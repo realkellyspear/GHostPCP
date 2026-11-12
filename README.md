@@ -61,12 +61,13 @@ GHost-PCP/
 > `pcp_data` folder, too. To keep fictional and personal memories separate,
 > try the sample in a separate, clean installation.
 
-### Option A: Run a Locally Built Executable
-An executable is not included in this repository. Build it using the instructions below first.
-1. Copy one or more `.gguf` models (for example, `Qwen3-14B-Q5_K_M.gguf`) into `ghost_models/`.
-2. Double-click **`GHost-PCP.exe`**.
-3. If you haven't imported an archive yet, drop your ChatGPT export `.zip` or `conversations.json` into the **Archive Import** window.
-4. In **[ CONFIG ]**, select your model and click **MOUNT**.
+### Option A: Download the Standalone Windows Release (Recommended)
+1. Download and extract **[`GHost-PCP-v1.0.0-win64.zip`](https://github.com/realkellyspear/GHost-PCP/releases/latest)** from Releases.
+2. Copy one or more `.gguf` models (for example, `Qwen3-14B-Q5_K_M.gguf`) into `ghost_models/`.
+3. Double-click **`GHost-PCP.exe`**.
+4. Drop your ChatGPT export `.zip` or `conversations.json` (or the included `sample_chatgpt_export.zip`) into the **Archive Import** window.
+5. In **[ CONFIG ]**, select your model and click **MOUNT**.
+6. *(Optional)* Click **[ PHONE / TUNNEL ]** and scan the QR code to pair your phone over Wi-Fi, Tailscale, or a 1-click Cloudflare HTTPS Quick Tunnel.
 
 ### Option B: Run from Python Source
 Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files are not included.
