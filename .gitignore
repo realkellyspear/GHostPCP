@@ -27,6 +27,7 @@ pcp_data/
 ghost_pcp_*.md
 *.npz
 *.zip
+!examples/sample_chatgpt_export.zip
 conversations.json
 ghost_pcp_settings.json
 current_speech.wav

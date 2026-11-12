@@ -55,6 +55,11 @@ GHost-PCP/
 
 ## Quick Start
 
+> **Important:** Importing an archive replaces existing `ghost_pcp_*.md`
+> volumes in this installation, including saved sessions. Back up your entire
+> `pcp_data` folder first. Try the sample in a separate, clean installation,
+> not one containing memories you want to keep.
+
 ### Option A: Run a Locally Built Executable
 An executable is not included in this repository. Build it using the instructions below first.
 1. Copy one or more `.gguf` models (for example, `Qwen3-14B-Q5_K_M.gguf`) into `ghost_models/`.
@@ -75,6 +80,19 @@ To run headless (API + Web UI without opening the desktop window):
 ```powershell
 & .\.venv\Scripts\python.exe ghost_pcp.py --api-only
 ```
+
+### Try the Fictional Sample
+
+Download [`sample_chatgpt_export.zip`](examples/sample_chatgpt_export.zip) and
+import it into a clean installation using **[ ARCHIVE ]**. This small, fictional
+ChatGPT-format export lets you try the workflow without using personal data.
+After mounting a model, try asking:
+
+- "What is our callsign and the golden rule on the Station 9 observation deck?"
+- "What happened during the Europa relay blackout?"
+
+The sample is not a benchmark: responses can vary and may contain errors.
+Importing a different archive later replaces the sample volumes.
 
 ---
 
