@@ -1,0 +1,35 @@
+# Virtual environment & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Build artifacts & external native DLLs
+build_pcp/
+backends/
+*.spec
+*.exe
+!assets/*
+
+# Local GGUF models (keep the folder and its README for GitHub)
+ghost_models/*
+!ghost_models/README.md
+*.gguf
+*.safetensors
+
+# Local Piper TTS voice models (keep the folder and its README for GitHub)
+piper_models/*.onnx
+piper_models/*.onnx.json
+!piper_models/README.md
+
+# Private PCP archive volumes, embeddings, exports, and runtime settings
+pcp_data/
+.local/
+ghost_pcp_*.md
+*.npz
+*.zip
+conversations.json
+ghost_pcp_settings.json
+current_speech.wav
+*.old.exe
+*.log
+.env

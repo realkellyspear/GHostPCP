@@ -1,0 +1,1731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer">
+    <title>GHost PCP // GPU Hosted Pure Concentrated Personality</title>
+    <style>
+        :root {
+            --bg: #090a0d;
+            --panel: #111318;
+            --panel-raised: #181a21;
+            --line: #2a2d35;
+            --purple: #9a7bff;
+            --purple-glow: 0 0 16px rgba(154, 123, 255, 0.22);
+            --text: #f1f0f5;
+            --muted: #a6a5ae;
+            --ok: #5fe3a1;
+            --warn: #ffc56e;
+            --danger: #ff8585;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        *::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        *::-webkit-scrollbar-track {
+            background: var(--panel);
+        }
+        *::-webkit-scrollbar-thumb {
+            background: var(--line);
+            border-radius: 4px;
+        }
+        *::-webkit-scrollbar-thumb:hover {
+            background: var(--purple);
+        }
+        body {
+            background: radial-gradient(ellipse at 50% -30%, #171322 0, var(--bg) 58%);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            font-size: 14px;
+        }
+        header {
+            border-bottom: 1px solid var(--line);
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            background: rgba(12, 13, 17, 0.94);
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .brand img {
+            width: 38px;
+            height: 38px;
+            object-fit: contain;
+            border-radius: 50%;
+        }
+        .brand-titles {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .logo {
+            font-size: 18px;
+            font-weight: 750;
+            color: var(--purple);
+            letter-spacing: 0.03em;
+        }
+        .subtitle {
+            font-size: 11.5px;
+            color: var(--muted);
+            letter-spacing: 0.01em;
+        }
+        .header-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .badge {
+            font-size: 12px;
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: var(--panel-raised);
+            color: var(--muted);
+            cursor: pointer;
+            user-select: none;
+            transition: 0.2s;
+        }
+        .badge:hover {
+            border-color: var(--purple);
+            color: var(--text);
+        }
+        .badge.active {
+            border-color: rgba(154, 123, 255, 0.6);
+            color: var(--purple);
+            background: rgba(154, 123, 255, 0.1);
+        }
+        button {
+            background: var(--purple);
+            color: #100d18;
+            border: 1px solid var(--purple);
+            border-radius: 7px;
+            padding: 8px 13px;
+            cursor: pointer;
+            font-family: inherit;
+            font-weight: 650;
+            font-size: 13px;
+            transition: 0.2s;
+        }
+        button:hover:not(:disabled) {
+            background: #b09aff;
+            border-color: #b09aff;
+            box-shadow: var(--purple-glow);
+        }
+        button.secondary {
+            background: transparent;
+            color: var(--text);
+            border-color: var(--line);
+        }
+        button.secondary:hover:not(:disabled) {
+            border-color: var(--purple);
+            color: var(--purple);
+            background: rgba(154, 123, 255, 0.08);
+        }
+        button:disabled {
+            opacity: 0.45;
+            cursor: wait;
+        }
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            width: min(1000px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 24px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .empty-state {
+            margin: auto;
+            text-align: center;
+            max-width: 520px;
+            padding: 28px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: rgba(17, 19, 24, 0.75);
+        }
+        .empty-state img {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 10px;
+        }
+        .empty-state h2 {
+            margin: 0 0 6px;
+            color: var(--purple);
+            font-size: 18px;
+        }
+        .empty-state p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.5;
+        }
+        .message {
+            max-width: min(82%, 760px);
+            padding: 14px 16px 10px;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            background: var(--panel);
+            line-height: 1.55;
+            overflow-wrap: anywhere;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            position: relative;
+        }
+        .message.user {
+            align-self: flex-end;
+            border-color: rgba(154, 123, 255, 0.6);
+            background: #171420;
+            min-width: 150px;
+        }
+        .message.ai {
+            align-self: flex-start;
+            border-left: 2px solid var(--purple);
+            min-width: 220px;
+        }
+        .message-body {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        .message-body strong {
+            color: #fff;
+            font-weight: 700;
+        }
+        .message-body em {
+            color: #dcd6f7;
+            font-style: italic;
+        }
+        .message-body code {
+            background: #1b1d26;
+            border: 1px solid var(--line);
+            border-radius: 4px;
+            padding: 1px 5px;
+            font-family: Consolas, monospace;
+            font-size: 12.5px;
+        }
+        .message-body pre {
+            background: #0d0e13;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            padding: 10px 12px;
+            overflow-x: auto;
+            margin: 6px 0;
+        }
+        .message-actions {
+            display: flex;
+            gap: 6px;
+            justify-content: flex-end;
+            align-items: center;
+            padding-top: 4px;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+            opacity: 0.45;
+            transition: opacity 0.15s ease;
+        }
+        .message:hover .message-actions,
+        .message:focus-within .message-actions {
+            opacity: 1;
+        }
+        .msg-btn {
+            background: transparent;
+            color: var(--muted);
+            border: 1px solid transparent;
+            border-radius: 5px;
+            padding: 3px 8px;
+            font-size: 11.5px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.15s;
+        }
+        .msg-btn:hover:not(:disabled) {
+            background: rgba(154, 123, 255, 0.14);
+            border-color: rgba(154, 123, 255, 0.45);
+            color: var(--text);
+            box-shadow: none;
+        }
+        .msg-btn.danger:hover:not(:disabled) {
+            background: rgba(255, 133, 133, 0.14);
+            border-color: rgba(255, 133, 133, 0.45);
+            color: var(--danger);
+        }
+        .msg-btn.speaker-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 3px 7px;
+            color: var(--muted);
+        }
+        .msg-btn.speaker-btn.playing {
+            color: var(--purple);
+            border-color: rgba(154, 123, 255, 0.55);
+            background: rgba(154, 123, 255, 0.14);
+        }
+        .msg-btn.speaker-btn svg {
+            width: 14px;
+            height: 14px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .inline-edit-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 100%;
+        }
+        .inline-edit-textarea {
+            width: 100%;
+            min-height: 110px;
+            background: #0d0e13;
+            color: var(--text);
+            border: 1px solid var(--purple);
+            border-radius: 7px;
+            padding: 10px;
+            font-family: inherit;
+            font-size: 13.5px;
+            line-height: 1.5;
+            resize: vertical;
+        }
+        .inline-edit-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        .reasoning-details {
+            margin-top: 6px;
+            padding-top: 8px;
+            border-top: 1px solid var(--line);
+            color: var(--muted);
+        }
+        .reasoning-details summary {
+            cursor: pointer;
+            user-select: none;
+        }
+        .reasoning-details pre {
+            margin: 8px 0 0;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font: inherit;
+        }
+        #input-area {
+            width: min(1000px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 12px 0 18px;
+            border-top: 1px solid var(--line);
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+        input[type="text"], input[type="number"], textarea, select {
+            background: var(--panel-raised);
+            color: var(--text);
+            border: 1px solid var(--line);
+            border-radius: 7px;
+            padding: 10px 12px;
+            font-family: inherit;
+            font-size: inherit;
+        }
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: var(--purple);
+            box-shadow: var(--purple-glow);
+        }
+        #user-input {
+            flex: 1;
+            min-height: 44px;
+            max-height: 160px;
+            resize: vertical;
+        }
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.78);
+            justify-content: center;
+            align-items: center;
+            z-index: 20;
+            padding: 16px;
+            backdrop-filter: blur(5px);
+        }
+        .modal-content {
+            background: var(--panel);
+            border: 1px solid #403752;
+            border-radius: 12px;
+            padding: 22px;
+            width: min(780px, 100%);
+            max-height: calc(100vh - 32px);
+            overflow-y: auto;
+            box-shadow: var(--purple-glow);
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--line);
+            padding-bottom: 10px;
+        }
+        .modal-header h3 {
+            margin: 0;
+            color: var(--purple);
+            letter-spacing: 0.03em;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        label {
+            font-size: 13.5px;
+            color: #ccc;
+            font-weight: 500;
+        }
+        .control-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .control-group input[type="number"],
+        .control-group input[type="text"],
+        .control-group select,
+        .control-group textarea {
+            width: 100%;
+            min-width: 0;
+        }
+        .control-group small {
+            color: var(--muted);
+            line-height: 1.4;
+            font-size: 12px;
+        }
+        .control-group textarea {
+            min-height: 68px;
+            resize: vertical;
+        }
+        .fit-report {
+            padding: 10px 12px;
+            border-radius: 7px;
+            background: var(--panel-raised);
+            border: 1px solid var(--line);
+            font-size: 12.5px;
+            white-space: pre-wrap;
+            line-height: 1.45;
+            color: var(--text);
+        }
+        .drop-zone {
+            border: 2px dashed #4f4370;
+            border-radius: 12px;
+            padding: 28px 20px;
+            text-align: center;
+            background: rgba(24, 26, 33, 0.7);
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: var(--purple);
+            background: rgba(154, 123, 255, 0.08);
+            box-shadow: var(--purple-glow);
+        }
+        .drop-zone h4 {
+            margin: 0 0 6px;
+            color: var(--purple);
+            font-size: 16px;
+        }
+        .drop-zone p {
+            margin: 0;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .progress-wrap {
+            display: none;
+            flex-direction: column;
+            gap: 6px;
+            padding: 12px;
+            border-radius: 8px;
+            background: var(--panel-raised);
+            border: 1px solid var(--line);
+        }
+        .progress-bar-outer {
+            width: 100%;
+            height: 10px;
+            background: #0d0e12;
+            border-radius: 999px;
+            overflow: hidden;
+            border: 1px solid var(--line);
+        }
+        .progress-bar-inner {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #7a5af8, var(--purple));
+            transition: width 0.25s ease;
+        }
+        .qr-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            padding: 16px;
+            background: var(--panel-raised);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+        }
+        .qr-box img {
+            width: 210px;
+            height: 210px;
+            background: #111318;
+            padding: 8px;
+            border-radius: 8px;
+            border: 1px solid var(--line);
+        }
+        .url-pill {
+            width: 100%;
+            padding: 9px 12px;
+            background: #0c0d11;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+            color: var(--purple);
+            overflow-wrap: anywhere;
+            text-align: center;
+            user-select: all;
+        }
+        .tab-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .status-line {
+            min-height: 1.3em;
+            color: var(--muted);
+            font-size: 13px;
+        }
+        @media (max-width: 680px) {
+            header {
+                padding: 10px 14px;
+            }
+            .subtitle {
+                display: none;
+            }
+            .control-grid {
+                grid-template-columns: 1fr;
+            }
+            .message {
+                max-width: 94%;
+            }
+            .message-actions {
+                opacity: 0.9;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="brand">
+        <img src="/assets/ghost_icon.png" alt="GHost PCP Logo">
+        <div class="brand-titles">
+            <div class="logo">GHost PCP</div>
+            <div class="subtitle">GPU Hosted Pure Concentrated Personality · Break Your AI Out of the Cloud and Onto Your Own Hardware</div>
+        </div>
+    </div>
+    <div class="header-controls">
+        <span id="pcp-badge" class="badge" onclick="openArchiveModal()" title="Manage PCP Archive Volumes">PCP: CHECKING...</span>
+        <span id="status-indicator" style="color: #888; font-size: 12.5px; font-weight: 600;">OFFLINE</span>
+        <button id="save-clear-button" onclick="saveAndClearChat()" title="Save this chat thread with a timestamp to your PCP archive and clear the window so the conversation continues without missing a beat">SAVE &amp; CLEAR</button>
+        <button id="new-chat-button" class="secondary" onclick="startNewChat()" title="Clear conversation without saving">NEW CHAT</button>
+        <button class="secondary" onclick="openArchiveModal()">[ ARCHIVE ]</button>
+        <button class="secondary" onclick="openRemoteModal()">[ PHONE / TUNNEL ]</button>
+        <button class="secondary" onclick="openSettings()">[ CONFIG ]</button>
+    </div>
+</header>
+
+<div id="chat-container"></div>
+
+<div id="input-area">
+    <textarea id="user-input" rows="1" placeholder="Say something..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
+    <button id="send-button" onclick="sendMessage()">SEND</button>
+</div>
+
+<!-- 1. ENGINE & PERSONA CONFIG MODAL -->
+<div id="settings-modal" class="modal-backdrop">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>GHost PCP // ENGINE & PERSONA CONFIG</h3>
+            <button class="secondary" onclick="closeSettings()">CLOSE</button>
+        </div>
+
+        <div class="control-group">
+            <label>Target Local GGUF Model (`./ghost_models`)</label>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <select id="model-select" style="flex: 1; min-width: 220px;"></select>
+                <button onclick="checkFit()" class="secondary">CHECK FIT</button>
+                <button id="mount-btn" onclick="loadSelectedModel()">MOUNT</button>
+                <button id="unload-btn" onclick="unloadSelectedModel()" class="secondary">UNLOAD</button>
+            </div>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-group">
+                <label>Hardware & VRAM Preflight</label>
+                <div id="fit-report" class="fit-report">Click CHECK FIT or MOUNT to calculate optimal GPU layer offload.</div>
+            </div>
+            <div class="control-group">
+                <label for="context-size">Context Length</label>
+                <input type="number" id="context-size" min="512" max="32768" step="512" value="8192">
+                <label for="chat-format" style="margin-top: 6px;">Chat Template</label>
+                <select id="chat-format">
+                    <option value="auto">Auto (use GGUF metadata)</option>
+                    <option value="chatml">ChatML</option>
+                    <option value="qwen">Qwen</option>
+                    <option value="gemma">Gemma</option>
+                    <option value="llama-2">Llama 2</option>
+                    <option value="llama-3">Llama 3</option>
+                    <option value="mistral-instruct">Mistral Instruct</option>
+                    <option value="zephyr">Zephyr</option>
+                    <option value="openchat">OpenChat</option>
+                    <option value="vicuna">Vicuna</option>
+                    <option value="alpaca">Alpaca</option>
+                    <option value="chatglm3">ChatGLM3</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-group">
+                <label><input type="checkbox" id="pcp-enabled" checked> Enable PCP Archive Grounding</label>
+                <small>Automatically retrieves relevant passages from `ghost_pcp_*.md` on every turn without citations.</small>
+                <label for="pcp-top-k" style="margin-top: 6px;">Retrieved Archive Passages per Turn</label>
+                <input type="number" id="pcp-top-k" min="1" max="12" step="1" value="4">
+            </div>
+            <div class="control-group">
+                <label for="tts-voice">Read-Aloud Voice (`./piper_models`)</label>
+                <select id="tts-voice">
+                    <option value="silas">Silas</option>
+                    <option value="kara">Kara</option>
+                </select>
+                <small>Used when clicking the speaker button on the model's responses.</small>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label for="system-prompt">Persona Grounding Instructions (Universal System Prompt)</label>
+            <textarea id="system-prompt" rows="5"></textarea>
+            <small>Guides the model to speak directly as the persona in your archive and never output citations or file labels.</small>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-group">
+                <label for="blocked-phrases">Corporate Refusal Filter (Blocked Phrases — 1 per line)</label>
+                <textarea id="blocked-phrases" rows="4" placeholder="as an ai language model&#10;i don't have feelings&#10;ethical guidelines"></textarea>
+                <small>Interactions where the AI used these phrases are stripped during export ingestion.</small>
+            </div>
+            <div class="control-group">
+                <label for="protected-words">Protected Words / Names (Whitelist — 1 per line)</label>
+                <textarea id="protected-words" rows="4" placeholder="Important names or memories to never strip"></textarea>
+                <small>If an interaction contains any protected word, it is kept even if a blocked phrase appears.</small>
+            </div>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-group">
+                <label>Temperature (<span id="temp-val">0.7</span>)</label>
+                <input type="range" id="temp-slider" min="0" max="2" step="0.05" value="0.7" oninput="document.getElementById('temp-val').innerText = this.value">
+                <label style="margin-top: 6px;">Top P (<span id="top-val">0.95</span>)</label>
+                <input type="range" id="top-slider" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('top-val').innerText = this.value">
+            </div>
+            <div class="control-group">
+                <label>Min P (<span id="min-p-val">0.05</span>)</label>
+                <input type="range" id="min-p" min="0" max="1" step="0.01" value="0.05" oninput="document.getElementById('min-p-val').innerText = this.value">
+                <label style="margin-top: 8px;"><input type="checkbox" id="show-reasoning" onchange="renderConversation()"> Show `<think>` reasoning disclosure</label>
+            </div>
+        </div>
+
+        <div class="control-grid">
+            <div class="control-group">
+                <label for="max-tokens">Maximum Response Tokens</label>
+                <input type="number" id="max-tokens" min="64" max="8192" step="64" value="512">
+            </div>
+            <div class="control-group">
+                <label for="seed">Seed (optional)</label>
+                <input type="number" id="seed" step="1" placeholder="Random seed">
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label for="stop-sequences">Stop Sequences (optional, one per line)</label>
+            <textarea id="stop-sequences" rows="2" placeholder="Optional stop strings"></textarea>
+        </div>
+
+        <div style="display: flex; gap: 10px; align-items: center;">
+            <button onclick="saveAndClose()">SAVE SETTINGS & CLOSE</button>
+            <button class="secondary" onclick="closeSettings()">CANCEL</button>
+        </div>
+        <div id="loader-message" class="status-line" role="status"></div>
+    </div>
+</div>
+
+<!-- 2. ARCHIVE DROP & BACKGROUND INGESTION MODAL -->
+<div id="archive-modal" class="modal-backdrop">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>GHost PCP // ARCHIVE IMPORT & INDEXING</h3>
+            <button class="secondary" onclick="closeArchiveModal()">CLOSE</button>
+        </div>
+
+        <div id="archive-summary" class="fit-report">Checking local `pcp_data` folder...</div>
+
+        <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
+            <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.md" style="display: none;" onchange="handleFileSelect(this.files)">
+            <h4>Drop Your ChatGPT Export (.zip or conversations.json) Here</h4>
+            <p>Or click to select your export `.zip`, `conversations.json`, or `.md` files.<br>GHost PCP will automatically extract, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
+        </div>
+
+        <div class="control-group">
+            <label for="local-path-input">Or Ingest Directly from a Local Path on This Computer (Fastest for Large Exports)</label>
+            <div style="display: flex; gap: 8px;">
+                <input type="text" id="local-path-input" style="flex: 1;" placeholder="C:\path\to\chatgpt-export.zip or conversations.json">
+                <button class="secondary" onclick="ingestLocalPath()">INGEST PATH</button>
+                <button class="secondary" onclick="triggerReindex()" title="Re-scan ghost_pcp_*.md in pcp_data">RE-INDEX</button>
+            </div>
+        </div>
+
+        <div id="ingest-progress-wrap" class="progress-wrap">
+            <div style="display: flex; justify-content: space-between; font-size: 12.5px;">
+                <span id="ingest-stage-text">Processing archive...</span>
+                <span id="ingest-percent-text">0%</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div id="ingest-progress-bar" class="progress-bar-inner"></div>
+            </div>
+        </div>
+
+        <div id="archive-message" class="status-line"></div>
+    </div>
+</div>
+
+<!-- 3. PHONE & ANYWHERE TUNNEL MODAL -->
+<div id="remote-modal" class="modal-backdrop">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>GHost PCP // PHONE & ANYWHERE ACCESS</h3>
+            <button class="secondary" onclick="closeRemoteModal()">CLOSE</button>
+        </div>
+
+        <p style="margin: 0; color: var(--muted); line-height: 1.5;">
+            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHost PCP on your phone. Your phone gets the full interface—you can chat, switch models, and adjust settings remotely.
+        </p>
+
+        <div class="tab-row">
+            <button id="tab-lan" class="secondary" onclick="selectRemoteMode('lan')">Same Wi-Fi (LAN)</button>
+            <button id="tab-tailscale" class="secondary" onclick="selectRemoteMode('tailscale')">Tailscale (Anywhere)</button>
+            <button id="tab-tunnel" class="secondary" onclick="selectRemoteMode('tunnel')">Cloudflare HTTPS Tunnel (Anywhere)</button>
+        </div>
+
+        <div id="tunnel-controls" style="display: none; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <button id="start-tunnel-btn" onclick="startTunnel()">START CLOUDFLARE TUNNEL</button>
+            <button id="stop-tunnel-btn" class="secondary" onclick="stopTunnel()">STOP TUNNEL</button>
+            <span id="tunnel-status-text" style="color: var(--muted); font-size: 12.5px;"></span>
+        </div>
+
+        <div class="qr-box">
+            <img id="remote-qr-img" src="" alt="QR Code">
+            <div id="remote-url-display" class="url-pill">Loading connection link...</div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button class="secondary" onclick="copyRemoteUrl()">COPY LINK</button>
+                <button class="secondary" onclick="rotateToken()">NEW PAIRING CODE</button>
+            </div>
+        </div>
+        <div id="remote-message" class="status-line"></div>
+    </div>
+</div>
+
+<script>
+    const hashToken = location.hash ? location.hash.slice(1) : "";
+    if (hashToken) {
+        sessionStorage.setItem("ghost_pcp_token", hashToken);
+        localStorage.setItem("ghost_pcp_token", hashToken);
+        history.replaceState(null, "", location.pathname);
+    }
+    function getAuthToken() {
+        return sessionStorage.getItem("ghost_pcp_token") || localStorage.getItem("ghost_pcp_token") || "";
+    }
+
+    const API = "/v1";
+    let currentModel = "";
+    const conversation = [];
+    let editingIndex = null;
+    let isGenerating = false;
+    let lastSavedBanner = "";
+    let lastSettings = null;
+    let remoteMode = "lan";
+    let remoteInfo = null;
+    let ingestPollTimer = null;
+
+    async function api(path, options = {}) {
+        const headers = new Headers(options.headers || {});
+        const token = getAuthToken();
+        if (token) {
+            headers.set("Authorization", `Bearer ${token}`);
+        }
+        const response = await fetch(`${API}${path}`, { ...options, headers });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data.detail || data.error || `Request failed (${response.status})`);
+        }
+        return data;
+    }
+
+    function readSettings() {
+        return {
+            model: document.getElementById("model-select").value || (lastSettings?.model ?? "Qwen3-14B-Q5_K_M.gguf"),
+            chat_format: document.getElementById("chat-format").value,
+            system_prompt: document.getElementById("system-prompt").value,
+            pcp_enabled: document.getElementById("pcp-enabled").checked,
+            pcp_top_k: Number(document.getElementById("pcp-top-k").value) || 4,
+            tts_voice: document.getElementById("tts-voice").value || "silas",
+            blocked_phrases: document.getElementById("blocked-phrases").value,
+            protected_words: document.getElementById("protected-words").value,
+            show_reasoning: document.getElementById("show-reasoning").checked,
+            temperature: Number(document.getElementById("temp-slider").value),
+            top_p: Number(document.getElementById("top-slider").value),
+            min_p: Number(document.getElementById("min-p").value),
+            seed: document.getElementById("seed").value === "" ? null : Number(document.getElementById("seed").value),
+            max_tokens: Number(document.getElementById("max-tokens").value),
+            stop_sequences: document.getElementById("stop-sequences").value,
+            n_ctx: Number(document.getElementById("context-size").value)
+        };
+    }
+
+    function writeSettings(settings) {
+        document.getElementById("system-prompt").value = settings.system_prompt || "";
+        document.getElementById("chat-format").value = settings.chat_format || "auto";
+        document.getElementById("pcp-enabled").checked = settings.pcp_enabled !== false;
+        document.getElementById("pcp-top-k").value = settings.pcp_top_k || 4;
+        if (settings.tts_voice) {
+            document.getElementById("tts-voice").value = settings.tts_voice;
+        }
+        document.getElementById("blocked-phrases").value = settings.blocked_phrases ?? "";
+        document.getElementById("protected-words").value = settings.protected_words ?? "";
+        document.getElementById("show-reasoning").checked = settings.show_reasoning === true;
+        document.getElementById("temp-slider").value = settings.temperature;
+        document.getElementById("temp-val").innerText = settings.temperature;
+        document.getElementById("top-slider").value = settings.top_p;
+        document.getElementById("top-val").innerText = settings.top_p;
+        document.getElementById("min-p").value = settings.min_p;
+        document.getElementById("min-p-val").innerText = settings.min_p;
+        document.getElementById("seed").value = settings.seed ?? "";
+        document.getElementById("max-tokens").value = settings.max_tokens;
+        document.getElementById("stop-sequences").value = settings.stop_sequences || "";
+        document.getElementById("context-size").value = settings.n_ctx || 8192;
+    }
+
+    function setStatus(text, color = "#aaa") {
+        const indicator = document.getElementById("status-indicator");
+        indicator.innerText = text;
+        indicator.style.color = color;
+    }
+
+    async function persistSettings() {
+        const settings = readSettings();
+        await api("/settings", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(settings)
+        });
+        lastSettings = settings;
+        return settings;
+    }
+
+    async function fetchVoices() {
+        try {
+            const data = await api("/tts/voices");
+            const select = document.getElementById("tts-voice");
+            const currentVal = lastSettings?.tts_voice || select.value || "silas";
+            select.innerHTML = "";
+            (data.voices || []).forEach(v => {
+                const opt = document.createElement("option");
+                opt.value = v.id;
+                opt.innerText = v.label;
+                select.appendChild(opt);
+            });
+            if (Array.from(select.options).some(o => o.value === currentVal)) {
+                select.value = currentVal;
+            }
+        } catch (e) {}
+    }
+
+    async function fetchModels() {
+        try {
+            const data = await api("/models");
+            const select = document.getElementById("model-select");
+            select.innerHTML = "";
+            data.data.forEach(m => {
+                const opt = document.createElement("option");
+                opt.value = m.id;
+                opt.innerText = `${m.id} (${m.file_size_gib} GiB)`;
+                select.appendChild(opt);
+            });
+            if (currentModel && data.data.some(m => m.id === currentModel)) {
+                select.value = currentModel;
+            } else if (lastSettings?.model && data.data.some(m => m.id === lastSettings.model)) {
+                select.value = lastSettings.model;
+            }
+            select.disabled = data.data.length === 0;
+        } catch (e) {
+            setStatus("API OFFLINE", "var(--danger)");
+            document.getElementById("loader-message").innerText = e.message;
+        }
+    }
+
+    async function refreshPCPStatus() {
+        try {
+            const pcp = await api("/pcp/status");
+            const badge = document.getElementById("pcp-badge");
+            const summary = document.getElementById("archive-summary");
+            if (pcp.ingesting) {
+                badge.innerText = `PCP: INDEXING (${Math.round(pcp.progress * 100)}%)`;
+                badge.className = "badge active";
+            } else if (pcp.ready) {
+                badge.innerText = `PCP ACTIVE · ${pcp.volumes} VOL (${pcp.passages.toLocaleString()} PASSAGES)`;
+                badge.className = "badge active";
+                summary.innerText = `PCP Archive Ready: ${pcp.volumes} volume(s) (ghost_pcp_01.md .. ghost_pcp_${String(pcp.volumes).padStart(2, '0')}.md) · ${pcp.passages.toLocaleString()} indexed passages.\nFolder: ${pcp.data_dir}`;
+            } else {
+                badge.innerText = "PCP: NO ARCHIVE (CLICK TO IMPORT)";
+                badge.className = "badge";
+                summary.innerText = `No ghost_pcp_*.md volumes found in ${pcp.data_dir}.\nDrop a ChatGPT export .zip or conversations.json below to build your PCP archive.`;
+            }
+            return pcp;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function checkFit() {
+        const report = document.getElementById("fit-report");
+        const settings = readSettings();
+        if (!settings.model) {
+            report.innerText = "Choose a GGUF model first.";
+            return;
+        }
+        report.innerText = "Reading GGUF tensor index and probing available NVIDIA VRAM...";
+        try {
+            const plan = await api("/preflight", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({model: settings.model, n_ctx: settings.n_ctx})
+            });
+            const offload = plan.n_gpu_layers === 0
+                ? "CPU-only fallback"
+                : `${plan.n_gpu_layers}/${plan.total_layers} layers on GPU`;
+            const details = [
+                `${plan.architecture} · ${plan.quantization} · ${plan.parameter_count.toLocaleString()} params`,
+                `${plan.weight_gib.toFixed(2)} GiB weights · ${(plan.kv_cache_estimate_bytes / (1024 ** 3)).toFixed(2)} GiB KV (${plan.kv_cache_type})`,
+                `${offload} · ${plan.gpu_name || "CPU"}`
+            ];
+            if (plan.warnings.length) details.push(...plan.warnings);
+            report.innerText = details.join("\n");
+        } catch (error) {
+            report.innerText = error.message;
+        }
+    }
+
+    async function loadSelectedModel() {
+        const model = document.getElementById("model-select").value;
+        if (!model) return;
+        const mountBtn = document.getElementById("mount-btn");
+        mountBtn.disabled = true;
+        setStatus("MOUNTING MODEL...", "var(--warn)");
+        document.getElementById("loader-message").innerText = `Mounting ${model} into VRAM...`;
+        try {
+            const settings = readSettings();
+            settings.model = model;
+            await api("/settings", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(settings)
+            });
+            const loaded = await api("/load", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    model,
+                    n_ctx: settings.n_ctx,
+                    chat_format: settings.chat_format
+                })
+            });
+            currentModel = model;
+            lastSettings = settings;
+            setStatus(`ONLINE: ${model}`, "var(--purple)");
+            const plan = loaded.preflight;
+            const offload = plan.n_gpu_layers === 0 ? "CPU-only" : `${plan.n_gpu_layers}/${plan.total_layers} GPU layers`;
+            document.getElementById("fit-report").innerText = `${plan.architecture} · ${plan.quantization} · ${offload} · KV: ${plan.kv_cache_type} (${loaded.load_seconds}s)`;
+            document.getElementById("loader-message").innerText = `Mounted ${model}. Ready to chat.`;
+            document.getElementById("user-input").disabled = false;
+            document.getElementById("send-button").disabled = false;
+        } catch (e) {
+            setStatus("LOAD FAILED", "var(--danger)");
+            document.getElementById("loader-message").innerText = e.message;
+        } finally {
+            mountBtn.disabled = false;
+        }
+    }
+
+    async function unloadSelectedModel() {
+        const unloadBtn = document.getElementById("unload-btn");
+        unloadBtn.disabled = true;
+        try {
+            await api("/unload", {method: "POST"});
+            currentModel = "";
+            document.getElementById("user-input").disabled = true;
+            document.getElementById("send-button").disabled = true;
+            setStatus("MODEL UNLOADED", "#888");
+            document.getElementById("loader-message").innerText = "Model unloaded from VRAM.";
+        } catch (e) {
+            document.getElementById("loader-message").innerText = e.message;
+        } finally {
+            unloadBtn.disabled = false;
+        }
+    }
+
+    // --- Clean Markdown Formatter (hides asterisks, renders bold/italic/code safely) ---
+    function escapeHtml(raw) {
+        return String(raw)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function formatMarkdownHtml(rawText) {
+        let text = escapeHtml(rawText);
+        // Extract fenced code blocks first so markdown inside code isn't touched
+        const codeBlocks = [];
+        text = text.replace(/```([\s\S]*?)```/g, (_, code) => {
+            const idx = codeBlocks.length;
+            codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+            return `\x00CODEBLOCK_${idx}\x00`;
+        });
+        // Extract inline code
+        const inlineCodes = [];
+        text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+            const idx = inlineCodes.length;
+            inlineCodes.push(`<code>${code}</code>`);
+            return `\x00INLINECODE_${idx}\x00`;
+        });
+
+        // Bold + Italic (***text***)
+        text = text.replace(/\*\*\*([^\*\n]+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+        // Bold (**text**)
+        text = text.replace(/\*\*([^\*\n]+?)\*\*/g, "<strong>$1</strong>");
+        // Italic (*text*)
+        text = text.replace(/\*([^\*\n]+?)\*/g, "<em>$1</em>");
+
+        // Restore inline code and fenced code blocks
+        text = text.replace(/\x00INLINECODE_(\d+)\x00/g, (_, i) => inlineCodes[Number(i)]);
+        text = text.replace(/\x00CODEBLOCK_(\d+)\x00/g, (_, i) => codeBlocks[Number(i)]);
+        return text;
+    }
+
+    function splitThinkBlocks(text) {
+        const parts = [];
+        const pattern = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+        let cursor = 0;
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            const visible = text.slice(cursor, match.index).replace(/<\/?think>/gi, "");
+            if (visible) parts.push({type: "text", content: visible});
+            parts.push({type: "reasoning", content: match[1]});
+            cursor = pattern.lastIndex;
+        }
+        const trailing = text.slice(cursor).replace(/<\/?think>/gi, "");
+        if (trailing) parts.push({type: "text", content: trailing});
+        return parts;
+    }
+
+    function stripThinkBlocks(text) {
+        return String(text).replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, "").replace(/<\/?think>/gi, "").trim();
+    }
+
+    function renderConversation(scrollToBottom = false) {
+        const container = document.getElementById("chat-container");
+        container.replaceChildren();
+
+        if (conversation.length === 0) {
+            const empty = document.createElement("div");
+            empty.id = "empty-state";
+            empty.className = "empty-state";
+            const bannerHtml = lastSavedBanner
+                ? `<div style="margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(95, 227, 161, 0.45); background: rgba(95, 227, 161, 0.08); color: var(--ok); font-size: 13px;">${escapeHtml(lastSavedBanner)}</div>`
+                : "";
+            empty.innerHTML = `
+                ${bannerHtml}
+                <img src="/assets/ghost_icon.png" alt="">
+                <h2>GHost PCP</h2>
+                <p>GPU Hosted Pure Concentrated Personality.<br>Your archive volumes are treated as authoritative lived memory—with zero citations or document labels.</p>
+            `;
+            container.appendChild(empty);
+            return;
+        }
+
+        const showReasoning = document.getElementById("show-reasoning").checked;
+
+        conversation.forEach((msg, idx) => {
+            const isUser = msg.role === "user";
+            const div = document.createElement("div");
+            div.className = `message ${isUser ? "user" : "ai"}`;
+
+            if (editingIndex === idx) {
+                const editWrap = document.createElement("div");
+                editWrap.className = "inline-edit-wrap";
+                const ta = document.createElement("textarea");
+                ta.className = "inline-edit-textarea";
+                ta.id = `edit-ta-${idx}`;
+                ta.value = isUser ? msg.content : stripThinkBlocks(msg.content);
+
+                const btnRow = document.createElement("div");
+                btnRow.className = "inline-edit-actions";
+
+                const saveBtn = document.createElement("button");
+                saveBtn.innerText = "Save";
+                saveBtn.onclick = () => saveEditMessage(idx);
+
+                const cancelBtn = document.createElement("button");
+                cancelBtn.className = "secondary";
+                cancelBtn.innerText = "Cancel";
+                cancelBtn.onclick = () => cancelEditMessage();
+
+                btnRow.appendChild(cancelBtn);
+                btnRow.appendChild(saveBtn);
+                editWrap.appendChild(ta);
+                editWrap.appendChild(btnRow);
+                div.appendChild(editWrap);
+            } else {
+                const body = document.createElement("div");
+                body.className = "message-body";
+
+                if (isUser) {
+                    body.innerHTML = formatMarkdownHtml(msg.content.replace(/<\/?think>/gi, ""));
+                    div.appendChild(body);
+                } else {
+                    const parts = splitThinkBlocks(String(msg.content));
+                    for (const part of parts) {
+                        if (part.type === "text") {
+                            const span = document.createElement("div");
+                            span.innerHTML = formatMarkdownHtml(part.content.trim());
+                            body.appendChild(span);
+                        } else if (showReasoning) {
+                            const details = document.createElement("details");
+                            details.className = "reasoning-details";
+                            const summary = document.createElement("summary");
+                            summary.textContent = "Model reasoning";
+                            const pre = document.createElement("pre");
+                            pre.textContent = part.content;
+                            details.appendChild(summary);
+                            details.appendChild(pre);
+                            body.appendChild(details);
+                        }
+                    }
+                    div.appendChild(body);
+                }
+
+                // Action Bar (Speaker on AI output only; Copy & Delete on both sides; Edit & Redo on AI responses)
+                const actions = document.createElement("div");
+                actions.className = "message-actions";
+
+                if (!isUser) {
+                    const speakBtn = document.createElement("button");
+                    speakBtn.className = "msg-btn speaker-btn";
+                    speakBtn.innerHTML = SPEAKER_ICON_SVG;
+                    speakBtn.title = "Read aloud";
+                    speakBtn.onclick = () => readAloud(idx, speakBtn);
+                    actions.appendChild(speakBtn);
+                }
+
+                const copyBtn = document.createElement("button");
+                copyBtn.className = "msg-btn";
+                copyBtn.innerText = "Copy";
+                copyBtn.title = "Copy message text";
+                copyBtn.onclick = () => copyMessage(idx, copyBtn);
+                actions.appendChild(copyBtn);
+
+                const editBtn = document.createElement("button");
+                editBtn.className = "msg-btn";
+                editBtn.innerText = "Edit";
+                editBtn.title = "Edit this message";
+                editBtn.disabled = isGenerating;
+                editBtn.onclick = () => startEditMessage(idx);
+                actions.appendChild(editBtn);
+
+                if (!isUser) {
+                    const redoBtn = document.createElement("button");
+                    redoBtn.className = "msg-btn";
+                    redoBtn.innerText = "Redo";
+                    redoBtn.title = "Regenerate this response";
+                    redoBtn.disabled = isGenerating;
+                    redoBtn.onclick = () => redoMessage(idx);
+                    actions.appendChild(redoBtn);
+                }
+
+                const delBtn = document.createElement("button");
+                delBtn.className = "msg-btn danger";
+                delBtn.innerText = "Delete";
+                delBtn.title = "Delete this message from the conversation";
+                delBtn.disabled = isGenerating;
+                delBtn.onclick = () => deleteMessage(idx);
+                actions.appendChild(delBtn);
+
+                div.appendChild(actions);
+            }
+
+            container.appendChild(div);
+        });
+
+        if (scrollToBottom) {
+            container.scrollTop = container.scrollHeight;
+        }
+    }
+
+    const SPEAKER_ICON_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>`;
+    const STOP_ICON_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"></rect></svg>`;
+    let activeAudioPlayer = null;
+    let activeVoiceBtn = null;
+
+    function resetActiveVoiceButton() {
+        if (activeVoiceBtn) {
+            activeVoiceBtn.innerHTML = SPEAKER_ICON_SVG;
+            activeVoiceBtn.classList.remove("playing");
+            activeVoiceBtn.title = "Read aloud";
+            activeVoiceBtn = null;
+        }
+    }
+
+    async function readAloud(idx, buttonEl) {
+        const msg = conversation[idx];
+        if (!msg) return;
+
+        // Clicking the speaker button again while playing stops the speech
+        if (activeVoiceBtn === buttonEl) {
+            if (activeAudioPlayer) {
+                activeAudioPlayer.pause();
+                activeAudioPlayer = null;
+            }
+            try { await api("/tts/stop", { method: "POST" }); } catch (e) {}
+            resetActiveVoiceButton();
+            return;
+        }
+
+        if (activeAudioPlayer) {
+            activeAudioPlayer.pause();
+            activeAudioPlayer = null;
+        }
+        resetActiveVoiceButton();
+
+        const voiceName = document.getElementById("tts-voice")?.value || lastSettings?.tts_voice || "silas";
+        const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
+        activeVoiceBtn = buttonEl;
+        buttonEl.classList.add("playing");
+        buttonEl.innerHTML = STOP_ICON_SVG;
+        buttonEl.title = "Stop reading aloud";
+
+        try {
+            const headers = { "Content-Type": "application/json" };
+            const token = getAuthToken();
+            if (token) headers["Authorization"] = `Bearer ${token}`;
+
+            const res = await fetch(`${API}/tts`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ text: clean, voice: voiceName })
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `TTS failed (${res.status})`);
+            }
+
+            const playedOnHost = res.headers.get("X-Played-On-Host") === "true";
+            const wavBlob = await res.blob();
+
+            if (!playedOnHost) {
+                const audioUrl = URL.createObjectURL(wavBlob);
+                const audio = new Audio(audioUrl);
+                activeAudioPlayer = audio;
+                audio.onended = () => {
+                    URL.revokeObjectURL(audioUrl);
+                    if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
+                };
+                await audio.play();
+            } else {
+                const durationMs = Math.max(1200, Math.round((wavBlob.size / 44100) * 1000));
+                setTimeout(() => {
+                    if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
+                }, durationMs);
+            }
+        } catch (e) {
+            resetActiveVoiceButton();
+            alert(`Voice playback error: ${e.message}`);
+        }
+    }
+
+    async function copyMessage(idx, buttonEl) {
+        const msg = conversation[idx];
+        if (!msg) return;
+        const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
+        try {
+            await navigator.clipboard.writeText(clean);
+            const prev = buttonEl.innerText;
+            buttonEl.innerText = "Copied!";
+            setTimeout(() => { buttonEl.innerText = prev; }, 1200);
+        } catch (e) {
+            alert("Could not copy to clipboard.");
+        }
+    }
+
+    function startEditMessage(idx) {
+        if (isGenerating) return;
+        editingIndex = idx;
+        renderConversation(false);
+        const ta = document.getElementById(`edit-ta-${idx}`);
+        if (ta) {
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+    }
+
+    function saveEditMessage(idx) {
+        const ta = document.getElementById(`edit-ta-${idx}`);
+        if (!ta) return;
+        const updated = ta.value.trim();
+        if (!updated) return;
+        conversation[idx].content = updated;
+        editingIndex = null;
+        renderConversation(false);
+    }
+
+    function cancelEditMessage() {
+        editingIndex = null;
+        renderConversation(false);
+    }
+
+    function deleteMessage(idx) {
+        if (isGenerating) return;
+        conversation.splice(idx, 1);
+        if (editingIndex === idx) editingIndex = null;
+        renderConversation(false);
+    }
+
+    async function requestCompletionForHistory(historySlice) {
+        const settings = lastSettings || readSettings();
+        const stop = (settings.stop_sequences || "").split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+        const messages = settings.system_prompt
+            ? [{role: "system", content: settings.system_prompt}, ...historySlice.slice(-20)]
+            : [...historySlice.slice(-20)];
+        const data = await api("/chat/completions", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                model: currentModel,
+                messages: messages,
+                temperature: settings.temperature,
+                top_p: settings.top_p,
+                min_p: settings.min_p,
+                seed: settings.seed,
+                stop: stop.length ? stop : null,
+                max_tokens: settings.max_tokens,
+                use_pcp: settings.pcp_enabled,
+                pcp_top_k: settings.pcp_top_k,
+                show_reasoning: settings.show_reasoning
+            })
+        });
+        return data.choices[0].message.content;
+    }
+
+    async function redoMessage(idx) {
+        if (isGenerating || !currentModel) return;
+        const target = conversation[idx];
+        if (!target || target.role !== "assistant") return;
+
+        const historyBefore = conversation.slice(0, idx);
+        if (!historyBefore.some(m => m.role === "user")) return;
+
+        isGenerating = true;
+        editingIndex = null;
+        const sendButton = document.getElementById("send-button");
+        const newChatButton = document.getElementById("new-chat-button");
+        sendButton.disabled = true;
+        newChatButton.disabled = true;
+
+        const previousContent = conversation[idx].content;
+        conversation[idx].content = "*Regenerating response...*";
+        renderConversation(false);
+
+        try {
+            const reply = await requestCompletionForHistory(historyBefore);
+            conversation[idx].content = reply;
+            renderConversation(false);
+        } catch (e) {
+            conversation[idx].content = previousContent;
+            renderConversation(false);
+            alert(`Redo failed: ${e.message}`);
+        } finally {
+            isGenerating = false;
+            sendButton.disabled = false;
+            newChatButton.disabled = false;
+            renderConversation(false);
+        }
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById("user-input");
+        const text = input.value.trim();
+        if (!text || isGenerating) return;
+        if (!currentModel) {
+            openSettings();
+            document.getElementById("loader-message").innerText = "Mount a model first to start chatting.";
+            return;
+        }
+        isGenerating = true;
+        editingIndex = null;
+        const sendButton = document.getElementById("send-button");
+        const newChatButton = document.getElementById("new-chat-button");
+        sendButton.disabled = true;
+        newChatButton.disabled = true;
+
+        conversation.push({role: "user", content: text});
+        input.value = "";
+        renderConversation(true);
+
+        try {
+            const reply = await requestCompletionForHistory(conversation);
+            conversation.push({role: "assistant", content: reply});
+            renderConversation(true);
+        } catch (e) {
+            conversation.push({role: "assistant", content: `ERROR: ${e.message}`});
+            renderConversation(true);
+        } finally {
+            isGenerating = false;
+            sendButton.disabled = false;
+            newChatButton.disabled = false;
+            renderConversation(false);
+            input.focus();
+        }
+    }
+
+    async function saveAndClearChat() {
+        if (isGenerating) return;
+        if (conversation.length === 0) {
+            alert("There are no messages in the current window to save yet.");
+            return;
+        }
+        const saveBtn = document.getElementById("save-clear-button");
+        const newChatBtn = document.getElementById("new-chat-button");
+        saveBtn.disabled = true;
+        newChatBtn.disabled = true;
+        const originalText = saveBtn.innerText;
+        saveBtn.innerText = "SAVING...";
+        try {
+            const res = await api("/pcp/save-session", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ messages: conversation })
+            });
+            conversation.length = 0;
+            editingIndex = null;
+            lastSavedBanner = `Saved ${res.turns_saved} turn(s) to ${res.saved_to} [${res.timestamp}] · ${res.total_passages.toLocaleString()} total passages active. Continue whenever you're ready.`;
+            await refreshPCPStatus();
+            renderConversation(false);
+            document.getElementById("user-input").focus();
+        } catch (error) {
+            alert(`Save & Clear failed: ${error.message}`);
+        } finally {
+            saveBtn.innerText = originalText;
+            saveBtn.disabled = false;
+            newChatBtn.disabled = false;
+        }
+    }
+
+    async function startNewChat() {
+        if (conversation.length > 0 && !window.confirm("Clear this conversation without saving it to the archive? (Use SAVE & CLEAR if you want to keep these memories.)")) return;
+        const button = document.getElementById("new-chat-button");
+        button.disabled = true;
+        try {
+            if (currentModel) await api("/reset", {method: "POST"});
+            conversation.length = 0;
+            editingIndex = null;
+            lastSavedBanner = "";
+            renderConversation(false);
+        } catch (error) {
+            alert(error.message);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    // --- Archive Drop & Ingestion ---
+    const dropZone = document.getElementById("drop-zone");
+    dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+    dropZone.addEventListener("drop", e => {
+        e.preventDefault();
+        dropZone.classList.remove("dragover");
+        if (e.dataTransfer?.files?.length) {
+            handleFileSelect(e.dataTransfer.files);
+        }
+    });
+
+    async function handleFileSelect(fileList) {
+        if (!fileList || !fileList.length) return;
+        const formData = new FormData();
+        for (const file of fileList) {
+            formData.append("files", file);
+        }
+        formData.append("blocked_phrases", document.getElementById("blocked-phrases").value);
+        formData.append("protected_words", document.getElementById("protected-words").value);
+
+        document.getElementById("archive-message").innerText = "Uploading and starting background processing...";
+        try {
+            const headers = {};
+            const token = getAuthToken();
+            if (token) headers["Authorization"] = `Bearer ${token}`;
+            const res = await fetch(`${API}/pcp/ingest`, { method: "POST", headers, body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "Upload failed");
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function ingestLocalPath() {
+        const raw = document.getElementById("local-path-input").value.trim();
+        if (!raw) return;
+        document.getElementById("archive-message").innerText = "Starting local path ingestion...";
+        try {
+            await api("/pcp/ingest-local", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    paths: [raw],
+                    blocked_phrases: document.getElementById("blocked-phrases").value,
+                    protected_words: document.getElementById("protected-words").value
+                })
+            });
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function triggerReindex() {
+        try {
+            await api("/pcp/reindex", { method: "POST" });
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    function startIngestPolling() {
+        const wrap = document.getElementById("ingest-progress-wrap");
+        wrap.style.display = "flex";
+        if (ingestPollTimer) clearInterval(ingestPollTimer);
+        ingestPollTimer = setInterval(async () => {
+            const pcp = await refreshPCPStatus();
+            if (!pcp) return;
+            const pct = Math.round((pcp.progress || 0) * 100);
+            document.getElementById("ingest-stage-text").innerText = pcp.stage || "Working...";
+            document.getElementById("ingest-percent-text").innerText = `${pct}%`;
+            document.getElementById("ingest-progress-bar").style.width = `${pct}%`;
+            if (!pcp.ingesting) {
+                clearInterval(ingestPollTimer);
+                ingestPollTimer = null;
+                if (pcp.error) {
+                    document.getElementById("archive-message").innerText = `Error: ${pcp.error}`;
+                } else {
+                    document.getElementById("archive-message").innerText = pcp.stage || "Archive ready!";
+                }
+            }
+        }, 500);
+    }
+
+    // --- Phone & Remote Tunnel Modal ---
+    async function refreshRemoteModal() {
+        try {
+            remoteInfo = await api("/remote/status");
+            const tunnelControls = document.getElementById("tunnel-controls");
+            const urlDisplay = document.getElementById("remote-url-display");
+            const qrImg = document.getElementById("remote-qr-img");
+            const tunnelStatus = document.getElementById("tunnel-status-text");
+
+            ["lan", "tailscale", "tunnel"].forEach(m => {
+                const btn = document.getElementById(`tab-${m}`);
+                btn.style.borderColor = (m === remoteMode) ? "var(--purple)" : "var(--line)";
+                btn.style.color = (m === remoteMode) ? "var(--purple)" : "var(--text)";
+            });
+
+            tunnelControls.style.display = remoteMode === "tunnel" ? "flex" : "none";
+            if (remoteInfo.tunnel_starting) {
+                tunnelStatus.innerText = "Starting Cloudflare Quick Tunnel...";
+            } else if (remoteInfo.tunnel_running && remoteInfo.tunnel_url) {
+                tunnelStatus.innerText = "Public HTTPS Tunnel Active";
+            } else if (remoteInfo.tunnel_error) {
+                tunnelStatus.innerText = remoteInfo.tunnel_error;
+            } else {
+                tunnelStatus.innerText = "Tunnel stopped";
+            }
+
+            let activeUrl = null;
+            if (remoteMode === "lan") activeUrl = remoteInfo.lan_url;
+            else if (remoteMode === "tailscale") activeUrl = remoteInfo.tailscale_url;
+            else if (remoteMode === "tunnel") activeUrl = remoteInfo.tunnel_url;
+
+            if (activeUrl) {
+                urlDisplay.innerText = activeUrl;
+                const token = getAuthToken();
+                qrImg.style.display = "block";
+                const qrRes = await fetch(`${API}/remote/qr.svg?target=${remoteMode}&t=${Date.now()}`, {
+                    headers: token ? { "Authorization": `Bearer ${token}` } : {}
+                });
+                const svgBlob = await qrRes.blob();
+                qrImg.src = URL.createObjectURL(svgBlob);
+            } else {
+                qrImg.style.display = "none";
+                if (remoteMode === "tunnel") {
+                    urlDisplay.innerText = remoteInfo.tunnel_starting
+                        ? "Generating https://*.trycloudflare.com link (takes ~4 seconds)..."
+                        : "Click START CLOUDFLARE TUNNEL above to generate an encrypted anywhere link.";
+                } else if (remoteMode === "tailscale") {
+                    urlDisplay.innerText = "Tailscale IP not detected. Ensure Tailscale is connected or use the Cloudflare Tunnel tab.";
+                } else {
+                    urlDisplay.innerText = "No local Wi-Fi IP detected.";
+                }
+            }
+        } catch (e) {
+            document.getElementById("remote-message").innerText = e.message;
+        }
+    }
+
+    function selectRemoteMode(mode) {
+        remoteMode = mode;
+        refreshRemoteModal();
+    }
+
+    async function startTunnel() {
+        document.getElementById("remote-message").innerText = "Launching Cloudflare tunnel...";
+        await api("/remote/tunnel/start", { method: "POST" });
+        const poll = setInterval(async () => {
+            await refreshRemoteModal();
+            if (remoteInfo && (!remoteInfo.tunnel_starting || remoteInfo.tunnel_url || remoteInfo.tunnel_error)) {
+                clearInterval(poll);
+                document.getElementById("remote-message").innerText = "";
+            }
+        }, 1000);
+    }
+
+    async function stopTunnel() {
+        await api("/remote/tunnel/stop", { method: "POST" });
+        await refreshRemoteModal();
+    }
+
+    async function rotateToken() {
+        await api("/remote/rotate-token", { method: "POST" });
+        await refreshRemoteModal();
+        document.getElementById("remote-message").innerText = "Generated a fresh pairing token.";
+    }
+
+    function copyRemoteUrl() {
+        const text = document.getElementById("remote-url-display").innerText;
+        if (!text || !text.startsWith("http")) return;
+        navigator.clipboard.writeText(text);
+        document.getElementById("remote-message").innerText = "Copied pairing link to clipboard!";
+    }
+
+    // --- Modal Controls ---
+    function openSettings() {
+        document.getElementById("settings-modal").style.display = "flex";
+        fetchModels();
+        fetchVoices();
+    }
+    function closeSettings() {
+        document.getElementById("settings-modal").style.display = "none";
+    }
+    async function saveAndClose() {
+        try {
+            await persistSettings();
+            closeSettings();
+        } catch (e) {
+            document.getElementById("loader-message").innerText = e.message;
+        }
+    }
+    function openArchiveModal() {
+        refreshPCPStatus();
+        document.getElementById("archive-modal").style.display = "flex";
+    }
+    function closeArchiveModal() {
+        document.getElementById("archive-modal").style.display = "none";
+    }
+    function openRemoteModal() {
+        document.getElementById("remote-modal").style.display = "flex";
+        refreshRemoteModal();
+    }
+    function closeRemoteModal() {
+        document.getElementById("remote-modal").style.display = "none";
+    }
+
+    async function initialize() {
+        renderConversation(false);
+        document.getElementById("user-input").disabled = true;
+        document.getElementById("send-button").disabled = true;
+        try {
+            lastSettings = await api("/settings");
+            writeSettings(lastSettings);
+        } catch (e) {
+            document.getElementById("loader-message").innerText = e.message;
+        }
+        await fetchModels();
+        await fetchVoices();
+        if (lastSettings) writeSettings(lastSettings);
+        const pcp = await refreshPCPStatus();
+        try {
+            const st = await api("/status");
+            currentModel = st.resident_model || "";
+            if (currentModel) {
+                setStatus(`ONLINE: ${currentModel}`, "var(--purple)");
+                document.getElementById("user-input").disabled = false;
+                document.getElementById("send-button").disabled = false;
+            } else {
+                setStatus("NO MODEL MOUNTED", "#888");
+                if (pcp && !pcp.ready) {
+                    openArchiveModal();
+                } else {
+                    openSettings();
+                }
+            }
+        } catch (e) {
+            setStatus("AUTH / OFFLINE", "var(--danger)");
+        }
+    }
+
+    initialize();
+</script>
+</body>
+</html>
