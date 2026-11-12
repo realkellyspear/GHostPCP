@@ -353,8 +353,8 @@ DEFAULT_VOICE_URLS = {
         "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx.json",
     },
     "kara": {
-        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/amy/medium/en_US-amy-medium.onnx",
-        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx",
+        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx.json",
     },
 }
 

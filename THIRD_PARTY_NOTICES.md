@@ -29,11 +29,12 @@ The standalone Windows release bundles (or downloads on demand) pre-trained voic
   - **License**: **CC BY-NC-SA 4.0** (Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International — https://creativecommons.org/licenses/by-nc-sa/4.0/)
 
 - **`kara.onnx` & `kara.onnx.json`**
-  - **Upstream Model**: [`en/en_US/amy/medium/en_US-amy-medium.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/amy/medium/en_US-amy-medium.onnx) (`SHA256: b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18`, `63,201,294` bytes)
-  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/amy/medium/MODEL_CARD
-  - **Dataset / Upstream**: https://github.com/MycroftAI/mimic3-voices (licensed under **CC BY-SA 4.0** — https://github.com/MycroftAI/mimic3-voices/blob/master/LICENSE; finetuned from U.S. English `lessac` medium voice, [Blizzard Challenge 2013 Lessac dataset](https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html)).
+  - **Upstream Model**: [`en/en_US/kristin/medium/en_US-kristin-medium.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx) (`SHA256: 5849957f929cbf720c258f8458692d6103fff2f0e3d3b19c8259474bb06a18d4`, `63,531,379` bytes)
+  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/MODEL_CARD
+  - **Dataset / Training**: [LibriVox](https://librivox.org) (`https://brycebeattie.com/files/tts/` — trained from scratch on Public Domain LibriVox recordings).
+  - **License**: **Public Domain**
 
-*(Note: Because `silas.onnx` (`en_US-ryan-high`) and `kara.onnx` (`en_US-amy-medium` finetuned from `lessac`) carry non-commercial dataset terms, the bundled `piper_models/` files are provided strictly for **non-commercial use**. Users may delete or replace the `.onnx` files in `piper_models/` at any time.)*
+*(Note: Because `silas.onnx` (`en_US-ryan-high`) carries non-commercial dataset terms under CC BY-NC-SA 4.0, it is provided for non-commercial use. `kara.onnx` (`en_US-kristin-medium`) is trained from scratch on Public Domain recordings. Users may delete or replace the `.onnx` files in `piper_models/` at any time.)*
 
 ---
 
