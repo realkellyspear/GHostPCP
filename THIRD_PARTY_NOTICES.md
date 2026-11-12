@@ -22,19 +22,19 @@ The standalone Windows release bundle (`GHost-PCP-v1.0.0-win64.zip`) includes th
 
 The standalone Windows release bundles (or downloads on demand) pre-trained voice models from the official [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) repository (exact upstream snapshot commit [`e7229f7d33`](https://huggingface.co/rhasspy/piper-voices/tree/e7229f7d33)):
 
-- **`silas.onnx` & `silas.onnx.json`**
-  - **Upstream Model**: [`en/en_US/ryan/high/en_US-ryan-high.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx) (`SHA256: b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca`, `120,786,792` bytes)
-  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/ryan/high/MODEL_CARD
-  - **Dataset**: [RyanSpeech](https://www.kaggle.com/datasets/roholazandie/ryanspeech)
-  - **License**: **CC BY-NC-SA 4.0** (Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International — https://creativecommons.org/licenses/by-nc-sa/4.0/)
-
-- **`kara.onnx` & `kara.onnx.json`**
-  - **Upstream Model**: [`en/en_US/kristin/medium/en_US-kristin-medium.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx) (`SHA256: 5849957f929cbf720c258f8458692d6103fff2f0e3d3b19c8259474bb06a18d4`, `63,531,379` bytes)
-  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/MODEL_CARD
-  - **Dataset / Training**: [LibriVox](https://librivox.org) (`https://brycebeattie.com/files/tts/` — trained from scratch on Public Domain LibriVox recordings).
+- **`silas.onnx`, `silas.onnx.json`, & `silas.MODEL_CARD`**
+  - **Upstream Model**: [`en/en_US/john/medium/en_US-john-medium.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/john/medium/en_US-john-medium.onnx) (`SHA256: 789c6c875726e627ddee93d51d8727859abe9c091c3d141591f4b83c2072e988`, `63,531,379` bytes)
+  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/john/medium/MODEL_CARD (bundled at `piper_models/silas.MODEL_CARD`)
+  - **Dataset / Training**: [LibriVox](https://librivox.org) (`https://brycebeattie.com/files/tts/` — finetuned from Public Domain `en_US-kristin-medium` on Public Domain LibriVox recordings; listed on Piper's official [Commercial & Permissive Use list](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/COMMERCIAL_USE.md)).
   - **License**: **Public Domain**
 
-*(Note: Because `silas.onnx` (`en_US-ryan-high`) carries non-commercial dataset terms under CC BY-NC-SA 4.0, it is provided for non-commercial use. `kara.onnx` (`en_US-kristin-medium`) is trained from scratch on Public Domain recordings. Users may delete or replace the `.onnx` files in `piper_models/` at any time.)*
+- **`kara.onnx`, `kara.onnx.json`, & `kara.MODEL_CARD`**
+  - **Upstream Model**: [`en/en_US/kristin/medium/en_US-kristin-medium.onnx`](https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx) (`SHA256: 5849957f929cbf720c258f8458692d6103fff2f0e3d3b19c8259474bb06a18d4`, `63,531,379` bytes)
+  - **Model Card**: https://huggingface.co/rhasspy/piper-voices/blob/e7229f7d33/en/en_US/kristin/medium/MODEL_CARD (bundled at `piper_models/kara.MODEL_CARD`)
+  - **Dataset / Training**: [LibriVox](https://librivox.org) (`https://brycebeattie.com/files/tts/` — trained from scratch on Public Domain LibriVox recordings; listed on Piper's official [Commercial & Permissive Use list](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/COMMERCIAL_USE.md)).
+  - **License**: **Public Domain**
+
+*(Both bundled voice models have an entire training chain consisting exclusively of Public Domain LibriVox recordings, with their upstream `MODEL_CARD` files included alongside the `.onnx` files in `piper_models/`. Users may delete or replace the `.onnx` files in `piper_models/` at any time.)*
 
 ---
 

@@ -349,8 +349,8 @@ def _clean_text_for_speech(text: str) -> str:
 
 DEFAULT_VOICE_URLS = {
     "silas": {
-        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx",
-        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx.json",
+        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/john/medium/en_US-john-medium.onnx",
+        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/john/medium/en_US-john-medium.onnx.json",
     },
     "kara": {
         "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/kristin/medium/en_US-kristin-medium.onnx",

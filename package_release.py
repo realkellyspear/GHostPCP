@@ -232,11 +232,12 @@ def stage_clean_sandbox(sandbox_dir: Path, link_sample_gguf: bool = True) -> Non
         if fpath.is_file():
             link_or_copy(fpath, sandbox_dir / "bge_model" / fname)
 
-    # Piper TTS voices (Silas & Kara)
+    # Piper TTS voices (Silas & Kara) + upstream MODEL_CARD files
     link_or_copy(ROOT / "piper_models" / "README.md", sandbox_dir / "piper_models" / "README.md")
-    for f in (ROOT / "piper_models").glob("*.onnx*"):
-        if f.is_file():
-            link_or_copy(f, sandbox_dir / "piper_models" / f.name)
+    for pattern in ("*.onnx*", "*.MODEL_CARD"):
+        for f in (ROOT / "piper_models").glob(pattern):
+            if f.is_file():
+                link_or_copy(f, sandbox_dir / "piper_models" / f.name)
 
     # Empty pcp_data and ghost_models
     (sandbox_dir / "pcp_data").mkdir(parents=True, exist_ok=True)
