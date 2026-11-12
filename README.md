@@ -1,3 +1,5 @@
+![GHost PCP — GPU Hosted Pure Concentrated Personality](GHostPCP%20Promo/pcp_banner_fixed.png)
+
 # GHost PCP
 
 **GPU Hosted Pure Concentrated Personality**  
@@ -18,6 +20,16 @@ Standard "chat with your docs" tools act like research librarians (*"According t
 3. **Citation-Free Persona Grounding & Save & Clear Continuity**: Every turn retrieves the most relevant passages from your `ghost_pcp_*.md` volumes in ~24ms and grounds the model silently in character. Click **SAVE & CLEAR** at the top of the window to save the current chat thread with a timestamp directly into your PCP archive (`ghost_pcp_NN.md`), update the vector index in ~0.13s, and clear the window so the conversation continues without missing a beat.
 4. **Built-In Fast Local Read-Aloud Voices**: Choose your preferred voice (such as **Silas** or **Kara**, or any `.onnx` voice dropped into `piper_models/`) in **[ CONFIG ]**, and click the speaker icon on any of the model's responses for instant local Piper ONNX synthesis (~0.17s latency) and seamless background playback via `sounddevice` on PC (or Web Audio when connected from your phone).
 5. **Use Anywhere (Wi-Fi, Tailscale, or One-Click HTTPS Tunnel)**: Open **[ PHONE / TUNNEL ]** to scan a pairing QR code on your phone over local Wi-Fi, Tailscale, or a one-click Cloudflare HTTPS Quick Tunnel. Your phone gets the full interface—chat, listen to voice responses, start a new session, or switch models remotely.
+
+## See It in Action
+
+**Model and persona configuration**
+
+<img src="GHostPCP%20Promo/persona_config.png" alt="GHost PCP model and persona configuration" width="600">
+
+**Phone interface**
+
+<img src="GHostPCP%20Promo/pcp_phone_cropped.png" alt="GHost PCP phone interface" width="300">
 
 ---
 
