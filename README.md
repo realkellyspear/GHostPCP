@@ -55,10 +55,11 @@ GHost-PCP/
 
 ## Quick Start
 
-> **Important:** Importing an archive replaces existing `ghost_pcp_*.md`
-> volumes in this installation, including saved sessions. Back up your entire
-> `pcp_data` folder first. Try the sample in a separate, clean installation,
-> not one containing memories you want to keep.
+> **Important:** Imports append volumes by default. If you select **Replace
+> existing archive volumes**, the app backs up existing volumes to
+> `pcp_data/backups/` before replacing them. Keep your own backup of the entire
+> `pcp_data` folder, too. To keep fictional and personal memories separate,
+> try the sample in a separate, clean installation.
 
 ### Option A: Run a Locally Built Executable
 An executable is not included in this repository. Build it using the instructions below first.
@@ -92,7 +93,8 @@ After mounting a model, try asking:
 - "What happened during the Europa relay blackout?"
 
 The sample is not a benchmark: responses can vary and may contain errors.
-Importing a different archive later replaces the sample volumes.
+Later imports append to the sample unless you select **Replace existing archive
+volumes**.
 
 ---
 

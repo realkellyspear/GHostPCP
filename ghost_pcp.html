@@ -706,6 +706,9 @@
                 <button class="secondary" onclick="ingestLocalPath()">INGEST PATH</button>
                 <button class="secondary" onclick="triggerReindex()" title="Re-scan ghost_pcp_*.md in pcp_data">RE-INDEX</button>
             </div>
+            <label style="margin-top: 6px; font-size: 12.5px; color: var(--muted);">
+                <input type="checkbox" id="replace-existing-archive"> Replace existing archive volumes (automatically backs up current volumes to `pcp_data/backups/` first; leave unchecked to append as new volumes)
+            </label>
         </div>
 
         <div id="ingest-progress-wrap" class="progress-wrap">
@@ -1500,6 +1503,7 @@
         }
         formData.append("blocked_phrases", document.getElementById("blocked-phrases").value);
         formData.append("protected_words", document.getElementById("protected-words").value);
+        formData.append("replace_existing", document.getElementById("replace-existing-archive")?.checked ? "true" : "false");
 
         document.getElementById("archive-message").innerText = "Uploading and starting background processing...";
         try {
@@ -1526,7 +1530,8 @@
                 body: JSON.stringify({
                     paths: [raw],
                     blocked_phrases: document.getElementById("blocked-phrases").value,
-                    protected_words: document.getElementById("protected-words").value
+                    protected_words: document.getElementById("protected-words").value,
+                    replace_existing: Boolean(document.getElementById("replace-existing-archive")?.checked)
                 })
             });
             startIngestPolling();

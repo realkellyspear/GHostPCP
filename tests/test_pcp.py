@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -34,6 +36,88 @@ class FakeEmbedder:
 
 
 class GHostPCPTests(unittest.TestCase):
+    def test_backup_failure_preserves_existing_volumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            first = out_dir / "ghost_pcp_01.md"
+            second = out_dir / "ghost_pcp_02.md"
+            first.write_text("first original", encoding="utf-8")
+            second.write_text("second original", encoding="utf-8")
+            copy_file = shutil.copy2
+            calls = 0
+
+            def fail_second_copy(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("backup failed")
+                return copy_file(source, destination)
+
+            with patch("pcp_ingest.shutil.copy2", side_effect=fail_second_copy):
+                with self.assertRaisesRegex(OSError, "backup failed"):
+                    write_pcp_volumes([("new user", "new answer")], out_dir, replace_existing=True)
+            self.assertEqual(first.read_text(encoding="utf-8"), "first original")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second original")
+
+    def test_removal_failure_keeps_complete_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            first = out_dir / "ghost_pcp_01.md"
+            second = out_dir / "ghost_pcp_02.md"
+            first.write_text("first original", encoding="utf-8")
+            second.write_text("second original", encoding="utf-8")
+            unlink = Path.unlink
+
+            def fail_second_removal(path, *args, **kwargs):
+                if path == second:
+                    raise OSError("removal failed")
+                return unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", autospec=True, side_effect=fail_second_removal):
+                with self.assertRaisesRegex(OSError, "removal failed"):
+                    write_pcp_volumes([("new user", "new answer")], out_dir, replace_existing=True)
+            backup = next((out_dir / "backups").iterdir())
+            self.assertEqual((backup / first.name).read_text(encoding="utf-8"), "first original")
+            self.assertEqual((backup / second.name).read_text(encoding="utf-8"), "second original")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second original")
+
+    def test_markdown_import_append_and_empty_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            original = out_dir / "ghost_pcp_01.md"
+            original.write_text("original", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ingest_files([("empty.md", b"  ")], output_dir=out_dir, replace_existing=True)
+            self.assertEqual(original.read_text(encoding="utf-8"), "original")
+            result = ingest_files([("new.md", b"new memory")], output_dir=out_dir)
+            self.assertEqual(result["volume_files"], ["ghost_pcp_02.md"])
+            self.assertEqual(original.read_text(encoding="utf-8"), "original")
+            self.assertEqual((out_dir / "ghost_pcp_02.md").read_text(encoding="utf-8").strip(), "new memory")
+
+    def test_repeated_replacement_creates_distinct_backups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            (out_dir / "ghost_pcp_01.md").write_text("original", encoding="utf-8")
+            with patch("pcp_ingest.datetime") as clock:
+                clock.now.return_value.strftime.return_value = "20261112_120000"
+                write_pcp_volumes([("first user", "first reply")], out_dir, replace_existing=True)
+                write_pcp_volumes([("second user", "second reply")], out_dir, replace_existing=True)
+            backups = list((out_dir / "backups").glob("backup_*/ghost_pcp_01.md"))
+            self.assertEqual(len(backups), 2)
+            contents = [path.read_text(encoding="utf-8") for path in backups]
+            self.assertIn("original", contents)
+            self.assertTrue(any("first reply" in text for text in contents))
+
+    def test_invalid_volume_size_preserves_existing_volumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            original = out_dir / "ghost_pcp_01.md"
+            original.write_text("original", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_pcp_volumes([("user", "answer")], out_dir,
+                                  interactions_per_volume=0, replace_existing=True)
+            self.assertEqual(original.read_text(encoding="utf-8"), "original")
+
     def test_no_forbidden_terms_in_codebase(self):
         forbidden = ("soul", "shard", "resurrection")
         checked_files = [
@@ -163,6 +247,38 @@ class GHostPCPTests(unittest.TestCase):
             # Verify newest session continuity is always included in search results
             continuity_hits = reloaded.search("Keep going with what we were saying", limit=2)
             self.assertTrue(any("[SESSION LOG: 2026-11-12 00:15:00]" in h for h in continuity_hits))
+
+            # Verify failed/empty import NEVER deletes existing ghost_pcp_*.md volumes
+            with self.assertRaises(ValueError):
+                ingest_files([("empty.json", b"[]")], output_dir=out_dir)
+            self.assertTrue((out_dir / "ghost_pcp_01.md").is_file())
+            self.assertTrue((out_dir / "ghost_pcp_02.md").is_file())
+            self.assertTrue((out_dir / "ghost_pcp_03.md").is_file())
+
+            # Verify default import appends as new volume (ghost_pcp_04.md) without overwriting 01..03
+            second_res = ingest_files(
+                [("export2.zip", zip_buf.getvalue())],
+                output_dir=out_dir,
+                blocked_phrases=["as an ai language model", "i don't have feelings"],
+                protected_words=["SpecialMemoryToken"],
+                interactions_per_volume=10,
+                replace_existing=False,
+            )
+            self.assertEqual(second_res["volume_files"], ["ghost_pcp_04.md"])
+            self.assertTrue((out_dir / "ghost_pcp_01.md").is_file())
+
+            # Verify replace_existing=True backs up existing volumes into pcp_data/backups/ before starting at 01
+            replace_res = ingest_files(
+                [("export3.zip", zip_buf.getvalue())],
+                output_dir=out_dir,
+                blocked_phrases=["as an ai language model", "i don't have feelings"],
+                protected_words=["SpecialMemoryToken"],
+                interactions_per_volume=10,
+                replace_existing=True,
+            )
+            self.assertEqual(replace_res["volume_files"], ["ghost_pcp_01.md"])
+            backups = list((out_dir / "backups").glob("backup_*/ghost_pcp_01.md"))
+            self.assertEqual(len(backups), 1)
 
     def test_api_endpoints_and_remote_pairing_auth(self):
         import ghost_pcp

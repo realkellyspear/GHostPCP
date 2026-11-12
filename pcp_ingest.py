@@ -10,7 +10,10 @@ import io
 import json
 import os
 import re
+import shutil
+import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -207,48 +210,80 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _next_volume_index(output_dir: Path) -> int:
+    max_idx = 0
+    for f in output_dir.glob("ghost_pcp_*.md"):
+        m = re.search(r"ghost_pcp_(\d+)", f.stem, re.IGNORECASE)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
+
+
+def _backup_existing_volumes(output_dir: Path) -> Optional[Path]:
+    existing = sorted(output_dir.glob("ghost_pcp_*.md"))
+    if not existing:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = output_dir / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_dir = Path(tempfile.mkdtemp(prefix=f"backup_{stamp}_", dir=backup_root))
+    for f in existing:
+        shutil.copy2(f, backup_dir / f.name)
+    for f in existing:
+        f.unlink()
+    return backup_dir
+
+
 def write_pcp_volumes(
     pairs: Sequence[Tuple[str, str]],
     output_dir: Path,
     interactions_per_volume: int = INTERACTIONS_PER_VOLUME,
+    replace_existing: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> List[Path]:
-    """Write interaction pairs into ghost_pcp_01.md, ghost_pcp_02.md, ..."""
+    """Write interaction pairs into ghost_pcp_01.md, ghost_pcp_02.md, ... safely."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove old ghost_pcp_*.md files before writing fresh set
-    for old_file in output_dir.glob("ghost_pcp_*.md"):
-        try:
-            old_file.unlink()
-        except OSError:
-            pass
+    # Filter out any empty pairs BEFORE touching existing files
+    cleaned_pairs: List[Tuple[str, str]] = []
+    for u_raw, a_raw in pairs:
+        u_clean = _clean_text(u_raw)
+        a_clean = _clean_text(a_raw)
+        if u_clean and a_clean:
+            cleaned_pairs.append((u_clean, a_clean))
 
-    total = len(pairs)
+    total = len(cleaned_pairs)
     if total == 0:
         raise ValueError("No valid conversation interactions were found in the uploaded file(s).")
+    if interactions_per_volume <= 0:
+        raise ValueError("interactions_per_volume must be greater than zero.")
+
+    if replace_existing:
+        _backup_existing_volumes(output_dir)
+        start_vol_idx = 1
+    else:
+        start_vol_idx = _next_volume_index(output_dir)
 
     written: List[Path] = []
     num_volumes = (total + interactions_per_volume - 1) // interactions_per_volume
 
-    for idx, start in enumerate(range(0, total, interactions_per_volume), start=1):
-        filename = f"ghost_pcp_{idx:02d}.md"
+    for offset, start in enumerate(range(0, total, interactions_per_volume)):
+        vol_idx = start_vol_idx + offset
+        filename = f"ghost_pcp_{vol_idx:02d}.md"
         out_path = output_dir / filename
-        batch = pairs[start : start + interactions_per_volume]
-        lines = [f"# **ARCHIVE VOLUME {idx}**", ""]
-        for u_raw, a_raw in batch:
-            u_clean = _clean_text(u_raw)
-            a_clean = _clean_text(a_raw)
-            if not u_clean or not a_clean:
-                continue
+        batch = cleaned_pairs[start : start + interactions_per_volume]
+        lines = [f"# **ARCHIVE VOLUME {vol_idx}**", ""]
+        for u_clean, a_clean in batch:
             lines.append(f"**USER:** {u_clean}")
             lines.append("")
             lines.append(f"**AI:** {a_clean}")
             lines.append("")
-        out_path.write_text("\n".join(lines), encoding="utf-8")
+        with out_path.open("x", encoding="utf-8") as output:
+            output.write("\n".join(lines))
         written.append(out_path)
         if progress_callback:
-            progress_callback(f"Writing {filename} ({idx}/{num_volumes})...", 0.25 + 0.25 * (idx / num_volumes))
+            progress_callback(f"Writing {filename} ({offset + 1}/{num_volumes})...", 0.25 + 0.25 * ((offset + 1) / num_volumes))
 
     return written
 
@@ -259,6 +294,7 @@ def ingest_files(
     blocked_phrases: Optional[Sequence[str]] = None,
     protected_words: Optional[Sequence[str]] = None,
     interactions_per_volume: int = INTERACTIONS_PER_VOLUME,
+    replace_existing: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> dict:
     """Ingest one or more dropped files (.zip, .json, .jsonl, or .md) into output_dir."""
@@ -324,23 +360,32 @@ def ingest_files(
 
     # If the user dropped pre-built Markdown files directly
     if md_payloads and not all_pairs:
-        for old_file in output_dir.glob("ghost_pcp_*.md"):
-            try:
-                old_file.unlink()
-            except OSError:
-                pass
+        non_empty_mds = [
+            (n, b.decode("utf-8-sig", errors="replace").strip())
+            for n, b in md_payloads
+            if b.decode("utf-8-sig", errors="replace").strip()
+        ]
+        if not non_empty_mds:
+            raise ValueError("Uploaded Markdown files were empty.")
+
+        if replace_existing:
+            _backup_existing_volumes(output_dir)
+            start_vol_idx = 1
+        else:
+            start_vol_idx = _next_volume_index(output_dir)
 
         # Sort naturally by embedded number if present
-        def _natural_key(item: Tuple[str, bytes]):
+        def _natural_key(item: Tuple[str, str]):
             nums = re.findall(r"\d+", item[0])
             return (int(nums[-1]) if nums else 999999, item[0].lower())
 
-        sorted_mds = sorted(md_payloads, key=_natural_key)
+        sorted_mds = sorted(non_empty_mds, key=_natural_key)
         written_paths: List[Path] = []
-        for idx, (_, content_bytes) in enumerate(sorted_mds, start=1):
-            target = output_dir / f"ghost_pcp_{idx:02d}.md"
-            text = content_bytes.decode("utf-8-sig", errors="replace")
-            target.write_text(text, encoding="utf-8")
+        for offset, (_, text) in enumerate(sorted_mds):
+            vol_idx = start_vol_idx + offset
+            target = output_dir / f"ghost_pcp_{vol_idx:02d}.md"
+            with target.open("x", encoding="utf-8") as output:
+                output.write(text + "\n")
             written_paths.append(target)
         return {
             "mode": "markdown_import",
@@ -363,6 +408,7 @@ def ingest_files(
         kept_pairs,
         output_dir=output_dir,
         interactions_per_volume=interactions_per_volume,
+        replace_existing=replace_existing,
         progress_callback=progress_callback,
     )
     return {

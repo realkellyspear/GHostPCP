@@ -230,7 +230,7 @@ PORT = _find_available_port(5555)
 MODEL_DIR = APP_DIR / "ghost_models"
 PIPER_MODEL_DIR = APP_DIR / "piper_models"
 PCP_DATA_DIR = APP_DIR / "pcp_data"
-BUNDLED_BGE_DIR = RESOURCE_DIR / "bge_model"
+BUNDLED_BGE_DIR = (APP_DIR / "bge_model") if (APP_DIR / "bge_model").is_dir() else (RESOURCE_DIR / "bge_model")
 SETTINGS_PATH = APP_DIR / "ghost_pcp_settings.json"
 PAIRING_TOKEN_PATH = PCP_DATA_DIR / ".pairing_token"
 HTML_PATH = (APP_DIR / "ghost_pcp.html") if (APP_DIR / "ghost_pcp.html").is_file() else (RESOURCE_DIR / "ghost_pcp.html")
@@ -1113,6 +1113,7 @@ class LocalPathIngestRequest(BaseModel):
     paths: List[str] = Field(min_length=1)
     blocked_phrases: Optional[str] = None
     protected_words: Optional[str] = None
+    replace_existing: bool = False
 
 
 class SaveSessionRequest(BaseModel):
@@ -1151,6 +1152,7 @@ def _start_background_ingest(
     file_items: List[Tuple[str, bytes]],
     blocked_phrases: List[str],
     protected_words: List[str],
+    replace_existing: bool = False,
 ) -> None:
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
@@ -1173,6 +1175,7 @@ def _start_background_ingest(
                 output_dir=PCP_DATA_DIR,
                 blocked_phrases=blocked_phrases,
                 protected_words=protected_words,
+                replace_existing=replace_existing,
                 progress_callback=_progress,
             )
             bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
@@ -1350,6 +1353,7 @@ async def pcp_ingest_upload(
     files: List[UploadFile] = File(...),
     blocked_phrases: Optional[str] = Form(default=None),
     protected_words: Optional[str] = Form(default=None),
+    replace_existing: bool = Form(default=False),
 ):
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
@@ -1364,7 +1368,7 @@ async def pcp_ingest_upload(
         content = await up.read()
         items.append((up.filename or "conversations.json", content))
 
-    _start_background_ingest(items, bp_list, pw_list)
+    _start_background_ingest(items, bp_list, pw_list, replace_existing=replace_existing)
     return {"status": "started", "files": len(items)}
 
 
@@ -1395,7 +1399,7 @@ def pcp_ingest_local(req: LocalPathIngestRequest):
     if not items:
         raise HTTPException(status_code=400, detail="No supported export files (.zip, .json, .jsonl, .md) found at path.")
 
-    _start_background_ingest(items, bp_list, pw_list)
+    _start_background_ingest(items, bp_list, pw_list, replace_existing=req.replace_existing)
     return {"status": "started", "files": len(items)}
 
 
