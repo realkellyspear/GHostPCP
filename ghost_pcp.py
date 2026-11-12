@@ -347,8 +347,20 @@ def _clean_text_for_speech(text: str) -> str:
     return cleaned
 
 
+DEFAULT_VOICE_URLS = {
+    "silas": {
+        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx",
+        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/ryan/high/en_US-ryan-high.onnx.json",
+    },
+    "kara": {
+        "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/amy/medium/en_US-amy-medium.onnx",
+        "json": "https://huggingface.co/rhasspy/piper-voices/resolve/e7229f7d33/en/en_US/amy/medium/en_US-amy-medium.onnx.json",
+    },
+}
+
+
 def scan_piper_voices() -> List[Dict[str, str]]:
-    voices: Dict[str, str] = {}
+    voices: Dict[str, str] = {"silas": "Silas", "kara": "Kara"}
     search_dirs = [
         PIPER_MODEL_DIR,
         RESOURCE_DIR / "piper_models",
@@ -359,8 +371,6 @@ def scan_piper_voices() -> List[Dict[str, str]]:
                 vid = f.stem.lower()
                 if vid not in voices:
                     voices[vid] = vid.capitalize()
-    if not voices:
-        voices = {"silas": "Silas", "kara": "Kara"}
     return [{"id": k, "label": v} for k, v in voices.items()]
 
 
@@ -373,6 +383,18 @@ def _resolve_piper_model_path(voice_name: str) -> Path:
     for path in candidates:
         if path.is_file():
             return path
+
+    if safe_voice in DEFAULT_VOICE_URLS:
+        PIPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        target_onnx = PIPER_MODEL_DIR / f"{safe_voice}.onnx"
+        target_json = PIPER_MODEL_DIR / f"{safe_voice}.onnx.json"
+        urls = DEFAULT_VOICE_URLS[safe_voice]
+        log.info(f"Downloading Piper voice '{safe_voice}' from Hugging Face to {PIPER_MODEL_DIR} ...")
+        urllib.request.urlretrieve(urls["json"], str(target_json))
+        urllib.request.urlretrieve(urls["onnx"], str(target_onnx))
+        if target_onnx.is_file():
+            return target_onnx
+
     raise FileNotFoundError(f"Piper voice model '{safe_voice}.onnx' not found in {PIPER_MODEL_DIR}")
 
 
