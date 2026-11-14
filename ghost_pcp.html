@@ -818,6 +818,8 @@
     let remoteMode = "lan";
     let remoteInfo = null;
     let ingestPollTimer = null;
+    let tunnelPollTimer = null;
+    let activeQrObjectUrl = null;
     let activeStreamController = null;
     let streamingIndex = null;
     let abortRequested = false;
@@ -842,7 +844,7 @@
             chat_format: document.getElementById("chat-format").value,
             system_prompt: document.getElementById("system-prompt").value,
             pcp_enabled: document.getElementById("pcp-enabled").checked,
-            pcp_top_k: Number(document.getElementById("pcp-top-k").value) || 4,
+            pcp_top_k: Math.trunc(Number(document.getElementById("pcp-top-k").value)) || 4,
             tts_voice: document.getElementById("tts-voice").value || "silas",
             blocked_phrases: document.getElementById("blocked-phrases").value,
             protected_words: document.getElementById("protected-words").value,
@@ -850,13 +852,13 @@
             temperature: Number(document.getElementById("temp-slider").value),
             top_p: Number(document.getElementById("top-slider").value),
             min_p: Number(document.getElementById("min-p").value),
-            top_k: Number(document.getElementById("top-k-sampler").value),
+            top_k: Math.trunc(Number(document.getElementById("top-k-sampler").value)),
             repeat_penalty: Number(document.getElementById("repeat-penalty").value),
             presence_penalty: Number(document.getElementById("presence-penalty").value),
-            seed: document.getElementById("seed").value === "" ? null : Number(document.getElementById("seed").value),
-            max_tokens: Number(document.getElementById("max-tokens").value),
+            seed: document.getElementById("seed").value === "" ? null : Math.trunc(Number(document.getElementById("seed").value)),
+            max_tokens: Math.trunc(Number(document.getElementById("max-tokens").value)) || 512,
             stop_sequences: document.getElementById("stop-sequences").value,
-            n_ctx: Number(document.getElementById("context-size").value)
+            n_ctx: Math.trunc(Number(document.getElementById("context-size").value)) || 8192
         };
     }
 
@@ -890,7 +892,7 @@
         document.getElementById("presence-penalty").value = presencePenalty;
         document.getElementById("presence-val").innerText = Number(presencePenalty).toFixed(2);
         document.getElementById("seed").value = settings.seed ?? "";
-        document.getElementById("max-tokens").value = settings.max_tokens;
+        document.getElementById("max-tokens").value = settings.max_tokens ?? 512;
         document.getElementById("stop-sequences").value = settings.stop_sequences || "";
         document.getElementById("context-size").value = settings.n_ctx || 8192;
     }
@@ -1447,6 +1449,9 @@
             paintHandle = null;
             const body = document.querySelector(`[data-message-index="${targetIndex}"] .message-body`);
             if (body) body.textContent = accumulated;
+            const container = document.getElementById("chat-container");
+            const nearBottom = (container.scrollHeight - container.scrollTop - container.clientHeight) < 120;
+            if (nearBottom) container.scrollTop = container.scrollHeight;
         };
         const queuePaint = () => {
             if (paintHandle === null) paintHandle = requestAnimationFrame(paint);
@@ -1456,4 +1461,4 @@
                 .filter(line => line.startsWith("data:"))
                 .map(line => line.slice(5).replace(/^ /, ""))
                 .join("\n");
-            if (!data ||
+            if (!data || data ===
