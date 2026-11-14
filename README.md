@@ -1,4 +1,4 @@
-![GHost PCP — GPU Hosted Pure Concentrated Personality](GHostPCP%20Promo/pcp_banner_fixed.png)
+![GHost PCP — GPU Hosted Pure Concentrated Personality](GHostPCP%20Promo/new/1github_banner.jpg)
 
 # GHost PCP
 
