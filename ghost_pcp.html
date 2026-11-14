@@ -1,10 +1,13 @@
+<!-- SPDX-FileCopyrightText: 2026 Kelly Spear -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="referrer" content="no-referrer">
-    <title>GHost PCP // GPU Hosted Pure Concentrated Personality</title>
+    <link rel="icon" type="image/png" href="/assets/ghost_favicon.png" sizes="16x16">
+    <title>GHostPCP // GPU Hosted Pure Concentrated Personality</title>
     <style>
         :root {
             --bg: #090a0d;
@@ -62,10 +65,10 @@
             gap: 12px;
         }
         .brand img {
-            width: 38px;
-            height: 38px;
+            width: 240px;
+            max-width: 42vw;
+            height: auto;
             object-fit: contain;
-            border-radius: 50%;
         }
         .brand-titles {
             display: flex;
@@ -160,14 +163,10 @@
             background: rgba(17, 19, 24, 0.75);
         }
         .empty-state img {
-            width: 64px;
-            height: 64px;
-            margin-bottom: 10px;
-        }
-        .empty-state h2 {
-            margin: 0 0 6px;
-            color: var(--purple);
-            font-size: 18px;
+            display: block;
+            width: min(240px, 100%);
+            height: auto;
+            margin: 0 auto 12px;
         }
         .empty-state p {
             margin: 0;
@@ -239,6 +238,38 @@
         .message:hover .message-actions,
         .message:focus-within .message-actions {
             opacity: 1;
+        }
+        .message-actions.live {
+            opacity: 1;
+        }
+        .message.pending .message-body::after {
+            content: "\25CF";
+            color: var(--purple);
+            margin-left: 4px;
+            animation: ghost-pulse 1s ease-in-out infinite;
+        }
+        @keyframes ghost-pulse {
+            0%, 100% { opacity: 0.25; }
+            50% { opacity: 1; }
+        }
+        .msg-btn.stop-btn {
+            color: var(--warn);
+            border-color: rgba(255, 197, 110, 0.45);
+            background: rgba(255, 197, 110, 0.1);
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .msg-btn.stop-btn:hover:not(:disabled) {
+            background: rgba(255, 197, 110, 0.2);
+            border-color: var(--warn);
+            color: var(--warn);
+        }
+        .msg-btn.stop-btn svg {
+            width: 10px;
+            height: 10px;
+            fill: currentColor;
+            stroke: none;
         }
         .msg-btn {
             background: transparent;
@@ -541,11 +572,7 @@
 
 <header>
     <div class="brand">
-        <img src="/assets/ghost_icon.png" alt="GHost PCP Logo">
-        <div class="brand-titles">
-            <div class="logo">GHost PCP</div>
-            <div class="subtitle">GPU Hosted Pure Concentrated Personality · Break Your AI Out of the Cloud and Onto Your Own Hardware</div>
-        </div>
+        <img src="/assets/ghost_wordmark.png" alt="GHostPCP — GPU Hosted Pure Concentrated Personality">
     </div>
     <div class="header-controls">
         <span id="pcp-badge" class="badge" onclick="openArchiveModal()" title="Manage PCP Archive Volumes">PCP: CHECKING...</span>
@@ -569,7 +596,7 @@
 <div id="settings-modal" class="modal-backdrop">
     <div class="modal-content">
         <div class="modal-header">
-            <h3>GHost PCP // ENGINE & PERSONA CONFIG</h3>
+            <h3>GHostPCP // ENGINE & PERSONA CONFIG</h3>
             <button class="secondary" onclick="closeSettings()">CLOSE</button>
         </div>
 
@@ -651,10 +678,16 @@
                 <input type="range" id="temp-slider" min="0" max="2" step="0.05" value="0.7" oninput="document.getElementById('temp-val').innerText = this.value">
                 <label style="margin-top: 6px;">Top P (<span id="top-val">0.95</span>)</label>
                 <input type="range" id="top-slider" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('top-val').innerText = this.value">
+                <label style="margin-top: 6px;">Top K (<span id="top-k-val">40</span>)</label>
+                <input type="range" id="top-k-sampler" min="0" max="100" step="1" value="40" oninput="document.getElementById('top-k-val').innerText = this.value">
             </div>
             <div class="control-group">
                 <label>Min P (<span id="min-p-val">0.05</span>)</label>
                 <input type="range" id="min-p" min="0" max="1" step="0.01" value="0.05" oninput="document.getElementById('min-p-val').innerText = this.value">
+                <label style="margin-top: 6px;">Repetition Penalty (<span id="repeat-val">1.00</span>)</label>
+                <input type="range" id="repeat-penalty" min="0.8" max="1.5" step="0.01" value="1" oninput="document.getElementById('repeat-val').innerText = Number(this.value).toFixed(2)">
+                <label style="margin-top: 6px;">Presence Penalty (<span id="presence-val">0.00</span>)</label>
+                <input type="range" id="presence-penalty" min="-2" max="2" step="0.05" value="0" oninput="document.getElementById('presence-val').innerText = Number(this.value).toFixed(2)">
                 <label style="margin-top: 8px;"><input type="checkbox" id="show-reasoning" onchange="renderConversation()"> Show `<think>` reasoning disclosure</label>
             </div>
         </div>
@@ -687,7 +720,7 @@
 <div id="archive-modal" class="modal-backdrop">
     <div class="modal-content">
         <div class="modal-header">
-            <h3>GHost PCP // ARCHIVE IMPORT & INDEXING</h3>
+            <h3>GHostPCP // ARCHIVE IMPORT & INDEXING</h3>
             <button class="secondary" onclick="closeArchiveModal()">CLOSE</button>
         </div>
 
@@ -696,7 +729,7 @@
         <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
             <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.md" style="display: none;" onchange="handleFileSelect(this.files)">
             <h4>Drop Your ChatGPT Export (.zip or conversations.json) Here</h4>
-            <p>Or click to select your export `.zip`, `conversations.json`, or `.md` files.<br>GHost PCP will automatically extract, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
+            <p>Or click to select your export `.zip`, `conversations.json`, or `.md` files.<br>GHostPCP will automatically extract, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
         </div>
 
         <div class="control-group">
@@ -729,12 +762,12 @@
 <div id="remote-modal" class="modal-backdrop">
     <div class="modal-content">
         <div class="modal-header">
-            <h3>GHost PCP // PHONE & ANYWHERE ACCESS</h3>
+            <h3>GHostPCP // PHONE & ANYWHERE ACCESS</h3>
             <button class="secondary" onclick="closeRemoteModal()">CLOSE</button>
         </div>
 
         <p style="margin: 0; color: var(--muted); line-height: 1.5;">
-            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHost PCP on your phone. Your phone gets the full interface—you can chat, switch models, and adjust settings remotely.
+            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHostPCP on your phone. Your phone gets the full interface—you can chat, switch models, and adjust settings remotely.
         </p>
 
         <div class="tab-row">
@@ -782,6 +815,9 @@
     let remoteMode = "lan";
     let remoteInfo = null;
     let ingestPollTimer = null;
+    let activeStreamController = null;
+    let streamingIndex = null;
+    let abortRequested = false;
 
     async function api(path, options = {}) {
         const headers = new Headers(options.headers || {});
@@ -811,6 +847,9 @@
             temperature: Number(document.getElementById("temp-slider").value),
             top_p: Number(document.getElementById("top-slider").value),
             min_p: Number(document.getElementById("min-p").value),
+            top_k: Number(document.getElementById("top-k-sampler").value),
+            repeat_penalty: Number(document.getElementById("repeat-penalty").value),
+            presence_penalty: Number(document.getElementById("presence-penalty").value),
             seed: document.getElementById("seed").value === "" ? null : Number(document.getElementById("seed").value),
             max_tokens: Number(document.getElementById("max-tokens").value),
             stop_sequences: document.getElementById("stop-sequences").value,
@@ -829,12 +868,24 @@
         document.getElementById("blocked-phrases").value = settings.blocked_phrases ?? "";
         document.getElementById("protected-words").value = settings.protected_words ?? "";
         document.getElementById("show-reasoning").checked = settings.show_reasoning === true;
-        document.getElementById("temp-slider").value = settings.temperature;
-        document.getElementById("temp-val").innerText = settings.temperature;
-        document.getElementById("top-slider").value = settings.top_p;
-        document.getElementById("top-val").innerText = settings.top_p;
-        document.getElementById("min-p").value = settings.min_p;
-        document.getElementById("min-p-val").innerText = settings.min_p;
+        const temperature = settings.temperature ?? 0.7;
+        const topP = settings.top_p ?? 0.95;
+        const minP = settings.min_p ?? 0.05;
+        const topK = settings.top_k ?? 40;
+        const repeatPenalty = settings.repeat_penalty ?? 1.0;
+        const presencePenalty = settings.presence_penalty ?? 0;
+        document.getElementById("temp-slider").value = temperature;
+        document.getElementById("temp-val").innerText = temperature;
+        document.getElementById("top-slider").value = topP;
+        document.getElementById("top-val").innerText = topP;
+        document.getElementById("min-p").value = minP;
+        document.getElementById("min-p-val").innerText = minP;
+        document.getElementById("top-k-sampler").value = topK;
+        document.getElementById("top-k-val").innerText = topK;
+        document.getElementById("repeat-penalty").value = repeatPenalty;
+        document.getElementById("repeat-val").innerText = Number(repeatPenalty).toFixed(2);
+        document.getElementById("presence-penalty").value = presencePenalty;
+        document.getElementById("presence-val").innerText = Number(presencePenalty).toFixed(2);
         document.getElementById("seed").value = settings.seed ?? "";
         document.getElementById("max-tokens").value = settings.max_tokens;
         document.getElementById("stop-sequences").value = settings.stop_sequences || "";
@@ -1082,8 +1133,7 @@
                 : "";
             empty.innerHTML = `
                 ${bannerHtml}
-                <img src="/assets/ghost_icon.png" alt="">
-                <h2>GHost PCP</h2>
+                <img src="/assets/ghost_logo_portrait.png" alt="GHostPCP — GPU Hosted Pure Concentrated Personality">
                 <p>GPU Hosted Pure Concentrated Personality.<br>Your archive volumes are treated as authoritative lived memory—with zero citations or document labels.</p>
             `;
             container.appendChild(empty);
@@ -1096,6 +1146,7 @@
             const isUser = msg.role === "user";
             const div = document.createElement("div");
             div.className = `message ${isUser ? "user" : "ai"}`;
+            div.dataset.messageIndex = String(idx);
 
             if (editingIndex === idx) {
                 const editWrap = document.createElement("div");
@@ -1154,6 +1205,17 @@
                 // Action Bar (Speaker on AI output only; Copy & Delete on both sides; Edit & Redo on AI responses)
                 const actions = document.createElement("div");
                 actions.className = "message-actions";
+                if (isGenerating && idx === streamingIndex) {
+                    actions.classList.add("live");
+                    div.classList.add("pending");
+                    const stopBtn = document.createElement("button");
+                    stopBtn.className = "msg-btn stop-btn";
+                    stopBtn.innerHTML = `${STOP_ICON_SVG}<span> Stop</span>`;
+                    stopBtn.title = "Stop generating this response";
+                    stopBtn.disabled = abortRequested;
+                    stopBtn.onclick = stopGeneration;
+                    actions.appendChild(stopBtn);
+                }
 
                 if (!isUser) {
                     const speakBtn = document.createElement("button");
@@ -1336,30 +1398,124 @@
         renderConversation(false);
     }
 
-    async function requestCompletionForHistory(historySlice) {
+    async function stopGeneration() {
+        if (!isGenerating || abortRequested) return;
+        abortRequested = true;
+        renderConversation(false);
+        try {
+            const result = await api("/abort", { method: "POST" });
+            if (result.status !== "aborting") {
+                abortRequested = false;
+                renderConversation(false);
+                return;
+            }
+        } catch (e) {
+            abortRequested = false;
+            renderConversation(false);
+            setStatus(`Could not stop generation: ${e.message}`, "var(--warn)");
+            return;
+        }
+        if (activeStreamController) activeStreamController.abort();
+    }
+
+    async function requestCompletionForHistory(historySlice, targetIndex) {
         const settings = lastSettings || readSettings();
         const stop = (settings.stop_sequences || "").split(/\r?\n/).map(v => v.trim()).filter(Boolean);
         const messages = settings.system_prompt
             ? [{role: "system", content: settings.system_prompt}, ...historySlice.slice(-20)]
             : [...historySlice.slice(-20)];
-        const data = await api("/chat/completions", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({
+        const controller = new AbortController();
+        activeStreamController = controller;
+        let accumulated = "";
+        let sawAbortMarker = false;
+        let paintHandle = null;
+        const paint = () => {
+            paintHandle = null;
+            const body = document.querySelector(`[data-message-index="${targetIndex}"] .message-body`);
+            if (body) body.textContent = accumulated;
+        };
+        const queuePaint = () => {
+            if (paintHandle === null) paintHandle = requestAnimationFrame(paint);
+        };
+        const consumeFrame = (frame) => {
+            const data = frame.split(/\r?\n/)
+                .filter(line => line.startsWith("data:"))
+                .map(line => line.slice(5).replace(/^ /, ""))
+                .join("\n");
+            if (!data || data === "[DONE]") return;
+            let chunk;
+            try {
+                chunk = JSON.parse(data);
+            } catch (e) {
+                throw new Error("The server returned an invalid streaming response.");
+            }
+            if (chunk.error) throw new Error(chunk.error.message || "Generation error");
+            if (chunk.ghost_aborted) sawAbortMarker = true;
+            const delta = chunk.choices?.[0]?.delta;
+            if (!delta) return;
+            if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+                accumulated += `<think>${delta.reasoning_content}</think>`;
+            }
+            if (typeof delta.content === "string" && delta.content) accumulated += delta.content;
+            queuePaint();
+        };
+        const headers = { "Content-Type": "application/json", "Accept": "text/event-stream" };
+        const token = getAuthToken();
+        if (token) headers.Authorization = `Bearer ${token}`;
+
+        try {
+            const response = await fetch(`${API}/chat/completions`, {
+                method: "POST",
+                headers,
+                signal: controller.signal,
+                body: JSON.stringify({
                 model: currentModel,
                 messages: messages,
+                stream: true,
                 temperature: settings.temperature,
                 top_p: settings.top_p,
                 min_p: settings.min_p,
+                top_k: settings.top_k,
+                repeat_penalty: settings.repeat_penalty,
+                presence_penalty: settings.presence_penalty,
                 seed: settings.seed,
                 stop: stop.length ? stop : null,
                 max_tokens: settings.max_tokens,
                 use_pcp: settings.pcp_enabled,
                 pcp_top_k: settings.pcp_top_k,
                 show_reasoning: settings.show_reasoning
-            })
-        });
-        return data.choices[0].message.content;
+                })
+            });
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.detail || error.error || `Request failed (${response.status})`);
+            }
+            if (!response.body) throw new Error("The server did not provide a streaming response.");
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            try {
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const frames = buffer.split(/\r?\n\r?\n/);
+                    buffer = frames.pop();
+                    for (const frame of frames) consumeFrame(frame);
+                }
+                buffer += decoder.decode();
+                if (buffer.trim()) consumeFrame(buffer);
+            } finally {
+                reader.releaseLock();
+            }
+        } catch (e) {
+            if (e.name !== "AbortError" || !controller.signal.aborted) throw e;
+        } finally {
+            if (paintHandle !== null) cancelAnimationFrame(paintHandle);
+            paint();
+            if (activeStreamController === controller) activeStreamController = null;
+        }
+        return {content: accumulated, aborted: sawAbortMarker || abortRequested};
     }
 
     async function redoMessage(idx) {
@@ -1371,6 +1527,7 @@
         if (!historyBefore.some(m => m.role === "user")) return;
 
         isGenerating = true;
+        abortRequested = false;
         editingIndex = null;
         const sendButton = document.getElementById("send-button");
         const newChatButton = document.getElementById("new-chat-button");
@@ -1378,12 +1535,19 @@
         newChatButton.disabled = true;
 
         const previousContent = conversation[idx].content;
-        conversation[idx].content = "*Regenerating response...*";
+        conversation[idx].content = "";
+        streamingIndex = idx;
         renderConversation(false);
 
         try {
-            const reply = await requestCompletionForHistory(historyBefore);
-            conversation[idx].content = reply;
+            const result = await requestCompletionForHistory(historyBefore, idx);
+            if (result.aborted) {
+                conversation[idx].content = result.content
+                    ? `${result.content}\n\n*[Stopped by you.]*`
+                    : "*[Stopped before any output.]*";
+            } else {
+                conversation[idx].content = result.content || previousContent;
+            }
             renderConversation(false);
         } catch (e) {
             conversation[idx].content = previousContent;
@@ -1391,6 +1555,9 @@
             alert(`Redo failed: ${e.message}`);
         } finally {
             isGenerating = false;
+            abortRequested = false;
+            streamingIndex = null;
+            activeStreamController = null;
             sendButton.disabled = false;
             newChatButton.disabled = false;
             renderConversation(false);
@@ -1407,6 +1574,7 @@
             return;
         }
         isGenerating = true;
+        abortRequested = false;
         editingIndex = null;
         const sendButton = document.getElementById("send-button");
         const newChatButton = document.getElementById("new-chat-button");
@@ -1415,17 +1583,29 @@
 
         conversation.push({role: "user", content: text});
         input.value = "";
+        const replyIndex = conversation.length;
+        conversation.push({role: "assistant", content: ""});
+        streamingIndex = replyIndex;
         renderConversation(true);
 
         try {
-            const reply = await requestCompletionForHistory(conversation);
-            conversation.push({role: "assistant", content: reply});
-            renderConversation(true);
+            const result = await requestCompletionForHistory(conversation.slice(0, replyIndex), replyIndex);
+            if (result.aborted) {
+                conversation[replyIndex].content = result.content
+                    ? `${result.content}\n\n*[Stopped by you.]*`
+                    : "*[Stopped before any output.]*";
+            } else {
+                conversation[replyIndex].content = result.content || "(empty response)";
+            }
         } catch (e) {
-            conversation.push({role: "assistant", content: `ERROR: ${e.message}`});
-            renderConversation(true);
+            conversation[replyIndex].content = abortRequested
+                ? (conversation[replyIndex].content || "*[Stopped before any output.]*")
+                : `ERROR: ${e.message}`;
         } finally {
             isGenerating = false;
+            abortRequested = false;
+            streamingIndex = null;
+            activeStreamController = null;
             sendButton.disabled = false;
             newChatButton.disabled = false;
             renderConversation(false);
