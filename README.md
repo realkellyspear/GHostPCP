@@ -7,7 +7,7 @@
 
 GHost PCP is a local-first desktop and mobile-paired application for Windows. Import your ChatGPT export archive (`.zip` or `conversations.json`), mount a local `.gguf` language model, and chat with a persona grounded in your conversation history.
 
-![GHost PCP desktop interface](GHostPCP%20Promo/save_clear.png)
+![GHost PCP desktop interface](GHostPCP%20Promo/newsc.png)
 
 ---
 
