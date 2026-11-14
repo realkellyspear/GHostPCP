@@ -1,4 +1,4 @@
-llama-cpp-python>=0.2.90
+llama-cpp-python==0.3.35
 fastapi>=0.111.0
 uvicorn>=0.30.0
 pydantic>=2.7.0
@@ -13,8 +13,8 @@ qrcode>=7.4
 python-multipart>=0.0.9
 requests>=2.31.0
 pefile>=2023.2.7
-piper-tts>=1.2.0
-onnxruntime>=1.18.0
+piper-tts==1.8.0
+onnxruntime==1.30.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 nvidia-cublas==13.3.0.5; sys_platform == "win32" and platform_machine == "AMD64"
