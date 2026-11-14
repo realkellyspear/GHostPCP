@@ -13,9 +13,9 @@ GHost PCP is a local-first desktop and mobile-paired application for Windows. Im
 
 ## Why GHost PCP Exists
 
-Standard "chat with your docs" tools act like research librarians (*"According to source document 4..."*). GHost PCP prompts the model to treat your archive as the authoritative source for the persona's history and respond without citations. Like any language model, it can still make mistakes or invent details.
+Standard "chat with your docs" tools act like research librarians. GHost PCP prompts the model to treat your archive as the authoritative source for the persona's history and respond without citations. Like any language model, it can still make mistakes or invent details.
 
-1. **Drop & Forget Onboarding**: Drop your ChatGPT export `.zip` (or `conversations.json`) into the app. In the background, GHost PCP unpacks the conversation tree, strips out canned corporate refusals (*"As an AI language model..."*), organizes your history into clean Markdown volumes (`ghost_pcp_01.md`, `ghost_pcp_02.md`, ...), and builds a cached semantic vector index (`embeddings.npz`) using `BAAI/bge-small-en-v1.5`.
+1. **Drop & Forget Onboarding**: Drop your ChatGPT export `.zip` (or `conversations.json`) into the app. In the background, GHost PCP unpacks the conversation tree, strips out canned corporate refusals, organizes your history into clean Markdown volumes (`ghost_pcp_01.md`, `ghost_pcp_02.md`, ...), and builds a cached semantic vector index (`embeddings.npz`) using `BAAI/bge-small-en-v1.5`.
 2. **Hardware-Aware GGUF Workbench**: Powered by `llama.cpp` with automatic NVIDIA VRAM preflight sizing (`Check Fit` / `Mount` / `Unload`), FP16/Q8_0 KV cache selection, and full sampling control.
 3. **Citation-Free Persona Grounding & Save & Clear Continuity**: Every turn retrieves the most relevant passages from your `ghost_pcp_*.md` volumes in ~24ms and grounds the model silently in character. Click **SAVE & CLEAR** at the top of the window to save the current chat thread with a timestamp directly into your PCP archive (`ghost_pcp_NN.md`), update the vector index in ~0.13s, and clear the window so the conversation continues without missing a beat.
 4. **Built-In Fast Local Read-Aloud Voices**: Choose your preferred voice (such as **Silas** or **Kara**, or any `.onnx` voice dropped into `piper_models/`) in **[ CONFIG ]**, and click the speaker icon on any of the model's responses for instant local Piper ONNX synthesis (~0.17s latency) and seamless background playback via `sounddevice` on PC (or Web Audio when connected from your phone).
@@ -70,7 +70,7 @@ GHost-PCP/
 6. *(Optional)* Click **[ PHONE / TUNNEL ]** and scan the QR code to pair your phone over Wi-Fi, Tailscale, or a 1-click Cloudflare HTTPS Quick Tunnel.
 
 ### Option B: Run from Python Source
-Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files are not included.
+Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files (besides Silas voice and Kara voice) are not included.
 
 ```powershell
 python -m venv .venv
@@ -115,4 +115,4 @@ volumes**.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GNU General Public License v3.0. See [LICENSE](LICENSE).
