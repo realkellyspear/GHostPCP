@@ -77,7 +77,7 @@ GHostPCP.exe                 Standalone desktop application (built locally)
 7. Responses stream as they are generated. Click **Stop** on the active response to interrupt generation.
 
 ### Option B: Run from Python Source
-Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files are not included.
+Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files (besides Silas voice and Kara voice) are not included.
 
 ```powershell
 python -m venv .venv
