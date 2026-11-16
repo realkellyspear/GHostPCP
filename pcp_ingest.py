@@ -1,4 +1,6 @@
-"""GHost PCP — Archive Extractor, Corporate Refusal Stripper, and Volume Writer.
+# SPDX-FileCopyrightText: 2026 Kelly Spear
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""GHostPCP — Archive Extractor, Corporate Refusal Stripper, and Volume Writer.
 
 Transforms ChatGPT export archives (.zip or conversations.json), JSONL pairs,
 or Markdown files into clean, high-density Markdown volumes:
@@ -20,6 +22,34 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 from persona import DEFAULT_BLOCKED_PHRASES, DEFAULT_PROTECTED_WORDS
 
 INTERACTIONS_PER_VOLUME = 1000
+SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log"}
+
+
+def extract_text_from_document(filename: str, raw_bytes: bytes) -> str:
+    """Extract clean readable text from .pdf, .txt, .md, .csv, or .log uploads."""
+    safe_name = Path(filename).name
+    suffix = Path(safe_name).suffix.lower()
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise RuntimeError("PDF support requires pypdf to be installed.") from exc
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        pages: List[str] = []
+        for page in reader.pages:
+            extracted = (page.extract_text() or "").strip()
+            if extracted:
+                pages.append(extracted)
+        text = "\n\n".join(pages).strip()
+        if not text:
+            raise ValueError(f"No readable text was found in PDF '{safe_name}' (scanned image PDFs need OCR first).")
+        return text
+    if suffix in SUPPORTED_TEXT_EXTENSIONS:
+        text = raw_bytes.decode("utf-8-sig", errors="replace").strip()
+        if not text:
+            raise ValueError(f"File '{safe_name}' is empty.")
+        return text
+    raise ValueError(f"Unsupported document format '{suffix}'. Supported: .pdf, .txt, .md, .csv, .log")
 
 
 def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
@@ -288,6 +318,40 @@ def write_pcp_volumes(
     return written
 
 
+def _write_markdown_payloads(
+    md_payloads: Sequence[Tuple[str, bytes]],
+    output_dir: Path,
+    replace_existing: bool = False,
+) -> List[Path]:
+    non_empty_mds = [
+        (n, b.decode("utf-8-sig", errors="replace").strip())
+        for n, b in md_payloads
+        if b.decode("utf-8-sig", errors="replace").strip()
+    ]
+    if not non_empty_mds:
+        raise ValueError("Uploaded document or Markdown files were empty.")
+
+    if replace_existing:
+        _backup_existing_volumes(output_dir)
+        start_vol_idx = 1
+    else:
+        start_vol_idx = _next_volume_index(output_dir)
+
+    def _natural_key(item: Tuple[str, str]):
+        nums = re.findall(r"\d+", item[0])
+        return (int(nums[-1]) if nums else 999999, item[0].lower())
+
+    sorted_mds = sorted(non_empty_mds, key=_natural_key)
+    written_paths: List[Path] = []
+    for offset, (_, text) in enumerate(sorted_mds):
+        vol_idx = start_vol_idx + offset
+        target = output_dir / f"ghost_pcp_{vol_idx:02d}.md"
+        with target.open("x", encoding="utf-8") as output:
+            output.write(text + "\n")
+        written_paths.append(target)
+    return written_paths
+
+
 def ingest_files(
     file_items: Sequence[Tuple[str, bytes]],
     output_dir: Path,
@@ -297,7 +361,7 @@ def ingest_files(
     replace_existing: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> dict:
-    """Ingest one or more dropped files (.zip, .json, .jsonl, or .md) into output_dir."""
+    """Ingest one or more dropped files (.zip, .json, .jsonl, .md, .txt, or .pdf) into output_dir."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -308,10 +372,11 @@ def ingest_files(
     md_payloads: List[Tuple[str, bytes]] = []
 
     for name, raw_bytes in file_items:
-        lower_name = Path(name).name.lower()
+        safe_name = Path(name).name
+        lower_name = safe_name.lower()
         if lower_name.endswith(".zip"):
             if progress_callback:
-                progress_callback(f"Unpacking {Path(name).name}...", 0.10)
+                progress_callback(f"Unpacking {safe_name}...", 0.10)
             with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                 members = sorted(zf.namelist())
                 json_members = [
@@ -323,15 +388,16 @@ def ingest_files(
                     )
                 ]
                 md_members = [m for m in members if not m.endswith("/") and m.lower().endswith(".md")]
+                doc_members = [
+                    m for m in members
+                    if not m.endswith("/") and Path(m).suffix.lower() in (".txt", ".pdf")
+                ]
                 if json_members:
                     for jm in json_members:
                         if progress_callback:
                             progress_callback(f"Parsing {Path(jm).name}...", 0.15)
                         data = json.loads(zf.read(jm).decode("utf-8-sig", errors="replace"))
                         all_pairs.extend(extract_pairs_from_data(data))
-                elif md_members:
-                    for mm in md_members:
-                        md_payloads.append((Path(mm).name, zf.read(mm)))
                 else:
                     # Fallback: try any .json file inside the zip
                     any_json = [m for m in members if not m.endswith("/") and m.lower().endswith(".json")]
@@ -341,14 +407,23 @@ def ingest_files(
                             all_pairs.extend(extract_pairs_from_data(data))
                         except Exception:
                             continue
+                for mm in md_members:
+                    md_payloads.append((Path(mm).name, zf.read(mm)))
+                for dm in doc_members:
+                    doc_title = Path(dm).name
+                    if progress_callback:
+                        progress_callback(f"Extracting {doc_title}...", 0.16)
+                    extracted = extract_text_from_document(doc_title, zf.read(dm))
+                    formatted = f"# **DOCUMENT: {doc_title}**\n\n{extracted}\n".encode("utf-8")
+                    md_payloads.append((doc_title, formatted))
         elif lower_name.endswith(".json"):
             if progress_callback:
-                progress_callback(f"Parsing {Path(name).name}...", 0.15)
+                progress_callback(f"Parsing {safe_name}...", 0.15)
             data = json.loads(raw_bytes.decode("utf-8-sig", errors="replace"))
             all_pairs.extend(extract_pairs_from_data(data))
         elif lower_name.endswith(".jsonl"):
             if progress_callback:
-                progress_callback(f"Parsing {Path(name).name}...", 0.15)
+                progress_callback(f"Parsing {safe_name}...", 0.15)
             rows = [
                 json.loads(line)
                 for line in raw_bytes.decode("utf-8-sig", errors="replace").splitlines()
@@ -356,37 +431,17 @@ def ingest_files(
             ]
             all_pairs.extend(extract_pairs_from_data(rows))
         elif lower_name.endswith(".md"):
-            md_payloads.append((Path(name).name, raw_bytes))
+            md_payloads.append((safe_name, raw_bytes))
+        elif Path(lower_name).suffix in (".txt", ".pdf"):
+            if progress_callback:
+                progress_callback(f"Extracting {safe_name}...", 0.15)
+            extracted = extract_text_from_document(safe_name, raw_bytes)
+            formatted = f"# **DOCUMENT: {safe_name}**\n\n{extracted}\n".encode("utf-8")
+            md_payloads.append((safe_name, formatted))
 
-    # If the user dropped pre-built Markdown files directly
+    # If only Markdown/document files were provided
     if md_payloads and not all_pairs:
-        non_empty_mds = [
-            (n, b.decode("utf-8-sig", errors="replace").strip())
-            for n, b in md_payloads
-            if b.decode("utf-8-sig", errors="replace").strip()
-        ]
-        if not non_empty_mds:
-            raise ValueError("Uploaded Markdown files were empty.")
-
-        if replace_existing:
-            _backup_existing_volumes(output_dir)
-            start_vol_idx = 1
-        else:
-            start_vol_idx = _next_volume_index(output_dir)
-
-        # Sort naturally by embedded number if present
-        def _natural_key(item: Tuple[str, str]):
-            nums = re.findall(r"\d+", item[0])
-            return (int(nums[-1]) if nums else 999999, item[0].lower())
-
-        sorted_mds = sorted(non_empty_mds, key=_natural_key)
-        written_paths: List[Path] = []
-        for offset, (_, text) in enumerate(sorted_mds):
-            vol_idx = start_vol_idx + offset
-            target = output_dir / f"ghost_pcp_{vol_idx:02d}.md"
-            with target.open("x", encoding="utf-8") as output:
-                output.write(text + "\n")
-            written_paths.append(target)
+        written_paths = _write_markdown_payloads(md_payloads, output_dir, replace_existing=replace_existing)
         return {
             "mode": "markdown_import",
             "interactions_total": 0,
@@ -411,6 +466,10 @@ def ingest_files(
         replace_existing=replace_existing,
         progress_callback=progress_callback,
     )
+    if md_payloads:
+        written_paths.extend(
+            _write_markdown_payloads(md_payloads, output_dir, replace_existing=False)
+        )
     return {
         "mode": "chatgpt_export",
         "interactions_total": len(all_pairs),

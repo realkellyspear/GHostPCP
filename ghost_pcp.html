@@ -6,9 +6,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="referrer" content="no-referrer">
-    <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">
-    <link rel="icon" type="image/png" sizes="64x64" href="/assets/favicon-64.png">
-    <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+    <link rel="icon" type="image/png" href="/assets/ghost_favicon.png" sizes="16x16">
+    <link rel="icon" type="image/png" href="/assets/favicon-32.png" sizes="32x32">
     <link rel="icon" type="image/x-icon" href="/assets/ghost_icon.ico">
     <title>GHostPCP // GPU Hosted Pure Concentrated Personality</title>
     <style>
@@ -357,6 +356,57 @@
             overflow-wrap: anywhere;
             font: inherit;
         }
+        #chat-attachments-bar {
+            width: min(1000px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 8px 0 0;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .attachment-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 10px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: rgba(168, 85, 247, 0.12);
+            font-size: 12px;
+        }
+        .attachment-chip button {
+            padding: 2px 8px;
+            font-size: 11px;
+            border-radius: 999px;
+        }
+        #attach-file-button {
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        details.chat-attachment-card {
+            margin: 0 0 8px 0;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(168, 85, 247, 0.12);
+            padding: 6px 10px;
+            font-size: 12px;
+        }
+        details.chat-attachment-card summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--purple);
+            user-select: none;
+        }
+        details.chat-attachment-card pre {
+            margin: 8px 0 0 0;
+            max-height: 220px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: inherit;
+            font-size: 12px;
+            opacity: 0.9;
+        }
         #input-area {
             width: min(1000px, calc(100% - 32px));
             margin: 0 auto;
@@ -590,7 +640,10 @@
 
 <div id="chat-container"></div>
 
+<div id="chat-attachments-bar" style="display: none;"></div>
 <div id="input-area">
+    <input type="file" id="chat-file-input" multiple accept=".pdf,.txt,.md,.csv,.json,.log" style="display: none;" onchange="handleChatFileSelect(this.files)">
+    <button id="attach-file-button" class="secondary" onclick="document.getElementById('chat-file-input').click()" title="Attach PDF or text files to chat or save them to your PCP database">[ + FILE ]</button>
     <textarea id="user-input" rows="1" placeholder="Say something..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
     <button id="send-button" onclick="sendMessage()">SEND</button>
 </div>
@@ -657,9 +710,9 @@
         </div>
 
         <div class="control-group">
-            <label for="system-prompt">Persona Grounding Instructions (Universal System Prompt)</label>
-            <textarea id="system-prompt" rows="5"></textarea>
-            <small>Guides the model to speak directly as the persona in your archive and never output citations or file labels.</small>
+            <label for="system-prompt">Persona Grounding Instructions (Custom Prefix)</label>
+            <textarea id="system-prompt" rows="4" placeholder="Optional: add custom persona traits or voice notes here (e.g. name, tone, quirks)."></textarea>
+            <small>Optional custom persona note added right before GHostPCP's built-in strict source-truth rules behind the scenes.</small>
         </div>
 
         <div class="control-grid">
@@ -730,21 +783,25 @@
         <div id="archive-summary" class="fit-report">Checking local `pcp_data` folder...</div>
 
         <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
-            <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.md" style="display: none;" onchange="handleFileSelect(this.files)">
-            <h4>Drop Your ChatGPT Export (.zip or conversations.json) Here</h4>
-            <p>Or click to select your export `.zip`, `conversations.json`, or `.md` files.<br>GHostPCP will automatically extract, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
+            <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.md,.txt,.pdf" style="display: none;" onchange="handleFileSelect(this.files)">
+            <h4>Drop Your Archive Export (.zip, .json, .md, .txt, or .pdf) Here</h4>
+            <p>Or click to select your export `.zip`, `conversations.json`, `.md`, `.txt`, or `.pdf` files.<br>GHostPCP will automatically extract text, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
         </div>
 
         <div class="control-group">
             <label for="local-path-input">Or Ingest Directly from a Local Path on This Computer (Fastest for Large Exports)</label>
             <div style="display: flex; gap: 8px;">
-                <input type="text" id="local-path-input" style="flex: 1;" placeholder="C:\path\to\chatgpt-export.zip or conversations.json">
+                <input type="text" id="local-path-input" style="flex: 1;" placeholder="C:\path\to\export.zip, document.pdf, notes.txt, or folder">
                 <button class="secondary" onclick="ingestLocalPath()">INGEST PATH</button>
                 <button class="secondary" onclick="triggerReindex()" title="Re-scan ghost_pcp_*.md in pcp_data">RE-INDEX</button>
             </div>
             <label style="margin-top: 6px; font-size: 12.5px; color: var(--muted);">
                 <input type="checkbox" id="replace-existing-archive"> Replace existing archive volumes (automatically backs up current volumes to `pcp_data/backups/` first; leave unchecked to append as new volumes)
             </label>
+        </div>
+
+        <div style="font-size: 12.5px; color: var(--muted); line-height: 1.45; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); background: rgba(154, 123, 255, 0.05);">
+            <strong style="color: var(--purple);">First-Time Import Note:</strong> Large archives can take <strong>30 minutes or more</strong> to import and index. <strong>It will only take this long the first time</strong>—once indexed, your archive loads in under a second on future startups, and <strong>SAVE &amp; CLEAR</strong> updates it in ~0.1s.
         </div>
 
         <div id="ingest-progress-wrap" class="progress-wrap">
@@ -755,13 +812,27 @@
             <div class="progress-bar-outer">
                 <div id="ingest-progress-bar" class="progress-bar-inner"></div>
             </div>
+            <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
+                <button id="cancel-ingest-btn" class="secondary" style="border-color: rgba(255, 197, 110, 0.45); color: var(--warn); padding: 5px 12px; font-size: 12px;" onclick="cancelIngest()">CANCEL IMPORT</button>
+            </div>
+        </div>
+
+        <div id="ingest-done-banner" style="display: none; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 8px; border: 1px solid rgba(95, 227, 161, 0.5); background: rgba(95, 227, 161, 0.08);">
+            <div style="color: var(--ok); font-weight: 700; font-size: 14px;">✓ DONE — ARCHIVE READY &amp; SAVED</div>
+            <div style="color: var(--text); font-size: 13px; line-height: 1.45;">
+                It is safe to close this window. <strong>Next step:</strong> Open <strong>[ CONFIG ]</strong>, mount a local GGUF model, and start talking to your AI.
+            </div>
+            <div style="display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap;">
+                <button id="done-open-config-btn" onclick="finishArchiveAndOpenConfig()">OPEN CONFIG &amp; LOAD MODEL</button>
+                <button class="secondary" onclick="closeArchiveModal()">DONE / CLOSE</button>
+            </div>
         </div>
 
         <div id="archive-message" class="status-line"></div>
     </div>
 </div>
 
-<!-- 3. PHONE & ANYWHERE TUNNEL MODAL -->
+<!-- 3. PHONE & ANYWHERE CLOUDFLARE TUNNEL MODAL -->
 <div id="remote-modal" class="modal-backdrop">
     <div class="modal-content">
         <div class="modal-header">
@@ -770,16 +841,10 @@
         </div>
 
         <p style="margin: 0; color: var(--muted); line-height: 1.5;">
-            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHostPCP on your phone. Your phone gets the full interface—you can chat, switch models, and adjust settings remotely.
+            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHostPCP over an encrypted <strong>Cloudflare HTTPS Tunnel</strong>. Works seamlessly on both Wi-Fi and cellular with zero firewall or router setup—and keeps your active conversation synced between your computer and phone.
         </p>
 
-        <div class="tab-row">
-            <button id="tab-lan" class="secondary" onclick="selectRemoteMode('lan')">Same Wi-Fi (LAN)</button>
-            <button id="tab-tailscale" class="secondary" onclick="selectRemoteMode('tailscale')">Tailscale (Anywhere)</button>
-            <button id="tab-tunnel" class="secondary" onclick="selectRemoteMode('tunnel')">Cloudflare HTTPS Tunnel (Anywhere)</button>
-        </div>
-
-        <div id="tunnel-controls" style="display: none; gap: 10px; align-items: center; flex-wrap: wrap;">
+        <div id="tunnel-controls" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <button id="start-tunnel-btn" onclick="startTunnel()">START CLOUDFLARE TUNNEL</button>
             <button id="stop-tunnel-btn" class="secondary" onclick="stopTunnel()">STOP TUNNEL</button>
             <span id="tunnel-status-text" style="color: var(--muted); font-size: 12.5px;"></span>
@@ -787,7 +852,7 @@
 
         <div class="qr-box">
             <img id="remote-qr-img" src="" alt="QR Code">
-            <div id="remote-url-display" class="url-pill">Loading connection link...</div>
+            <div id="remote-url-display" class="url-pill">Starting encrypted phone link...</div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                 <button class="secondary" onclick="copyRemoteUrl()">COPY LINK</button>
                 <button class="secondary" onclick="rotateToken()">NEW PAIRING CODE</button>
@@ -811,11 +876,11 @@
     const API = "/v1";
     let currentModel = "";
     const conversation = [];
+    let pendingAttachments = [];
     let editingIndex = null;
     let isGenerating = false;
     let lastSavedBanner = "";
     let lastSettings = null;
-    let remoteMode = "lan";
     let remoteInfo = null;
     let ingestPollTimer = null;
     let tunnelPollTimer = null;
@@ -836,6 +901,36 @@
             throw new Error(data.detail || data.error || `Request failed (${response.status})`);
         }
         return data;
+    }
+
+    async function loadConversationFromServer(scrollToBottom = false) {
+        if (isGenerating || editingIndex !== null) return;
+        try {
+            const data = await api("/chat/history");
+            const serverMsgs = Array.isArray(data.messages) ? data.messages : [];
+            const same = serverMsgs.length === conversation.length && serverMsgs.every(
+                (m, i) => m.role === conversation[i]?.role && m.content === conversation[i]?.content
+            );
+            if (!same) {
+                const grew = serverMsgs.length > conversation.length;
+                conversation.length = 0;
+                serverMsgs.forEach(m => conversation.push({ role: m.role, content: m.content }));
+                renderConversation(scrollToBottom || grew);
+            }
+        } catch (e) {}
+    }
+
+    async function syncConversationToServer() {
+        try {
+            const payload = conversation
+                .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+                .map(m => ({ role: m.role, content: m.content }));
+            await api("/chat/history", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ messages: payload })
+            });
+        } catch (e) {}
     }
 
     function readSettings() {
@@ -961,12 +1056,21 @@
             const badge = document.getElementById("pcp-badge");
             const summary = document.getElementById("archive-summary");
             if (pcp.ingesting) {
-                badge.innerText = `PCP: INDEXING (${Math.round(pcp.progress * 100)}%)`;
+                badge.innerText = pcp.cancelling
+                    ? "PCP: CANCELLING IMPORT..."
+                    : `PCP: INDEXING (${Math.round(pcp.progress * 100)}%)`;
                 badge.className = "badge active";
+                if (!ingestPollTimer) {
+                    startIngestPolling();
+                }
             } else if (pcp.ready) {
                 badge.innerText = `PCP ACTIVE · ${pcp.volumes} VOL (${pcp.passages.toLocaleString()} PASSAGES)`;
                 badge.className = "badge active";
                 summary.innerText = `PCP Archive Ready: ${pcp.volumes} volume(s) (ghost_pcp_01.md .. ghost_pcp_${String(pcp.volumes).padStart(2, '0')}.md) · ${pcp.passages.toLocaleString()} indexed passages.\nFolder: ${pcp.data_dir}`;
+            } else if (pcp.volumes > 0) {
+                badge.innerText = `PCP: ${pcp.volumes} VOL UNINDEXED (CLICK TO RESUME)`;
+                badge.className = "badge";
+                summary.innerText = `${pcp.volumes} volume(s) extracted in ${pcp.data_dir}, but indexing has not finished yet.\nClick RE-INDEX below to finish or resume indexing.`;
             } else {
                 badge.innerText = "PCP: NO ARCHIVE (CLICK TO IMPORT)";
                 badge.className = "badge";
@@ -1125,6 +1229,40 @@
         return String(text).replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, "").replace(/<\/?think>/gi, "").trim();
     }
 
+    function formatUserMessageHtml(rawContent) {
+        const text = String(rawContent || "");
+        if (!text.includes("[Attached File:")) {
+            return formatMarkdownHtml(text);
+        }
+        const pairedPattern = /\[Attached File:\s*([^\]]+)\]\r?\n([\s\S]*?)\r?\n\[\/Attached File\]/g;
+        const cards = [];
+        let remainder = text;
+        if (pairedPattern.test(text)) {
+            pairedPattern.lastIndex = 0;
+            remainder = text.replace(pairedPattern, (_full, name, body) => {
+                cards.push({ name: name.trim(), body: body.trim() });
+                return "";
+            }).trim();
+        } else {
+            const legacyMatch = text.match(/\[Attached File:\s*([^\]]+)\]\r?\n([\s\S]*)$/);
+            if (legacyMatch) {
+                let body = legacyMatch[2];
+                remainder = text.slice(0, legacyMatch.index).trim();
+                const trailingMarker = "\n\nPlease read the attached file(s).";
+                if (body.endsWith(trailingMarker)) {
+                    body = body.slice(0, -trailingMarker.length);
+                    remainder = remainder ? `${remainder}\n\nPlease read the attached file(s).` : "Please read the attached file(s).";
+                }
+                cards.push({ name: legacyMatch[1].trim(), body: body.trim() });
+            }
+        }
+        const cardHtml = cards.map(card =>
+            `<details class="chat-attachment-card"><summary>Attached File: ${escapeHtml(card.name)} (click to view excerpt)</summary><pre>${escapeHtml(card.body)}</pre></details>`
+        ).join("");
+        const promptHtml = remainder ? formatMarkdownHtml(remainder) : "";
+        return `${cardHtml}${promptHtml}`;
+    }
+
     function renderConversation(scrollToBottom = false) {
         const container = document.getElementById("chat-container");
         container.replaceChildren();
@@ -1192,7 +1330,7 @@
                 body.className = "message-body";
 
                 if (isUser) {
-                    body.innerHTML = formatMarkdownHtml(msg.content.replace(/<\/?think>/gi, ""));
+                    body.innerHTML = formatUserMessageHtml(msg.content.replace(/<\/?think>/gi, ""));
                     div.appendChild(body);
                 } else {
                     const parts = splitThinkBlocks(String(msg.content));
@@ -1290,6 +1428,7 @@
     const STOP_ICON_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"></rect></svg>`;
     let activeAudioPlayer = null;
     let activeVoiceBtn = null;
+    let activeTtsController = null;
 
     function resetActiveVoiceButton() {
         if (activeVoiceBtn) {
@@ -1306,6 +1445,10 @@
 
         // Clicking the speaker button again while playing stops the speech
         if (activeVoiceBtn === buttonEl) {
+            if (activeTtsController) {
+                activeTtsController.abort();
+                activeTtsController = null;
+            }
             if (activeAudioPlayer) {
                 activeAudioPlayer.pause();
                 activeAudioPlayer = null;
@@ -1315,6 +1458,10 @@
             return;
         }
 
+        if (activeTtsController) {
+            activeTtsController.abort();
+            activeTtsController = null;
+        }
         if (activeAudioPlayer) {
             activeAudioPlayer.pause();
             activeAudioPlayer = null;
@@ -1323,6 +1470,11 @@
 
         const voiceName = document.getElementById("tts-voice")?.value || lastSettings?.tts_voice || "silas";
         const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
+        const controller = new AbortController();
+        activeTtsController = controller;
+        // Instantiate Audio synchronously during the click event so mobile browsers keep playback gesture rights
+        const clientAudio = new Audio();
+        clientAudio.preload = "auto";
         activeVoiceBtn = buttonEl;
         buttonEl.classList.add("playing");
         buttonEl.innerHTML = STOP_ICON_SVG;
@@ -1336,6 +1488,7 @@
             const res = await fetch(`${API}/tts`, {
                 method: "POST",
                 headers,
+                signal: controller.signal,
                 body: JSON.stringify({ text: clean, voice: voiceName })
             });
             if (!res.ok) {
@@ -1345,16 +1498,23 @@
 
             const playedOnHost = res.headers.get("X-Played-On-Host") === "true";
             const wavBlob = await res.blob();
+            if (controller.signal.aborted) return;
 
             if (!playedOnHost) {
                 const audioUrl = URL.createObjectURL(wavBlob);
-                const audio = new Audio(audioUrl);
-                activeAudioPlayer = audio;
-                audio.onended = () => {
+                clientAudio.src = audioUrl;
+                activeAudioPlayer = clientAudio;
+                clientAudio.onended = () => {
                     URL.revokeObjectURL(audioUrl);
+                    if (activeAudioPlayer === clientAudio) activeAudioPlayer = null;
                     if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
                 };
-                await audio.play();
+                clientAudio.onerror = () => {
+                    URL.revokeObjectURL(audioUrl);
+                    if (activeAudioPlayer === clientAudio) activeAudioPlayer = null;
+                    if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
+                };
+                await clientAudio.play();
             } else {
                 const durationMs = Math.max(1200, Math.round((wavBlob.size / 44100) * 1000));
                 setTimeout(() => {
@@ -1362,8 +1522,45 @@
                 }, durationMs);
             }
         } catch (e) {
-            resetActiveVoiceButton();
+            if (e && e.name === "AbortError") {
+                if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
+                return;
+            }
+            if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
             alert(`Voice playback error: ${e.message}`);
+        } finally {
+            if (activeTtsController === controller) {
+                activeTtsController = null;
+            }
+        }
+    }
+
+    async function copyTextToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+            try {
+                await navigator.clipboard.writeText(text);
+                return;
+            } catch (e) {}
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.top = "-9999px";
+        textarea.style.left = "-9999px";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+        let ok = false;
+        try {
+            ok = document.execCommand("copy");
+        } finally {
+            document.body.removeChild(textarea);
+        }
+        if (!ok) {
+            throw new Error("Copy command unavailable in this browser.");
         }
     }
 
@@ -1372,7 +1569,7 @@
         if (!msg) return;
         const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
         try {
-            await navigator.clipboard.writeText(clean);
+            await copyTextToClipboard(clean);
             const prev = buttonEl.innerText;
             buttonEl.innerText = "Copied!";
             setTimeout(() => { buttonEl.innerText = prev; }, 1200);
@@ -1400,6 +1597,7 @@
         conversation[idx].content = updated;
         editingIndex = null;
         renderConversation(false);
+        syncConversationToServer();
     }
 
     function cancelEditMessage() {
@@ -1412,6 +1610,7 @@
         conversation.splice(idx, 1);
         if (editingIndex === idx) editingIndex = null;
         renderConversation(false);
+        syncConversationToServer();
     }
 
     async function stopGeneration() {
@@ -1437,9 +1636,24 @@
     async function requestCompletionForHistory(historySlice, targetIndex) {
         const settings = lastSettings || readSettings();
         const stop = (settings.stop_sequences || "").split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+        const recent = historySlice.slice(-20);
+        const cleanedHistory = [];
+        for (let i = 0; i < recent.length; i++) {
+            const cur = recent[i];
+            if (!cur || !cur.content) continue;
+            const next = recent[i + 1];
+            if (cur.role === "user" && next && next.role === "assistant" && String(next.content).startsWith("ERROR:")) {
+                i++;
+                continue;
+            }
+            if (cur.role === "assistant" && String(cur.content).startsWith("ERROR:")) {
+                continue;
+            }
+            cleanedHistory.push(cur);
+        }
         const messages = settings.system_prompt
-            ? [{role: "system", content: settings.system_prompt}, ...historySlice.slice(-20)]
-            : [...historySlice.slice(-20)];
+            ? [{role: "system", content: settings.system_prompt}, ...cleanedHistory]
+            : [...cleanedHistory];
         const controller = new AbortController();
         activeStreamController = controller;
         let accumulated = "";
@@ -1461,4 +1675,688 @@
                 .filter(line => line.startsWith("data:"))
                 .map(line => line.slice(5).replace(/^ /, ""))
                 .join("\n");
-            if (!data || data ===
+            if (!data || data === "[DONE]") return;
+            let chunk;
+            try {
+                chunk = JSON.parse(data);
+            } catch (e) {
+                throw new Error("The server returned an invalid streaming response.");
+            }
+            if (chunk.error) throw new Error(chunk.error.message || "Generation error");
+            if (chunk.ghost_aborted) sawAbortMarker = true;
+            const delta = chunk.choices?.[0]?.delta;
+            if (!delta) return;
+            if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+                accumulated += `<think>${delta.reasoning_content}</think>`;
+            }
+            if (typeof delta.content === "string" && delta.content) accumulated += delta.content;
+            queuePaint();
+        };
+        const headers = { "Content-Type": "application/json", "Accept": "text/event-stream" };
+        const token = getAuthToken();
+        if (token) headers.Authorization = `Bearer ${token}`;
+
+        try {
+            const response = await fetch(`${API}/chat/completions`, {
+                method: "POST",
+                headers,
+                signal: controller.signal,
+                body: JSON.stringify({
+                    model: currentModel,
+                    messages: messages,
+                    stream: true,
+                    temperature: settings.temperature,
+                    top_p: settings.top_p,
+                    min_p: settings.min_p,
+                    top_k: settings.top_k,
+                    repeat_penalty: settings.repeat_penalty,
+                    presence_penalty: settings.presence_penalty,
+                    seed: settings.seed,
+                    stop: stop.length ? stop : null,
+                    max_tokens: settings.max_tokens,
+                    use_pcp: settings.pcp_enabled,
+                    pcp_top_k: settings.pcp_top_k,
+                    show_reasoning: settings.show_reasoning
+                })
+            });
+            if (!response.ok) {
+                const error = await response.json().catch(() => ({}));
+                throw new Error(error.detail || error.error || `Request failed (${response.status})`);
+            }
+            if (!response.body) throw new Error("The server did not provide a streaming response.");
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            try {
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const frames = buffer.split(/\r?\n\r?\n/);
+                    buffer = frames.pop();
+                    for (const frame of frames) consumeFrame(frame);
+                }
+                buffer += decoder.decode();
+                if (buffer.trim()) consumeFrame(buffer);
+            } finally {
+                reader.releaseLock();
+            }
+        } catch (e) {
+            if (e.name !== "AbortError" || !controller.signal.aborted) throw e;
+        } finally {
+            if (paintHandle !== null) cancelAnimationFrame(paintHandle);
+            paint();
+            if (activeStreamController === controller) activeStreamController = null;
+        }
+        return {content: accumulated, aborted: sawAbortMarker || abortRequested};
+    }
+
+    async function redoMessage(idx) {
+        if (isGenerating || !currentModel) return;
+        const target = conversation[idx];
+        if (!target || target.role !== "assistant") return;
+
+        const historyBefore = conversation.slice(0, idx);
+        if (!historyBefore.some(m => m.role === "user")) return;
+
+        isGenerating = true;
+        abortRequested = false;
+        editingIndex = null;
+        const sendButton = document.getElementById("send-button");
+        const newChatButton = document.getElementById("new-chat-button");
+        sendButton.disabled = true;
+        newChatButton.disabled = true;
+
+        const previousContent = conversation[idx].content;
+        conversation[idx].content = "";
+        streamingIndex = idx;
+        renderConversation(false);
+
+        try {
+            const result = await requestCompletionForHistory(historyBefore, idx);
+            if (result.aborted) {
+                conversation[idx].content = result.content
+                    ? `${result.content}\n\n*[Stopped by you.]*`
+                    : "*[Stopped before any output.]*";
+            } else {
+                conversation[idx].content = result.content || previousContent;
+            }
+            renderConversation(false);
+        } catch (e) {
+            conversation[idx].content = previousContent;
+            renderConversation(false);
+            alert(`Redo failed: ${e.message}`);
+        } finally {
+            isGenerating = false;
+            abortRequested = false;
+            streamingIndex = null;
+            activeStreamController = null;
+            sendButton.disabled = false;
+            newChatButton.disabled = false;
+            renderConversation(false);
+            await syncConversationToServer();
+        }
+    }
+
+    function renderChatAttachments() {
+        const bar = document.getElementById("chat-attachments-bar");
+        if (!bar) return;
+        if (!pendingAttachments.length) {
+            bar.style.display = "none";
+            bar.innerHTML = "";
+            return;
+        }
+        bar.style.display = "flex";
+        bar.innerHTML = pendingAttachments.map((att, idx) => {
+            const sizeLabel = `${(att.chars || 0).toLocaleString()} chars`;
+            const saveControl = att.savedTo
+                ? `<span style="color: var(--purple); font-size: 11px;">Saved: ${escapeHtml(att.savedTo)}</span>`
+                : `<button type="button" class="secondary" ${att.saving ? "disabled" : ""} onclick="saveAttachmentToArchive(${idx})" title="Permanently index into pcp_data">${att.saving ? "SAVING..." : "SAVE TO DB"}</button>`;
+            return `<div class="attachment-chip"><span>${escapeHtml(att.name)} (${sizeLabel})</span>${saveControl}<button type="button" class="secondary" onclick="removeChatAttachment(${idx})" title="Remove attachment">x</button></div>`;
+        }).join("");
+    }
+
+    function removeChatAttachment(idx) {
+        if (idx < 0 || idx >= pendingAttachments.length) return;
+        pendingAttachments.splice(idx, 1);
+        renderChatAttachments();
+    }
+
+    async function handleChatFileSelect(fileList) {
+        const files = Array.from(fileList || []);
+        const input = document.getElementById("chat-file-input");
+        if (!files.length) return;
+
+        const btn = document.getElementById("attach-file-button");
+        const origLabel = btn ? btn.innerText : "[ + FILE ]";
+        if (btn) {
+            btn.disabled = true;
+            btn.innerText = "READING...";
+        }
+        try {
+            const formData = new FormData();
+            for (const file of files) {
+                formData.append("files", file);
+            }
+            formData.append("save_to_archive", "false");
+            const data = await api("/chat/extract-file", { method: "POST", body: formData });
+            const extracted = Array.isArray(data.files) ? data.files : [];
+            let anyAutoSaved = false;
+            extracted.forEach((item, idx) => {
+                const text = item.chat_text || item.text || "";
+                const savedTo = item.saved_to || "";
+                if (savedTo) anyAutoSaved = true;
+                pendingAttachments.push({
+                    name: item.name || (files[idx] ? files[idx].name : "document.txt"),
+                    text,
+                    chars: item.chars || text.length,
+                    savedTo,
+                    rawFile: files[idx] || null,
+                    saving: false,
+                });
+            });
+            renderChatAttachments();
+            if (anyAutoSaved) {
+                await refreshPCPStatus();
+            }
+        } catch (error) {
+            alert(`Could not read file: ${error.message}`);
+        } finally {
+            if (input) input.value = "";
+            if (btn) {
+                btn.disabled = false;
+                btn.innerText = origLabel;
+            }
+        }
+    }
+
+    async function saveAttachmentToArchive(idx) {
+        const att = pendingAttachments[idx];
+        if (!att || att.saving) return;
+        att.saving = true;
+        renderChatAttachments();
+        try {
+            const formData = new FormData();
+            if (att.rawFile) {
+                formData.append("files", att.rawFile, att.name);
+            } else {
+                const uploadName = att.name.toLowerCase().endsWith(".pdf") ? `${att.name}.txt` : att.name;
+                formData.append("files", new Blob([att.text || ""], { type: "text/plain" }), uploadName);
+            }
+            formData.append("save_to_archive", "true");
+            const data = await api("/chat/extract-file", { method: "POST", body: formData });
+            const savedItem = (data.files && data.files[0]) || {};
+            att.savedTo = savedItem.saved_to || "pcp_data";
+            await refreshPCPStatus();
+        } catch (error) {
+            alert(`Save to DB failed: ${error.message}`);
+        } finally {
+            att.saving = false;
+            renderChatAttachments();
+        }
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById("user-input");
+        const text = input.value.trim();
+        if ((!text && pendingAttachments.length === 0) || isGenerating) return;
+        if (!currentModel) {
+            openSettings();
+            document.getElementById("loader-message").innerText = "Mount a model first to start chatting.";
+            return;
+        }
+        isGenerating = true;
+        abortRequested = false;
+        editingIndex = null;
+        const sendButton = document.getElementById("send-button");
+        const newChatButton = document.getElementById("new-chat-button");
+        sendButton.disabled = true;
+        newChatButton.disabled = true;
+
+        let userContent = text;
+        if (pendingAttachments.length > 0) {
+            const fileBlocks = pendingAttachments.map(att => `[Attached File: ${att.name}]\n${att.text}\n[/Attached File]`);
+            userContent = [...fileBlocks, text || "Please read the attached file(s)."].join("\n\n");
+            pendingAttachments = [];
+            renderChatAttachments();
+        }
+        conversation.push({role: "user", content: userContent});
+        input.value = "";
+        const replyIndex = conversation.length;
+        conversation.push({role: "assistant", content: ""});
+        streamingIndex = replyIndex;
+        renderConversation(true);
+
+        try {
+            const result = await requestCompletionForHistory(conversation.slice(0, replyIndex), replyIndex);
+            if (result.aborted) {
+                conversation[replyIndex].content = result.content
+                    ? `${result.content}\n\n*[Stopped by you.]*`
+                    : "*[Stopped before any output.]*";
+            } else {
+                conversation[replyIndex].content = result.content || "(empty response)";
+            }
+        } catch (e) {
+            conversation[replyIndex].content = abortRequested
+                ? (conversation[replyIndex].content || "*[Stopped before any output.]*")
+                : `ERROR: ${e.message}`;
+        } finally {
+            isGenerating = false;
+            abortRequested = false;
+            streamingIndex = null;
+            activeStreamController = null;
+            sendButton.disabled = false;
+            newChatButton.disabled = false;
+            renderConversation(false);
+            await syncConversationToServer();
+            input.focus();
+        }
+    }
+
+    async function saveAndClearChat() {
+        if (isGenerating) return;
+        if (conversation.length === 0) {
+            alert("There are no messages in the current window to save yet.");
+            return;
+        }
+        const saveBtn = document.getElementById("save-clear-button");
+        const newChatBtn = document.getElementById("new-chat-button");
+        saveBtn.disabled = true;
+        newChatBtn.disabled = true;
+        const originalText = saveBtn.innerText;
+        saveBtn.innerText = "SAVING...";
+        try {
+            const res = await api("/pcp/save-session", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ messages: conversation })
+            });
+            conversation.length = 0;
+            editingIndex = null;
+            lastSavedBanner = `Saved ${res.turns_saved} turn(s) to ${res.saved_to} [${res.timestamp}] · ${res.total_passages.toLocaleString()} total passages active. Continue whenever you're ready.`;
+            await refreshPCPStatus();
+            renderConversation(false);
+            document.getElementById("user-input").focus();
+        } catch (error) {
+            alert(`Save & Clear failed: ${error.message}`);
+        } finally {
+            saveBtn.innerText = originalText;
+            saveBtn.disabled = false;
+            newChatBtn.disabled = false;
+        }
+    }
+
+    async function startNewChat() {
+        if (conversation.length > 0 && !window.confirm("Clear this conversation without saving it to the archive? (Use SAVE & CLEAR if you want to keep these memories.)")) return;
+        const button = document.getElementById("new-chat-button");
+        button.disabled = true;
+        try {
+            if (currentModel) await api("/reset", {method: "POST"});
+            conversation.length = 0;
+            editingIndex = null;
+            lastSavedBanner = "";
+            renderConversation(false);
+            await syncConversationToServer();
+        } catch (error) {
+            alert(error.message);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    // --- Archive Drop & Ingestion ---
+    const dropZone = document.getElementById("drop-zone");
+    dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+    dropZone.addEventListener("drop", e => {
+        e.preventDefault();
+        dropZone.classList.remove("dragover");
+        if (e.dataTransfer?.files?.length) {
+            handleFileSelect(e.dataTransfer.files);
+        }
+    });
+
+    async function handleFileSelect(fileList) {
+        if (!fileList || !fileList.length) return;
+        const formData = new FormData();
+        for (const file of fileList) {
+            formData.append("files", file);
+        }
+        formData.append("blocked_phrases", document.getElementById("blocked-phrases").value);
+        formData.append("protected_words", document.getElementById("protected-words").value);
+        formData.append("replace_existing", document.getElementById("replace-existing-archive")?.checked ? "true" : "false");
+
+        document.getElementById("archive-message").innerText = "Uploading and starting background processing...";
+        try {
+            const headers = {};
+            const token = getAuthToken();
+            if (token) headers["Authorization"] = `Bearer ${token}`;
+            const res = await fetch(`${API}/pcp/ingest`, { method: "POST", headers, body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "Upload failed");
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function ingestLocalPath() {
+        const raw = document.getElementById("local-path-input").value.trim();
+        if (!raw) return;
+        document.getElementById("archive-message").innerText = "Starting local path ingestion...";
+        try {
+            await api("/pcp/ingest-local", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    paths: [raw],
+                    blocked_phrases: document.getElementById("blocked-phrases").value,
+                    protected_words: document.getElementById("protected-words").value,
+                    replace_existing: Boolean(document.getElementById("replace-existing-archive")?.checked)
+                })
+            });
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function triggerReindex() {
+        try {
+            await api("/pcp/reindex", { method: "POST" });
+            startIngestPolling();
+        } catch (e) {
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function cancelIngest() {
+        const btn = document.getElementById("cancel-ingest-btn");
+        if (btn) {
+            btn.disabled = true;
+            btn.innerText = "CANCELLING...";
+        }
+        document.getElementById("archive-message").innerText = "Cancelling import and saving progress...";
+        try {
+            const res = await api("/pcp/cancel", { method: "POST" });
+            if (res.status !== "cancelling" && btn) {
+                btn.disabled = false;
+                btn.innerText = "CANCEL IMPORT";
+            }
+        } catch (e) {
+            if (btn) {
+                btn.disabled = false;
+                btn.innerText = "CANCEL IMPORT";
+            }
+            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    function startIngestPolling() {
+        const wrap = document.getElementById("ingest-progress-wrap");
+        wrap.style.display = "flex";
+        const doneBanner = document.getElementById("ingest-done-banner");
+        const bar = document.getElementById("ingest-progress-bar");
+        if (doneBanner) doneBanner.style.display = "none";
+        if (bar) bar.style.background = "var(--purple)";
+        const cancelBtn = document.getElementById("cancel-ingest-btn");
+        if (cancelBtn) {
+            cancelBtn.style.display = "inline-block";
+            cancelBtn.disabled = false;
+            cancelBtn.innerText = "CANCEL IMPORT";
+        }
+        if (ingestPollTimer) clearInterval(ingestPollTimer);
+        ingestPollTimer = setInterval(async () => {
+            const pcp = await refreshPCPStatus();
+            if (!pcp) return;
+            const pct = Math.round((pcp.progress || 0) * 100);
+            document.getElementById("ingest-stage-text").innerText = pcp.stage || "Working...";
+            document.getElementById("ingest-percent-text").innerText = `${pct}%`;
+            if (bar) bar.style.width = `${pct}%`;
+            if (cancelBtn) {
+                cancelBtn.disabled = Boolean(pcp.cancelling);
+                cancelBtn.innerText = pcp.cancelling ? "CANCELLING..." : "CANCEL IMPORT";
+            }
+            if (!pcp.ingesting) {
+                clearInterval(ingestPollTimer);
+                ingestPollTimer = null;
+                if (cancelBtn) {
+                    cancelBtn.style.display = "none";
+                }
+                if (!pcp.error && !pcp.cancelled && pcp.ready) {
+                    document.getElementById("ingest-stage-text").innerText = `DONE — ${pcp.stage || "Archive ready!"}`;
+                    if (bar) bar.style.background = "var(--ok)";
+                    if (doneBanner) doneBanner.style.display = "flex";
+                    document.getElementById("archive-message").innerText = "";
+                } else if (pcp.error) {
+                    document.getElementById("archive-message").innerText = `Error: ${pcp.error}`;
+                } else {
+                    document.getElementById("archive-message").innerText = pcp.stage || "Archive ready!";
+                }
+            }
+        }, 500);
+    }
+
+    // --- Phone & Remote Tunnel Modal ---
+    function startTunnelPolling() {
+        if (tunnelPollTimer) return;
+        tunnelPollTimer = setInterval(async () => {
+            await refreshRemoteModal();
+            if (remoteInfo && (!remoteInfo.tunnel_starting || remoteInfo.tunnel_url || remoteInfo.tunnel_error)) {
+                clearInterval(tunnelPollTimer);
+                tunnelPollTimer = null;
+                document.getElementById("remote-message").innerText = remoteInfo.tunnel_error
+                    ? `Tunnel error: ${remoteInfo.tunnel_error}`
+                    : "";
+            }
+        }, 1000);
+    }
+
+    async function refreshRemoteModal() {
+        try {
+            remoteInfo = await api("/remote/status");
+            const tunnelControls = document.getElementById("tunnel-controls");
+            const urlDisplay = document.getElementById("remote-url-display");
+            const qrImg = document.getElementById("remote-qr-img");
+            const tunnelStatus = document.getElementById("tunnel-status-text");
+            const startBtn = document.getElementById("start-tunnel-btn");
+            const stopBtn = document.getElementById("stop-tunnel-btn");
+
+            tunnelControls.style.display = "flex";
+            if (startBtn) {
+                const runningWithUrl = Boolean(remoteInfo.tunnel_running && remoteInfo.tunnel_url);
+                startBtn.disabled = Boolean(remoteInfo.tunnel_starting || runningWithUrl);
+                startBtn.innerText = remoteInfo.tunnel_starting
+                    ? "STARTING..."
+                    : (runningWithUrl ? "TUNNEL RUNNING" : "START CLOUDFLARE TUNNEL");
+            }
+            if (stopBtn) {
+                stopBtn.disabled = Boolean(!remoteInfo.tunnel_running && !remoteInfo.tunnel_starting);
+            }
+            if (remoteInfo.tunnel_starting) {
+                tunnelStatus.innerText = "Starting Cloudflare Quick Tunnel...";
+                startTunnelPolling();
+            } else if (remoteInfo.tunnel_running && remoteInfo.tunnel_url) {
+                tunnelStatus.innerText = "Public HTTPS Tunnel Active";
+            } else if (remoteInfo.tunnel_error) {
+                tunnelStatus.innerText = remoteInfo.tunnel_error;
+            } else {
+                tunnelStatus.innerText = "Tunnel stopped";
+            }
+
+            const activeUrl = remoteInfo.tunnel_url || null;
+
+            if (activeUrl) {
+                urlDisplay.innerText = activeUrl;
+                const token = getAuthToken();
+                qrImg.style.display = "block";
+                const qrRes = await fetch(`${API}/remote/qr.svg?target=tunnel&t=${Date.now()}`, {
+                    headers: token ? { "Authorization": `Bearer ${token}` } : {}
+                });
+                if (!qrRes.ok) {
+                    throw new Error(`QR request failed (${qrRes.status})`);
+                }
+                const svgBlob = await qrRes.blob();
+                if (activeQrObjectUrl) {
+                    URL.revokeObjectURL(activeQrObjectUrl);
+                }
+                activeQrObjectUrl = URL.createObjectURL(svgBlob);
+                qrImg.src = activeQrObjectUrl;
+            } else {
+                if (activeQrObjectUrl) {
+                    URL.revokeObjectURL(activeQrObjectUrl);
+                    activeQrObjectUrl = null;
+                }
+                qrImg.style.display = "none";
+                urlDisplay.innerText = remoteInfo.tunnel_starting
+                    ? "Generating https://*.trycloudflare.com link (takes ~4 seconds)..."
+                    : "Click START CLOUDFLARE TUNNEL above to generate an encrypted anywhere link.";
+            }
+        } catch (e) {
+            document.getElementById("remote-message").innerText = e.message;
+        }
+    }
+
+    async function startTunnel() {
+        document.getElementById("remote-message").innerText = "Launching Cloudflare tunnel...";
+        try {
+            await api("/remote/tunnel/start", { method: "POST" });
+            await refreshRemoteModal();
+            if (remoteInfo && remoteInfo.tunnel_starting) {
+                startTunnelPolling();
+            } else {
+                document.getElementById("remote-message").innerText = remoteInfo?.tunnel_error
+                    ? `Tunnel error: ${remoteInfo.tunnel_error}`
+                    : "";
+            }
+        } catch (e) {
+            document.getElementById("remote-message").innerText = `Tunnel error: ${e.message}`;
+        }
+    }
+
+    async function stopTunnel() {
+        if (tunnelPollTimer) {
+            clearInterval(tunnelPollTimer);
+            tunnelPollTimer = null;
+        }
+        try {
+            await api("/remote/tunnel/stop", { method: "POST" });
+            await refreshRemoteModal();
+            document.getElementById("remote-message").innerText = "Cloudflare tunnel stopped.";
+        } catch (e) {
+            document.getElementById("remote-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function rotateToken() {
+        try {
+            await api("/remote/rotate-token", { method: "POST" });
+            await refreshRemoteModal();
+            document.getElementById("remote-message").innerText = "Generated a fresh pairing token.";
+        } catch (e) {
+            document.getElementById("remote-message").innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function copyRemoteUrl() {
+        const text = document.getElementById("remote-url-display").innerText;
+        if (!text || !text.startsWith("http")) return;
+        try {
+            await copyTextToClipboard(text);
+            document.getElementById("remote-message").innerText = "Copied pairing link to clipboard!";
+        } catch (e) {
+            document.getElementById("remote-message").innerText = `Could not copy automatically: ${e.message}`;
+        }
+    }
+
+    // --- Modal Controls ---
+    function openSettings() {
+        document.getElementById("settings-modal").style.display = "flex";
+        fetchModels();
+        fetchVoices();
+    }
+    function closeSettings() {
+        document.getElementById("settings-modal").style.display = "none";
+    }
+    async function saveAndClose() {
+        try {
+            await persistSettings();
+            closeSettings();
+        } catch (e) {
+            document.getElementById("loader-message").innerText = e.message;
+        }
+    }
+    function openArchiveModal() {
+        refreshPCPStatus();
+        document.getElementById("archive-modal").style.display = "flex";
+    }
+    function closeArchiveModal() {
+        document.getElementById("archive-modal").style.display = "none";
+    }
+    function finishArchiveAndOpenConfig() {
+        closeArchiveModal();
+        openSettings();
+    }
+    async function openRemoteModal() {
+        document.getElementById("remote-modal").style.display = "flex";
+        await refreshRemoteModal();
+        if (remoteInfo && !remoteInfo.tunnel_running && !remoteInfo.tunnel_starting) {
+            await startTunnel();
+        }
+    }
+    function closeRemoteModal() {
+        if (tunnelPollTimer) {
+            clearInterval(tunnelPollTimer);
+            tunnelPollTimer = null;
+        }
+        document.getElementById("remote-modal").style.display = "none";
+    }
+
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+            loadConversationFromServer(false);
+        }
+    });
+    window.addEventListener("focus", () => {
+        loadConversationFromServer(false);
+    });
+
+    async function initialize() {
+        renderConversation(false);
+        document.getElementById("user-input").disabled = true;
+        document.getElementById("send-button").disabled = true;
+        try {
+            lastSettings = await api("/settings");
+            writeSettings(lastSettings);
+        } catch (e) {
+            document.getElementById("loader-message").innerText = e.message;
+        }
+        await loadConversationFromServer(true);
+        await fetchModels();
+        await fetchVoices();
+        if (lastSettings) writeSettings(lastSettings);
+        const pcp = await refreshPCPStatus();
+        try {
+            const st = await api("/status");
+            currentModel = st.resident_model || "";
+            if (currentModel) {
+                setStatus(`ONLINE: ${currentModel}`, "var(--purple)");
+                document.getElementById("user-input").disabled = false;
+                document.getElementById("send-button").disabled = false;
+            } else {
+                setStatus("NO MODEL MOUNTED", "#888");
+                if (pcp && !pcp.ready) {
+                    openArchiveModal();
+                } else {
+                    openSettings();
+                }
+            }
+        } catch (e) {
+            setStatus("AUTH / OFFLINE", "var(--danger)");
+        }
+    }
+
+    initialize();
+</script>
+</body>
+</html>

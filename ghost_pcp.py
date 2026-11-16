@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Kelly Spear
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 =======================================================================
- GHost PCP — GPU Hosted Pure Concentrated Personality
+ GHostPCP — GPU Hosted Pure Concentrated Personality
  "Break Your AI Out of the Cloud and Onto Your Own Hardware"
 =======================================================================
  - Hardware target : Local GPU (CUDA / Vulkan) with safe CPU fallback
@@ -31,6 +33,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
@@ -46,12 +49,18 @@ import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from gguf import GGUFReader, LlamaFileType
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
-from pcp_ingest import ingest_files
-from pcp_retrieval import PCPIndex
-from persona import DEFAULT_BLOCKED_PHRASES, DEFAULT_PROTECTED_WORDS, SYSTEM_PROMPT
+from pcp_ingest import extract_pairs_from_data, extract_text_from_document, ingest_files
+from pcp_retrieval import IngestCancelledError, PCPIndex
+from persona import (
+    DEFAULT_BLOCKED_PHRASES,
+    DEFAULT_PROTECTED_WORDS,
+    SYSTEM_PROMPT,
+    strip_builtin_system_prompt,
+)
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
@@ -175,8 +184,10 @@ def _configure_runtime_backend() -> tuple[str, Path]:
         raise RuntimeError(f"{selected} backend is missing required DLLs: {sorted(missing)}")
     for item in dlls:
         target_dll = runtime_lib / item.name
-        if not target_dll.exists():
+        try:
             shutil.copy2(item, target_dll)
+        except OSError:
+            pass
 
     if os.name == "nt":
         _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(runtime_lib)))
@@ -197,9 +208,13 @@ def _find_available_port(preferred: int = 5555) -> int:
     if "GHOST_API_PORT" in os.environ:
         return int(os.environ["GHOST_API_PORT"])
     for candidate in range(preferred, preferred + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            if probe.connect_ex(("127.0.0.1", candidate)) == 0:
+                continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind(("127.0.0.1", candidate))
+                s.bind(("0.0.0.0", candidate))
                 return candidate
             except OSError:
                 continue
@@ -247,7 +262,7 @@ N_BATCH = 512
 DEFAULT_SETTINGS = {
     "model": "Qwen3-14B-Q5_K_M.gguf",
     "chat_format": "auto",
-    "system_prompt": SYSTEM_PROMPT.strip(),
+    "system_prompt": "",
     "pcp_enabled": True,
     "pcp_top_k": 4,
     "tts_voice": "silas",
@@ -257,6 +272,9 @@ DEFAULT_SETTINGS = {
     "temperature": 0.7,
     "top_p": 0.95,
     "min_p": 0.05,
+    "top_k": 40,
+    "repeat_penalty": 1.0,
+    "presence_penalty": 0.0,
     "seed": None,
     "max_tokens": 512,
     "stop_sequences": "",
@@ -273,7 +291,7 @@ if sys.stdout is not None:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [GHost-PCP] %(levelname)s :: %(message)s",
+    format="%(asctime)s [GHostPCP] %(levelname)s :: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=log_handlers,
 )
@@ -286,7 +304,7 @@ GHOST_BANNER = r"""
  | |_| |  _  | (_) |___) | |_  |  __/| |___|  __/ 
   \____|_| |_|\___/|____/ \__| |_|    \____|_|    
 
-    GHost PCP // GPU HOSTED PURE CONCENTRATED PERSONALITY
+    GHostPCP // GPU HOSTED PURE CONCENTRATED PERSONALITY
     Break Your AI Out of the Cloud and Onto Your Own Hardware
 =================================================================
 """
@@ -307,6 +325,46 @@ class EngineState:
         self.loaded_chat_format: Optional[str] = None
         self.locked = False
         self.busy = False
+        self.streaming = False
+        self.generation_id = 0
+        self.abort_event = threading.Event()
+        self._lease = threading.Lock()
+        self.conversation: List[Dict[str, str]] = []
+        self._history_lock = threading.Lock()
+        self.prior_assistant_tokens: List[int] = []
+
+    def begin_generation(self, streaming: bool) -> int:
+        with self._lease:
+            if self.locked:
+                raise HTTPException(status_code=409, detail="Model change in progress.")
+            if self.busy:
+                raise HTTPException(status_code=409, detail="A generation is already in progress.")
+            if self.llm is None:
+                raise HTTPException(status_code=409, detail="No model resident. Open CONFIG and click MOUNT first.")
+            self.busy = True
+            self.streaming = streaming
+            self.abort_event.clear()
+            self.generation_id += 1
+            return self.generation_id
+
+    def end_generation(self, generation_id: Optional[int] = None) -> None:
+        with self._lease:
+            if generation_id is not None and generation_id != self.generation_id:
+                return
+            self.busy = False
+            self.streaming = False
+            self.abort_event.clear()
+
+    def request_abort(self) -> bool:
+        with self._lease:
+            if not self.busy:
+                return False
+            self.abort_event.set()
+            return True
+
+    @property
+    def abort_requested(self) -> bool:
+        return self.abort_event.is_set()
 
 
 class IngestState:
@@ -316,6 +374,16 @@ class IngestState:
         self.progress = 0.0
         self.error: Optional[str] = None
         self.last_result: Optional[dict] = None
+        self.cancel_event = threading.Event()
+        self.cancelled = False
+        self._lock = threading.Lock()
+
+    def request_cancel(self) -> bool:
+        with self._lock:
+            if not self.running:
+                return False
+            self.cancel_event.set()
+            return True
 
 
 class TunnelState:
@@ -495,10 +563,15 @@ def _init_pcp_index() -> None:
     PCP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
     try:
-        PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
+        PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir, cache_only=True)
         if PCP_INDEX.ready:
             log.info(
                 f"PCP Index online: {PCP_INDEX.file_count} volume(s), {PCP_INDEX.passage_count:,} passages."
+            )
+        elif PCP_INDEX.file_count > 0:
+            log.info(
+                f"Detected {PCP_INDEX.file_count} unindexed PCP volume(s) in {PCP_DATA_DIR}. "
+                "Open ARCHIVE and click RE-INDEX to finish indexing."
             )
         else:
             log.info("No ghost_pcp_*.md volumes found yet. Waiting for archive import.")
@@ -520,12 +593,29 @@ def verify_access(request: Request, authorization: str = Header(default="")) -> 
     )
     is_local_loopback = client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not forwarded
     if is_local_loopback:
-        return
+        local_hosts = {"127.0.0.1", "::1", "localhost", "testserver", "testclient"}
+        request_host = (request.url.hostname or "").lower()
+        origin = request.headers.get("origin")
+        if request_host in local_hosts:
+            if origin:
+                try:
+                    origin_url = urllib.parse.urlsplit(origin)
+                    same_origin = (
+                        origin_url.scheme == request.url.scheme
+                        and (origin_url.hostname or "").lower() == request_host
+                        and origin_url.port == request.url.port
+                    )
+                except ValueError:
+                    same_origin = False
+                if same_origin:
+                    return
+            else:
+                return
     expected = f"Bearer {PAIRING_TOKEN}"
     if not PAIRING_TOKEN or not secrets.compare_digest(authorization, expected):
         raise HTTPException(
             status_code=401,
-            detail="Remote access requires a valid pairing link. Scan the QR code shown in GHost PCP on your computer.",
+            detail="Remote access requires a valid pairing link. Scan the QR code shown in GHostPCP on your computer.",
         )
 
 
@@ -583,10 +673,7 @@ def get_tailscale_ip() -> Optional[str]:
 
 
 def _find_or_download_cloudflared() -> Path:
-    candidates = [
-        APP_DIR / "cloudflared.exe",
-        Path.home() / "OneDrive" / "Desktop" / "EVERYTHING" / "cloudflared.exe",
-    ]
+    candidates = [APP_DIR / "cloudflared.exe"]
     which_cf = shutil.which("cloudflared")
     if which_cf:
         candidates.insert(0, Path(which_cf))
@@ -595,9 +682,18 @@ def _find_or_download_cloudflared() -> Path:
             return path
 
     target = APP_DIR / "cloudflared.exe"
+    part_target = target.with_suffix(".exe.part")
     url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
     log.info(f"Downloading cloudflared tunnel binary from {url} ...")
-    urllib.request.urlretrieve(url, str(target))
+    try:
+        urllib.request.urlretrieve(url, str(part_target))
+        os.replace(part_target, target)
+    except Exception:
+        try:
+            part_target.unlink()
+        except OSError:
+            pass
+        raise
     return target
 
 
@@ -684,7 +780,7 @@ def scan_models() -> List[Dict[str, Any]]:
             "id": f.name,
             "object": "model",
             "created": int(f.stat().st_mtime) if f.exists() else 0,
-            "owned_by": "GHost-PCP-Local",
+            "owned_by": "GHostPCP-Local",
             "size_gb": round(file_size_bytes / (1024 ** 3), 2),
             "file_size_bytes": file_size_bytes,
             "file_size_gib": round(file_size_bytes / GIB, 3),
@@ -976,10 +1072,10 @@ def load_model(
     path = MODEL_DIR / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"Model '{filename}' not found in ./ghost_models.")
-    if STATE.locked or STATE.busy:
-        raise HTTPException(status_code=409, detail="A model change is already in progress.")
-
-    STATE.locked = True
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="A model change is already in progress.")
+        STATE.locked = True
     try:
         unload_current_model()
         preflight = preflight_model(filename, context_size)
@@ -993,6 +1089,7 @@ def load_model(
                 n_ctx=context_size,
                 n_threads=N_THREADS,
                 n_batch=N_BATCH,
+                last_n_tokens_size=1024,
                 type_k=int(preflight["kv_type"]),
                 type_v=int(preflight["kv_type"]),
                 offload_kqv=gpu_layers > 0,
@@ -1000,6 +1097,18 @@ def load_model(
                 chat_format=None if chat_format == "auto" else chat_format,
                 verbose=False,
             )
+            orig_init_sampler = STATE.llm._init_sampler
+
+            def _patched_init_sampler(*s_args, **s_kwargs):
+                sampler = orig_init_sampler(*s_args, **s_kwargs)
+                for tok in STATE.prior_assistant_tokens:
+                    try:
+                        sampler.accept(int(tok))
+                    except Exception:
+                        break
+                return sampler
+
+            STATE.llm._init_sampler = _patched_init_sampler
         except Exception as exc:
             log.error(f"Load failed: {exc}")
             log.error(traceback.format_exc())
@@ -1017,7 +1126,8 @@ def load_model(
         log.info(f"Model '{filename}' resident in VRAM. Load time: {dt:.2f}s")
         return preflight
     finally:
-        STATE.locked = False
+        with STATE._lease:
+            STATE.locked = False
 
 
 # =====================================================================
@@ -1086,10 +1196,13 @@ class ChatRequest(BaseModel):
 
     model: StrictStr
     messages: List[Message]
-    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: Optional[float] = Field(default=0.95, ge=0.0, le=1.0)
-    min_p: Optional[float] = Field(default=0.05, ge=0.0, le=1.0)
-    max_tokens: Optional[StrictInt] = Field(default=512, ge=1, le=32768)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    min_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_k: Optional[StrictInt] = Field(default=None, ge=0, le=200)
+    repeat_penalty: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    max_tokens: Optional[StrictInt] = Field(default=None, ge=1, le=32768)
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     seed: Optional[StrictInt] = None
@@ -1125,6 +1238,9 @@ class LoaderSettings(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.95, ge=0.0, le=1.0)
     min_p: float = Field(default=0.05, ge=0.0, le=1.0)
+    top_k: StrictInt = Field(default=40, ge=0, le=200)
+    repeat_penalty: float = Field(default=1.0, ge=0.0, le=2.0)
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     seed: Optional[StrictInt] = None
     max_tokens: StrictInt = Field(default=512, ge=1, le=8192)
     stop_sequences: StrictStr = Field(default="", max_length=2000)
@@ -1142,17 +1258,32 @@ class SaveSessionRequest(BaseModel):
     messages: List[Message] = Field(min_length=1)
 
 
+class HistoryTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: StrictStr = Field(max_length=200000)
+
+
+class ChatHistoryRequest(BaseModel):
+    messages: List[HistoryTurn]
+
+
 class TTSRequest(BaseModel):
     text: StrictStr = Field(min_length=1, max_length=20000)
     voice: StrictStr = Field(default="silas", max_length=64)
     play_on_host: Optional[bool] = None
 
 
+_SETTINGS_LOCK = threading.Lock()
+
+
 def load_settings() -> dict:
     try:
-        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        with _SETTINGS_LOCK:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         merged = {**DEFAULT_SETTINGS, **data}
-        return LoaderSettings.model_validate(merged).model_dump()
+        validated = LoaderSettings.model_validate(merged).model_dump()
+        validated["system_prompt"] = strip_builtin_system_prompt(validated.get("system_prompt", ""))
+        return validated
     except FileNotFoundError:
         return dict(DEFAULT_SETTINGS)
     except Exception as exc:
@@ -1162,13 +1293,24 @@ def load_settings() -> dict:
 
 def save_settings(settings: LoaderSettings) -> dict:
     data = settings.model_dump()
-    SETTINGS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    data["system_prompt"] = strip_builtin_system_prompt(data.get("system_prompt", ""))
+    temporary_path = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".tmp")
+    with _SETTINGS_LOCK:
+        temporary_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary_path, SETTINGS_PATH)
     return data
 
 
 # =====================================================================
 # BACKGROUND ARCHIVE INGESTION WORKER
 # =====================================================================
+
+def _ingest_progress_callback(msg: str, frac: float) -> None:
+    if INGEST_STATE.cancel_event.is_set():
+        raise IngestCancelledError("Import cancelled by user.")
+    INGEST_STATE.stage = msg
+    INGEST_STATE.progress = round(min(1.0, max(0.0, frac)), 3)
+
 
 def _start_background_ingest(
     file_items: List[Tuple[str, bytes]],
@@ -1179,15 +1321,13 @@ def _start_background_ingest(
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
 
+    INGEST_STATE.cancel_event.clear()
+    INGEST_STATE.cancelled = False
     INGEST_STATE.running = True
     INGEST_STATE.stage = "Starting archive extraction..."
     INGEST_STATE.progress = 0.02
     INGEST_STATE.error = None
     INGEST_STATE.last_result = None
-
-    def _progress(msg: str, frac: float):
-        INGEST_STATE.stage = msg
-        INGEST_STATE.progress = round(min(1.0, max(0.0, frac)), 3)
 
     def _worker():
         global PCP_INDEX
@@ -1198,7 +1338,7 @@ def _start_background_ingest(
                 blocked_phrases=blocked_phrases,
                 protected_words=protected_words,
                 replace_existing=replace_existing,
-                progress_callback=_progress,
+                progress_callback=_ingest_progress_callback,
             )
             bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
             if PCP_INDEX is None:
@@ -1206,10 +1346,10 @@ def _start_background_ingest(
                     PCP_DATA_DIR,
                     cache_dir=PCP_DATA_DIR,
                     model_dir=bge_dir,
-                    progress_callback=_progress,
+                    progress_callback=_ingest_progress_callback,
                 )
             else:
-                PCP_INDEX.reload(progress_callback=_progress)
+                PCP_INDEX.reload(progress_callback=_ingest_progress_callback)
             summary["passages_indexed"] = PCP_INDEX.passage_count if PCP_INDEX else 0
             INGEST_STATE.last_result = summary
             INGEST_STATE.stage = (
@@ -1218,6 +1358,11 @@ def _start_background_ingest(
             )
             INGEST_STATE.progress = 1.0
             log.info(f"Archive ingestion complete: {summary}")
+        except IngestCancelledError:
+            INGEST_STATE.cancelled = True
+            INGEST_STATE.error = None
+            INGEST_STATE.stage = "Import cancelled. Progress saved — click RE-INDEX anytime to resume, or close."
+            log.info("Archive ingestion cancelled by user.")
         except Exception as exc:
             log.error(f"Archive ingestion failed: {exc}")
             log.error(traceback.format_exc())
@@ -1233,12 +1378,12 @@ def _start_background_ingest(
 # FASTAPI APPLICATION & ROUTES
 # =====================================================================
 
-app = FastAPI(title="GHost PCP", version="1.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="GHostPCP", version="1.1.0", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1306,31 +1451,41 @@ def load_endpoint(req: LoadRequest):
 
 @app.post("/v1/unload", dependencies=[Depends(verify_access)])
 def unload_endpoint():
-    if STATE.locked or STATE.busy:
-        raise HTTPException(status_code=409, detail="A model change or generation is in progress.")
-    STATE.locked = True
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="A model change or generation is in progress.")
+        STATE.locked = True
     try:
         unload_current_model()
     finally:
-        STATE.locked = False
+        with STATE._lease:
+            STATE.locked = False
     return {"status": "unloaded"}
 
 
 @app.post("/v1/reset", dependencies=[Depends(verify_access)])
 def reset_endpoint():
-    if STATE.locked or STATE.busy:
-        raise HTTPException(status_code=409, detail="Wait for the current model operation to finish.")
-    if STATE.llm is None:
-        raise HTTPException(status_code=409, detail="No model is loaded.")
-    STATE.llm.reset()
-    return {"status": "reset", "model": STATE.loaded_model}
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="Wait for the current model operation to finish.")
+        if STATE.llm is None:
+            raise HTTPException(status_code=409, detail="No model is loaded.")
+        STATE.locked = True
+        llm = STATE.llm
+        model = STATE.loaded_model
+    try:
+        llm.reset()
+        return {"status": "reset", "model": model}
+    finally:
+        with STATE._lease:
+            STATE.locked = False
 
 
 @app.get("/v1/status", dependencies=[Depends(verify_access)])
 def status():
     pcp_ready = bool(PCP_INDEX and PCP_INDEX.ready)
     return {
-        "engine": "GHost-PCP",
+        "engine": "GHostPCP",
         "backend": BACKEND_NAME,
         "resident_model": STATE.loaded_model,
         "n_gpu_layers": STATE.loaded_gpu_layers,
@@ -1339,6 +1494,9 @@ def status():
         "chat_format": STATE.loaded_chat_format,
         "loading": STATE.locked,
         "generating": STATE.busy,
+        "generating_stream": STATE.streaming,
+        "abort_requested": STATE.abort_requested,
+        "generation_id": STATE.generation_id,
         "models_available": len(scan_models()),
         "pcp_ready": pcp_ready,
         "pcp_volumes": PCP_INDEX.file_count if pcp_ready and PCP_INDEX else 0,
@@ -1363,11 +1521,19 @@ def pcp_status():
         "volume_files": volume_files,
         "data_dir": str(PCP_DATA_DIR),
         "ingesting": INGEST_STATE.running,
+        "cancelling": INGEST_STATE.running and INGEST_STATE.cancel_event.is_set(),
+        "cancelled": INGEST_STATE.cancelled,
         "stage": INGEST_STATE.stage,
         "progress": INGEST_STATE.progress,
         "error": INGEST_STATE.error,
         "last_result": INGEST_STATE.last_result,
     }
+
+
+@app.post("/v1/pcp/cancel", dependencies=[Depends(verify_access)])
+def pcp_cancel():
+    active = INGEST_STATE.request_cancel()
+    return {"status": "cancelling" if active else "idle"}
 
 
 @app.post("/v1/pcp/ingest", dependencies=[Depends(verify_access)])
@@ -1410,8 +1576,9 @@ def pcp_ingest_local(req: LocalPathIngestRequest):
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"Path not found: {p}")
         if p.is_dir():
-            for child in sorted(p.glob("*.md")):
-                items.append((child.name, child.read_bytes()))
+            for ext in ("*.md", "*.txt", "*.pdf", "*.jsonl"):
+                for child in sorted(p.glob(ext)):
+                    items.append((child.name, child.read_bytes()))
             conv = p / "conversations.json"
             if conv.is_file():
                 items.append((conv.name, conv.read_bytes()))
@@ -1419,7 +1586,7 @@ def pcp_ingest_local(req: LocalPathIngestRequest):
             items.append((p.name, p.read_bytes()))
 
     if not items:
-        raise HTTPException(status_code=400, detail="No supported export files (.zip, .json, .jsonl, .md) found at path.")
+        raise HTTPException(status_code=400, detail="No supported export or document files (.zip, .json, .jsonl, .md, .txt, .pdf) found at path.")
 
     _start_background_ingest(items, bp_list, pw_list, replace_existing=req.replace_existing)
     return {"status": "started", "files": len(items)}
@@ -1430,33 +1597,41 @@ def pcp_save_session(req: SaveSessionRequest):
     global PCP_INDEX
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Wait for archive indexing to finish before saving session.")
-    if STATE.locked or STATE.busy:
-        raise HTTPException(status_code=409, detail="Wait for current generation to finish before saving session.")
-
-    bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
-    if PCP_INDEX is None:
-        PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
-
-    raw_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="Wait for current generation to finish before saving session.")
+        STATE.locked = True
     try:
-        result = PCP_INDEX.append_session(raw_msgs)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        log.error(f"Save session failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to save session: {exc}") from exc
+        bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
+        if PCP_INDEX is None:
+            PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
 
-    if STATE.llm is not None:
+        raw_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
         try:
-            STATE.llm.reset()
+            result = PCP_INDEX.append_session(raw_msgs)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            log.warning(f"LLM reset warning after save-session: {exc}")
+            log.error(f"Save session failed: {exc}")
+            raise HTTPException(status_code=500, detail=f"Failed to save session: {exc}") from exc
 
-    log.info(
-        f"SESSION SAVED :: file={result['saved_to']} turns={result['turns_saved']} "
-        f"passages_added={result['passages_added']} total_passages={result['total_passages']}"
-    )
-    return result
+        with STATE._history_lock:
+            STATE.conversation.clear()
+
+        if STATE.llm is not None:
+            try:
+                STATE.llm.reset()
+            except Exception as exc:
+                log.warning(f"LLM reset warning after save-session: {exc}")
+
+        log.info(
+            f"SESSION SAVED :: file={result['saved_to']} turns={result['turns_saved']} "
+            f"passages_added={result['passages_added']} total_passages={result['total_passages']}"
+        )
+        return result
+    finally:
+        with STATE._lease:
+            STATE.locked = False
 
 
 @app.post("/v1/pcp/reindex", dependencies=[Depends(verify_access)])
@@ -1464,14 +1639,12 @@ def pcp_reindex():
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
 
+    INGEST_STATE.cancel_event.clear()
+    INGEST_STATE.cancelled = False
     INGEST_STATE.running = True
     INGEST_STATE.stage = "Re-indexing ghost_pcp_*.md volumes..."
     INGEST_STATE.progress = 0.1
     INGEST_STATE.error = None
-
-    def _progress(msg: str, frac: float):
-        INGEST_STATE.stage = msg
-        INGEST_STATE.progress = round(min(1.0, max(0.0, frac)), 3)
 
     def _worker():
         global PCP_INDEX
@@ -1482,16 +1655,21 @@ def pcp_reindex():
                     PCP_DATA_DIR,
                     cache_dir=PCP_DATA_DIR,
                     model_dir=bge_dir,
-                    progress_callback=_progress,
+                    progress_callback=_ingest_progress_callback,
                 )
             else:
-                PCP_INDEX.reload(progress_callback=_progress)
+                PCP_INDEX.reload(progress_callback=_ingest_progress_callback)
             INGEST_STATE.stage = (
                 f"Indexed {PCP_INDEX.file_count} volume(s), {PCP_INDEX.passage_count:,} passages."
                 if PCP_INDEX and PCP_INDEX.ready
                 else "No ghost_pcp_*.md files found in pcp_data."
             )
             INGEST_STATE.progress = 1.0
+        except IngestCancelledError:
+            INGEST_STATE.cancelled = True
+            INGEST_STATE.error = None
+            INGEST_STATE.stage = "Import cancelled. Progress saved — click RE-INDEX anytime to resume, or close."
+            log.info("Archive re-index cancelled by user.")
         except Exception as exc:
             INGEST_STATE.error = str(exc)
             INGEST_STATE.stage = f"Failed: {exc}"
@@ -1547,12 +1725,16 @@ def remote_rotate_token():
 
 
 @app.get("/v1/remote/qr.svg", dependencies=[Depends(verify_access)])
-def remote_qr_svg(target: str = "lan"):
+def remote_qr_svg(target: str = "tunnel"):
     info = remote_status()
     if target == "tunnel" and info["tunnel_url"]:
         url = info["tunnel_url"]
     elif target == "tailscale" and info["tailscale_url"]:
         url = info["tailscale_url"]
+    elif target == "lan" and info["lan_url"]:
+        url = info["lan_url"]
+    elif info["tunnel_url"]:
+        url = info["tunnel_url"]
     elif info["lan_url"]:
         url = info["lan_url"]
     else:
@@ -1616,8 +1798,201 @@ def tts_stop_endpoint():
 
 
 # =====================================================================
+# LIVE CONVERSATION SYNC (DESKTOP <-> PHONE)
+# =====================================================================
+
+@app.get("/v1/chat/history", dependencies=[Depends(verify_access)])
+def get_chat_history():
+    with STATE._history_lock:
+        return {"messages": [dict(m) for m in STATE.conversation]}
+
+
+@app.post("/v1/chat/history", dependencies=[Depends(verify_access)])
+def set_chat_history(req: ChatHistoryRequest):
+    cleaned = [{"role": m.role, "content": m.content} for m in req.messages]
+    with STATE._history_lock:
+        STATE.conversation = cleaned
+    return {"status": "ok", "count": len(cleaned)}
+
+
+def _condense_document_for_chat(safe_name: str, text: str, max_chars: int = 11000) -> str:
+    """Keep huge attached files within chat context limits while indexing the full text into PCP."""
+    total_len = len(text)
+    if total_len <= max_chars:
+        return text
+
+    open_len, mid_len, close_len = 2200, 1550, 1800
+    sections = [("--- OPENING SECTION ---", text[:open_len].rstrip())]
+    cursor = open_len
+    tail_start = total_len - close_len
+    for label, frac in (
+        ("--- EARLY SECTION ---", 0.20),
+        ("--- MID-EARLY SECTION ---", 0.40),
+        ("--- MID-LATE SECTION ---", 0.60),
+        ("--- LATE SECTION ---", 0.80),
+    ):
+        start = max(cursor, min(tail_start - mid_len, int(total_len * frac) - (mid_len // 2)))
+        snippet = text[start : start + mid_len].strip()
+        if snippet:
+            sections.append((label, snippet))
+        cursor = start + mid_len
+    sections.append(("--- CLOSING SECTION ---", text[tail_start:].lstrip()))
+
+    body = "\n\n".join(f"{label}\n{snippet}" for label, snippet in sections)
+    return (
+        f"[Large document '{safe_name}' ({total_len:,} chars total) — automatically indexed into your PCP archive for full search. "
+        f"Representative sections across the full document are shown below:]\n\n{body}"
+    )
+
+
+@app.post("/v1/chat/extract-file", dependencies=[Depends(verify_access)])
+async def chat_extract_file(
+    files: List[UploadFile] = File(...),
+    save_to_archive: bool = Form(default=False),
+):
+    global PCP_INDEX
+    if save_to_archive and INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive indexing to finish before saving to database.")
+
+    extracted_files: List[Dict[str, Any]] = []
+    for up in files:
+        safe_name = Path(up.filename or "document.txt").name
+        raw = await up.read()
+        suffix = Path(safe_name).suffix.lower()
+        try:
+            if suffix == ".json":
+                text_raw = raw.decode("utf-8-sig", errors="replace").strip()
+                try:
+                    data = json.loads(text_raw)
+                    pairs = extract_pairs_from_data(data)
+                except Exception:
+                    pairs = []
+                if pairs:
+                    text = "\n\n".join(f"**USER:** {u}\n\n**AI:** {a}" for u, a in pairs).strip()
+                else:
+                    text = text_raw
+            else:
+                text = extract_text_from_document(safe_name, raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read '{safe_name}': {exc}") from exc
+
+        if not text:
+            raise HTTPException(status_code=400, detail=f"File '{safe_name}' contained no readable text.")
+
+        condensed = _condense_document_for_chat(safe_name, text)
+        entry: Dict[str, Any] = {
+            "name": safe_name,
+            "text": condensed,
+            "chat_text": condensed,
+            "chars": len(text),
+            "saved_to": None,
+        }
+        should_save = bool(save_to_archive) or (len(text) > 12000 and not INGEST_STATE.running)
+        if should_save:
+            bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
+            if PCP_INDEX is None:
+                PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
+            try:
+                save_res = PCP_INDEX.append_document(safe_name, text)
+                entry["saved_to"] = save_res.get("saved_to")
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to index '{safe_name}': {exc}") from exc
+        extracted_files.append(entry)
+
+    return {
+        "files": extracted_files,
+        "total_volumes": PCP_INDEX.file_count if PCP_INDEX else 0,
+        "total_passages": PCP_INDEX.passage_count if PCP_INDEX else 0,
+    }
+
+
+# =====================================================================
 # CHAT COMPLETIONS (WITH CITATION-FREE PCP GROUNDING)
 # =====================================================================
+
+def _build_effective_system_prompt(custom_prompt: str = "") -> str:
+    custom = strip_builtin_system_prompt(custom_prompt)
+    builtin = SYSTEM_PROMPT.strip()
+    return f"{custom}\n\n{builtin}" if custom else builtin
+
+
+def _condense_long_text(text: str, keep_head: int, keep_tail: int, marker: str) -> str:
+    if len(text) <= keep_head + keep_tail + len(marker) + 20:
+        return text
+    head = text[:keep_head].rstrip()
+    tail = text[-keep_tail:].lstrip() if keep_tail > 0 else ""
+    return f"{head}{marker}{tail}".strip()
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    if STATE.llm is not None and hasattr(STATE.llm, "tokenize"):
+        try:
+            return len(STATE.llm.tokenize(text.encode("utf-8", errors="replace"), add_bos=False)) + 6
+        except Exception:
+            pass
+    return max(1, (len(text) // 3) + 6)
+
+
+def _fit_messages_to_context(
+    messages: List[Dict[str, Any]],
+    n_ctx: int,
+    max_tokens: int,
+) -> List[Dict[str, Any]]:
+    """Trim older turns and oversize attachments so total prompt tokens stay inside n_ctx."""
+    if not messages:
+        return messages
+    fitted = [dict(m) for m in messages]
+    budget = max(1024, int(n_ctx) - int(max_tokens) - 256)
+
+    def total_est() -> int:
+        return sum(_estimate_tokens(str(m.get("content") or "")) for m in fitted)
+
+    if total_est() <= budget:
+        return fitted
+
+    for idx in range(len(fitted) - 1):
+        msg = fitted[idx]
+        if msg.get("role") == "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and len(content) > 2400:
+            msg["content"] = _condense_long_text(
+                content,
+                1200,
+                800,
+                "\n\n[... earlier attachment/turn condensed ...]\n\n",
+            )
+
+    while len(fitted) > 2 and total_est() > budget:
+        drop_idx = 1 if fitted[0].get("role") == "system" else 0
+        fitted.pop(drop_idx)
+
+    if total_est() > budget and isinstance(fitted[-1].get("content"), str):
+        other_tokens = sum(_estimate_tokens(str(m.get("content") or "")) for m in fitted[:-1])
+        remaining_tokens = max(512, budget - other_tokens)
+        last_text = fitted[-1]["content"]
+        if _estimate_tokens(last_text) > remaining_tokens:
+            char_budget = max(800, int(remaining_tokens * 2.5))
+            for _ in range(6):
+                candidate = _condense_long_text(
+                    last_text,
+                    max(300, int(char_budget * 0.5)),
+                    max(300, int(char_budget * 0.45)),
+                    "\n\n[... middle condensed to fit context window ...]\n\n",
+                )
+                if _estimate_tokens(candidate) <= remaining_tokens or len(candidate) >= len(last_text):
+                    last_text = candidate
+                    break
+                char_budget = int(char_budget * 0.75)
+                last_text = candidate
+            fitted[-1]["content"] = last_text
+
+    return fitted
+
 
 def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]:
     settings = load_settings()
@@ -1638,47 +2013,123 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
             latest_user_text = raw_messages[idx]["content"].strip()
             break
 
-    if use_pcp and PCP_INDEX is not None and PCP_INDEX.ready and latest_user_text:
-        excerpts = PCP_INDEX.search(latest_user_text, limit=top_k)
-        if excerpts:
-            archive_block = "\n\n---\n\n".join(excerpts)
-            base_sys = settings.get("system_prompt") or SYSTEM_PROMPT.strip()
-            if raw_messages[0].get("role") == "system":
-                existing_sys = str(raw_messages[0].get("content") or base_sys).strip()
-                if "ARCHIVE EXCERPTS:" not in existing_sys:
-                    raw_messages[0]["content"] = existing_sys + "\n\nARCHIVE EXCERPTS:\n" + archive_block
-            else:
-                raw_messages.insert(
-                    0,
-                    {"role": "system", "content": base_sys + "\n\nARCHIVE EXCERPTS:\n" + archive_block},
-                )
+    # Include recent conversation turns when the latest reply is short (ignoring large attached file bodies)
+    query_core = re.sub(
+        r"\[Attached File:\s*([^\]]+)\][\s\S]*?(?:\[/Attached File\]|\Z)",
+        r"Attached file: \1",
+        latest_user_text,
+    ).strip()
+    retrieval_query = query_core or latest_user_text
+    if retrieval_query and len(query_core) < 120 and latest_user_idx is not None:
+        prior_turns: List[str] = []
+        for msg in raw_messages[:latest_user_idx]:
+            if msg.get("role") in ("user", "assistant") and isinstance(msg["content"], str):
+                cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", msg["content"], flags=re.IGNORECASE).strip()
+                if cleaned:
+                    prior_turns.append(cleaned[:200])
+        if prior_turns:
+            retrieval_query = "\n".join(prior_turns[-3:] + [retrieval_query])
 
-    # For Qwen3 models when reasoning blocks are hidden, append /no_think to keep replies immediate
+    configured_custom = strip_builtin_system_prompt(settings.get("system_prompt") or "")
+    has_system = raw_messages[0].get("role") == "system"
+    incoming_sys = str(raw_messages[0].get("content") or "").strip() if has_system else ""
+    if has_system and "ARCHIVE EXCERPTS:" in incoming_sys:
+        effective_sys = incoming_sys
+    else:
+        custom_prefix = strip_builtin_system_prompt(incoming_sys) if (has_system and incoming_sys) else configured_custom
+        effective_sys = _build_effective_system_prompt(custom_prefix)
+
+    if has_system:
+        raw_messages[0]["content"] = effective_sys
+    else:
+        raw_messages.insert(0, {"role": "system", "content": effective_sys})
+
+    if use_pcp and PCP_INDEX is not None and PCP_INDEX.ready and retrieval_query:
+        excerpts = PCP_INDEX.search(retrieval_query, limit=top_k)
+        if excerpts and "ARCHIVE EXCERPTS:" not in raw_messages[0]["content"]:
+            archive_block = "\n\n---\n\n".join(excerpts)
+            raw_messages[0]["content"] = raw_messages[0]["content"].rstrip() + "\n\nARCHIVE EXCERPTS:\n" + archive_block
+
+    last_user_msg = next(
+        (m for m in reversed(raw_messages) if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        None,
+    )
+    if last_user_msg is not None and "[Attached File:" in last_user_msg["content"]:
+        reminder = (
+            "[Respond directly to the attached text above by referencing its actual scenes, characters, and details. "
+            "Do not repeat or paraphrase your previous reply.]"
+        )
+        if reminder not in last_user_msg["content"]:
+            last_user_msg["content"] = last_user_msg["content"].rstrip() + "\n\n" + reminder
+
+    effective_n_ctx = int(STATE.loaded_context_size or settings.get("n_ctx") or 8192)
+    effective_max_tokens = int(req.max_tokens or settings.get("max_tokens") or 512)
+    raw_messages = _fit_messages_to_context(raw_messages, effective_n_ctx, effective_max_tokens)
+
+    # For Qwen3 models when reasoning blocks are hidden, append /no_think to system + all user turns
     if (
         latest_user_idx is not None
         and STATE.loaded_model
         and "qwen3" in STATE.loaded_model.lower()
         and not show_reasoning
     ):
-        # Find latest user message again in case system prompt was inserted at index 0
-        for idx in range(len(raw_messages) - 1, -1, -1):
-            if raw_messages[idx].get("role") == "user" and isinstance(raw_messages[idx].get("content"), str):
-                if "/no_think" not in raw_messages[idx]["content"]:
-                    raw_messages[idx]["content"] = raw_messages[idx]["content"].rstrip() + "\n/no_think"
-                break
+        for msg in raw_messages:
+            if msg.get("role") in ("system", "user") and isinstance(msg.get("content"), str):
+                if "/no_think" not in msg["content"]:
+                    msg["content"] = msg["content"].rstrip() + "\n/no_think"
 
     return raw_messages, show_reasoning
 
 
 def _chat_completion_args(req: ChatRequest, prepared_messages: List[Dict[str, Any]]) -> dict:
+    settings = load_settings()
+
+    def pick(name: str, fallback: Any) -> Any:
+        value = getattr(req, name)
+        if name in req.model_fields_set and value is not None:
+            return value
+        stored = settings.get(name)
+        return stored if stored is not None else fallback
+
+    stop = req.stop
+    if stop is None:
+        raw_stop = str(settings.get("stop_sequences") or "").strip()
+        if raw_stop:
+            stop = [line.strip() for line in raw_stop.splitlines() if line.strip()]
+
+    chosen_seed = pick("seed", None)
+    if chosen_seed is None:
+        chosen_seed = secrets.randbelow(2**31 - 1) + 1
+
+    ai_turns: List[str] = []
+    for m in prepared_messages:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        if role == "assistant" and isinstance(content, str) and content.strip():
+            ai_turns.append(content.strip())
+    ai_turns = ai_turns[-3:]
+    if ai_turns and STATE.llm is not None and hasattr(STATE.llm, "tokenize"):
+        try:
+            prior_text = "\n".join(ai_turns)
+            STATE.prior_assistant_tokens = list(
+                STATE.llm.tokenize(prior_text.encode("utf-8", errors="replace"), add_bos=False)[-1024:]
+            )
+        except Exception:
+            STATE.prior_assistant_tokens = []
+    else:
+        STATE.prior_assistant_tokens = []
+
     args = {
         "messages": prepared_messages,
-        "max_tokens": req.max_tokens,
-        "temperature": req.temperature,
-        "top_p": req.top_p,
-        "min_p": req.min_p,
-        "stop": req.stop,
-        "seed": req.seed,
+        "max_tokens": int(pick("max_tokens", 512)),
+        "temperature": float(pick("temperature", 0.7)),
+        "top_p": float(pick("top_p", 0.95)),
+        "min_p": float(pick("min_p", 0.05)),
+        "top_k": int(pick("top_k", 40)),
+        "repeat_penalty": float(pick("repeat_penalty", 1.0)),
+        "presence_penalty": float(pick("presence_penalty", 0.0)),
+        "stop": stop,
+        "seed": chosen_seed,
     }
     if req.response_format is not None:
         args["response_format"] = req.response_format.model_dump(by_alias=True, exclude_none=True)
@@ -1689,58 +2140,211 @@ def _chat_completion_args(req: ChatRequest, prepared_messages: List[Dict[str, An
     return args
 
 
-def _stream_generator(req: ChatRequest, prepared_messages: List[Dict[str, Any]]):
-    start = time.perf_counter()
-    token_count = 0
+class _ThinkGate:
+    OPEN = "<think>"
+    CLOSE = "</think>"
 
+    def __init__(self, show_reasoning: bool):
+        self.show_reasoning = show_reasoning
+        self.inside = False
+        self.pending = ""
+
+    @staticmethod
+    def _partial_tail(text: str, tag: str) -> int:
+        for size in range(min(len(text), len(tag) - 1), 0, -1):
+            if text.endswith(tag[:size]):
+                return size
+        return 0
+
+    def feed(self, text: str) -> str:
+        if self.show_reasoning or not text:
+            return text
+        buf = self.pending + text
+        lowered = buf.lower()
+        out: List[str] = []
+        cursor = 0
+        self.pending = ""
+        while cursor < len(buf):
+            tag = self.CLOSE if self.inside else self.OPEN
+            hit = lowered.find(tag, cursor)
+            if hit < 0:
+                tail = buf[cursor:]
+                hold = self._partial_tail(tail.lower(), tag)
+                if not self.inside:
+                    out.append(tail[:-hold] if hold else tail)
+                self.pending = tail[-hold:] if hold else ""
+                break
+            if not self.inside:
+                out.append(buf[cursor:hit])
+            cursor = hit + len(tag)
+            self.inside = not self.inside
+        return "".join(out)
+
+    def flush(self) -> str:
+        remainder = "" if self.inside else self.pending
+        self.pending = ""
+        return remainder
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+def _stream_generator(
+    req: ChatRequest,
+    prepared_messages: List[Dict[str, Any]],
+    generation_id: int,
+    show_reasoning: bool,
+):
+    start = time.perf_counter()
+    first_token_at: Optional[float] = None
+    token_count = 0
+    aborted = False
+    failed = False
+    stream = None
+    reasoning_open = False
+    think_gate = _ThinkGate(show_reasoning)
     try:
         stream_args = _chat_completion_args(req, prepared_messages)
         stream_args["stream"] = True
-        assert STATE.llm is not None
-        stream = STATE.llm.create_chat_completion(**stream_args)
+        llm = STATE.llm
+        if llm is None:
+            raise RuntimeError("No model resident.")
+        stream = llm.create_chat_completion(**stream_args)
         for chunk in stream:
-            choice = (chunk.get("choices") or [{}])[0]
-            if choice.get("delta", {}).get("content"):
-                token_count += 1
-            yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
-    except Exception as e:
-        log.error(f"Streaming generation error: {e}")
-        yield "data: " + json.dumps({"error": {"message": str(e)}}) + "\n\n"
-    finally:
-        STATE.busy = False
+            if STATE.abort_requested:
+                aborted = True
+                break
+            choices = chunk.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                reasoning = delta.pop("reasoning_content", None)
+                if not show_reasoning and reasoning:
+                    pass
+                elif isinstance(reasoning, str) and reasoning:
+                    prefix = ""
+                    if not reasoning_open:
+                        prefix = "<think>"
+                    if isinstance(content, str) and content:
+                        content = prefix + reasoning + "</think>" + content
+                        reasoning_open = False
+                    else:
+                        content = prefix + reasoning
+                        reasoning_open = True
+                if isinstance(content, str) and content:
+                    if show_reasoning and reasoning_open and reasoning is None:
+                        content = "</think>" + content
+                        reasoning_open = False
+                    filtered = think_gate.feed(content)
+                    if filtered:
+                        delta["content"] = filtered
+                        token_count += 1
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                    else:
+                        delta.pop("content", None)
+                if not delta and choices[0].get("finish_reason") is None:
+                    continue
+            yield _sse(chunk)
 
-    elapsed = time.perf_counter() - start
-    tps = token_count / elapsed if elapsed > 0 else 0.0
-    log.info(f"STREAM DONE :: model={req.model} tokens={token_count} time={elapsed:.2f}s speed={tps:.2f} tok/s")
-    yield "data: [DONE]\n\n"
+        if show_reasoning and reasoning_open:
+            yield _sse({
+                "id": f"chatcmpl-{generation_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {"content": "</think>"}}],
+            })
+        residual = think_gate.flush()
+        if residual:
+            yield _sse({
+                "id": f"chatcmpl-{generation_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {"content": residual}}],
+            })
+        if aborted:
+            yield _sse({
+                "id": f"chatcmpl-{generation_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "ghost_aborted": True,
+            })
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        failed = True
+        log.error(f"Streaming generation error: {exc}")
+        yield _sse({"error": {"message": str(exc)}})
+        yield "data: [DONE]\n\n"
+    finally:
+        if stream is not None:
+            closer = getattr(stream, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as exc:
+                    log.warning(f"Could not close generation stream: {exc}")
+        STATE.end_generation(generation_id)
+        elapsed = time.perf_counter() - start
+        decode_time = elapsed - ((first_token_at - start) if first_token_at else elapsed)
+        rate = token_count / decode_time if decode_time > 0 else 0.0
+        outcome = "ABORTED" if aborted else ("FAILED" if failed else "DONE")
+        log.info(
+            f"STREAM {outcome} :: gen={generation_id} model={req.model} chunks={token_count} "
+            f"time={elapsed:.2f}s decode={rate:.2f} chunk/s"
+        )
+
+
+@app.post("/v1/abort", dependencies=[Depends(verify_access)])
+def abort_generation():
+    active = STATE.request_abort()
+    streaming = bool(active and STATE.streaming)
+    log.info(
+        f"ABORT REQUEST :: gen={STATE.generation_id} active={active} streaming={streaming}"
+    )
+    return {
+        "status": "aborting" if active else "idle",
+        "generation_id": STATE.generation_id,
+        "interruptible": streaming,
+    }
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_access)])
 def chat_completions(req: ChatRequest):
-    if STATE.locked:
-        raise HTTPException(status_code=409, detail="Model change in progress.")
-    if STATE.busy:
-        raise HTTPException(status_code=409, detail="A generation is already in progress.")
     if STATE.llm is None:
         raise HTTPException(status_code=409, detail="No model resident. Open CONFIG and click MOUNT first.")
 
-    prepared_messages, show_reasoning = _prepare_pcp_messages(req)
-    log.info(f"REQUEST :: model={req.model} stream={req.stream} msgs={len(prepared_messages)}")
+    generation_id = STATE.begin_generation(bool(req.stream))
+    try:
+        prepared_messages, show_reasoning = _prepare_pcp_messages(req)
+    except Exception:
+        STATE.end_generation(generation_id)
+        raise
+    log.info(
+        f"REQUEST :: gen={generation_id} model={req.model} stream={req.stream} "
+        f"msgs={len(prepared_messages)}"
+    )
 
     if req.stream:
-        STATE.busy = True
         return StreamingResponse(
-            _stream_generator(req, prepared_messages),
+            _stream_generator(req, prepared_messages, generation_id, show_reasoning),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            background=BackgroundTask(STATE.end_generation, generation_id),
         )
 
     start = time.perf_counter()
-    STATE.busy = True
     try:
         completion_args = _chat_completion_args(req, prepared_messages)
         completion_args["stream"] = False
-        out = STATE.llm.create_chat_completion(**completion_args)
+        llm = STATE.llm
+        if llm is None:
+            raise RuntimeError("No model resident.")
+        out = llm.create_chat_completion(**completion_args)
         if not show_reasoning:
             try:
                 content = out["choices"][0]["message"]["content"]
@@ -1754,7 +2358,7 @@ def chat_completions(req: ChatRequest):
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        STATE.busy = False
+        STATE.end_generation(generation_id)
 
     elapsed = time.perf_counter() - start
     usage = out.get("usage", {})
@@ -1778,7 +2382,7 @@ def startup_banner():
             print(GHOST_BANNER)
         except UnicodeEncodeError:
             pass
-    log.info("GHost PCP boot sequence initiated.")
+    log.info("GHostPCP boot sequence initiated.")
     log.info(f"Model directory : {MODEL_DIR.resolve()}")
     log.info(f"PCP Data dir    : {PCP_DATA_DIR.resolve()}")
     log.info(f"Settings file   : {SETTINGS_PATH.resolve()}")
@@ -1794,7 +2398,7 @@ def startup_banner():
     log.info(f"GGUF models detected: {len(detected)}")
     for m in detected:
         log.info(f"  -> {m['id']} ({m['size_gb']} GB)")
-    log.info("GHost PCP Engine online.")
+    log.info("GHostPCP Engine online.")
 
 
 @app.on_event("startup")
@@ -1807,11 +2411,11 @@ def on_shutdown():
     log.info("Shutdown signal received. Stopping tunnel and flushing VRAM ...")
     stop_cloudflare_tunnel()
     unload_current_model()
-    log.info("GHost PCP terminated cleanly.")
+    log.info("GHostPCP terminated cleanly.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GHost PCP — GPU Hosted Pure Concentrated Personality")
+    parser = argparse.ArgumentParser(description="GHostPCP — GPU Hosted Pure Concentrated Personality")
     parser.add_argument("--api-only", action="store_true", help="Run the server without opening a desktop window")
     args = parser.parse_args()
 
@@ -1846,11 +2450,11 @@ if __name__ == "__main__":
             if not server.started:
                 server.should_exit = True
                 server_thread.join(timeout=5)
-                raise RuntimeError(f"GHost PCP server did not start on {LOOPBACK_HOST}:{PORT}.")
+                raise RuntimeError(f"GHostPCP server did not start on {LOOPBACK_HOST}:{PORT}.")
 
             try:
                 webview.create_window(
-                    "GHost PCP // GPU Hosted Pure Concentrated Personality",
+                    "GHostPCP // GPU Hosted Pure Concentrated Personality",
                     f"http://{LOOPBACK_HOST}:{PORT}/",
                     width=1440,
                     height=960,
@@ -1864,11 +2468,11 @@ if __name__ == "__main__":
                 server.should_exit = True
                 server_thread.join(timeout=10)
     except Exception as exc:
-        log.exception("GHost PCP failed to start")
-        message = f"GHost PCP could not start.\n\n{exc}\n\nDetails: {LOG_PATH}"
+        log.exception("GHostPCP failed to start")
+        message = f"GHostPCP could not start.\n\n{exc}\n\nDetails: {LOG_PATH}"
         if os.name == "nt":
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, message, "GHost PCP startup error", 0x10)
+            ctypes.windll.user32.MessageBoxW(None, message, "GHostPCP startup error", 0x10)
         else:
             print(message, file=sys.stderr)
         raise

@@ -34,3 +34,4 @@ current_speech.wav
 *.old.exe
 *.log
 .env
+.aider*

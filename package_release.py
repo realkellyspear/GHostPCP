@@ -1,4 +1,6 @@
-"""Generate sample_chatgpt_export.zip and package a clean GHost-PCP Windows Release."""
+# SPDX-FileCopyrightText: 2026 Kelly Spear
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Generate sample_chatgpt_export.zip and package a clean GHostPCP Windows release."""
 from __future__ import annotations
 
 import io
@@ -202,15 +204,29 @@ def stage_clean_sandbox(sandbox_dir: Path, link_sample_gguf: bool = True) -> Non
         except OSError:
             pass
 
-    # Core executable & docs
-    link_or_copy(ROOT / "GHost-PCP.exe", sandbox_dir / "GHost-PCP.exe")
+    # Executable, documentation, and the complete first-party corresponding source
+    link_or_copy(ROOT / "GHostPCP.exe", sandbox_dir / "GHostPCP.exe")
     link_or_copy(ROOT / "README.md", sandbox_dir / "README.md")
     if (ROOT / "THIRD_PARTY_NOTICES.md").is_file():
         link_or_copy(ROOT / "THIRD_PARTY_NOTICES.md", sandbox_dir / "THIRD_PARTY_NOTICES.md")
-    if (ROOT / "LICENSE.GPL-3.0").is_file():
-        link_or_copy(ROOT / "LICENSE.GPL-3.0", sandbox_dir / "LICENSE.GPL-3.0")
-    if (ROOT.parent / "GHost-PCP-public" / "LICENSE").is_file():
-        link_or_copy(ROOT.parent / "GHost-PCP-public" / "LICENSE", sandbox_dir / "LICENSE")
+    link_or_copy(ROOT / "LICENSE", sandbox_dir / "LICENSE")
+    source_files = (
+        "ghost_pcp.py",
+        "pcp_ingest.py",
+        "pcp_retrieval.py",
+        "persona.py",
+        "ghost_pcp.html",
+        "build_pcp.py",
+        "package_release.py",
+        "requirements.txt",
+    )
+    for name in source_files:
+        source = ROOT / name
+        if source.is_file():
+            link_or_copy(source, sandbox_dir / "source" / name)
+    test_source = ROOT / "tests" / "test_pcp.py"
+    if test_source.is_file():
+        link_or_copy(test_source, sandbox_dir / "source" / "tests" / test_source.name)
 
     # Assets
     for f in (ROOT / "assets").glob("*"):
@@ -265,24 +281,21 @@ def build_release_zip(sandbox_dir: Path, zip_path: Path) -> None:
             if "pcp_data" in file_path.parts:
                 continue
             rel = file_path.relative_to(sandbox_dir)
-            arcname = str(Path("GHost-PCP") / rel)
+            arcname = str(Path("GHostPCP") / rel)
             zf.write(file_path, arcname)
         # Ensure empty pcp_data/ directory entry exists
-        zf.writestr("GHost-PCP/pcp_data/", "")
+        zf.writestr("GHostPCP/pcp_data/", "")
 
 
 if __name__ == "__main__":
-    # Also place sample_chatgpt_export.zip in GHost-PCP and GHost-PCP-public
-    build_sample_chatgpt_export(ROOT / "sample_chatgpt_export.zip")
-    pub_dir = ROOT.parent / "GHost-PCP-public"
-    if pub_dir.is_dir():
-        build_sample_chatgpt_export(pub_dir / "sample_chatgpt_export.zip")
+    (ROOT / "examples").mkdir(parents=True, exist_ok=True)
+    build_sample_chatgpt_export(ROOT / "examples" / "sample_chatgpt_export.zip")
 
-    sandbox = ROOT.parent / "GHost-PCP-Release-Test"
+    sandbox = ROOT.parent / "GHostPCP-Release-Test"
     print(f"Staging clean first-time-user test folder at: {sandbox}")
     stage_clean_sandbox(sandbox, link_sample_gguf=True)
 
-    release_zip = ROOT.parent / "GHost-PCP-v1.0.0-win64.zip"
+    release_zip = ROOT.parent / "GHostPCP-v1.1.0-win64.zip"
     print(f"Packaging distributable GitHub Release archive: {release_zip} ...")
     build_release_zip(sandbox, release_zip)
     print(f"Done! Release zip size: {release_zip.stat().st_size / (1024**2):.1f} MB")

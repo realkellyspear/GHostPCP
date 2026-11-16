@@ -1,8 +1,10 @@
 # Third-Party Notices & Licenses
 
-**GHost PCP** source code is licensed under the MIT License (see `LICENSE`).
+**GHostPCP** first-party application code is licensed under the GNU General
+Public License v3.0 or later (see `LICENSE`). Bundled third-party components
+and models retain their own licenses.
 
-The standalone Windows release bundle (`GHost-PCP-v1.0.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
+The standalone Windows release bundle (`GHostPCP-v1.1.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
 
 ---
 
@@ -13,8 +15,8 @@ The standalone Windows release bundle (`GHost-PCP-v1.0.0-win64.zip`) includes th
 - **Source Code**:
   - https://github.com/OHF-Voice/piper1-gpl
   - https://github.com/espeak-ng/espeak-ng
-  - GHost PCP complete source code and build scripts (`build_pcp.py`, `package_release.py`, `requirements.txt`): https://github.com/realkellyspear/GHost-PCP
-- **License**: **GPL-3.0-or-later** (GNU General Public License v3.0 or later — full text included in `LICENSE.GPL-3.0`).
+  - GHostPCP complete source code and build scripts (`build_pcp.py`, `package_release.py`, `requirements.txt`): https://github.com/realkellyspear/GHost-PCP
+- **License**: **GPL-3.0-or-later** (GNU General Public License v3.0 or later — full text included in `LICENSE`).
 
 ---
 
@@ -52,4 +54,5 @@ The standalone Windows release bundles (or downloads on demand) pre-trained voic
 - **`llama.cpp` / `llama-cpp-python`**: Georgi Gerganov & contributors / Andrei Betlen (**MIT License**)
 - **ONNX Runtime (`onnxruntime` 1.30.0)**: Microsoft Corporation (**MIT License**)
 - **NVIDIA CUDA Runtime (`cublas64_13.dll`, `cublasLt64_13.dll`)**: NVIDIA Corporation (redistributable runtime components under NVIDIA CUDA Toolkit EULA)
+- **`pypdf`**: Matthieu Thillay, Martin Thoma & pypdf contributors (**BSD-3-Clause License**)
 - **FastAPI, Uvicorn, Pydantic, NumPy, Safetensors, Tokenizers, SoundDevice, SoundFile (`libsndfile`, LGPL-2.1), PyWebView, QRCode**: Distributed under their respective open-source licenses (MIT / BSD / Apache-2.0 / LGPL-2.1).

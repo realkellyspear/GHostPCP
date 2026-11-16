@@ -1,4 +1,6 @@
-"""GHost PCP — Local Semantic Vector Index for ghost_pcp_*.md Volumes.
+# SPDX-FileCopyrightText: 2026 Kelly Spear
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""GHostPCP — Local Semantic Vector Index for ghost_pcp_*.md Volumes.
 
 Uses BAAI/bge-small-en-v1.5 (384-D) with dual execution support:
 - Lightweight native Safetensors + Tokenizers + NumPy engine (~24ms query latency,
@@ -24,6 +26,10 @@ OVERLAP = 200
 INDEX_VERSION = 1
 SESSION_BOUNDARY = "<!-- PCP_SESSION_BOUNDARY -->"
 LIVE_VOLUME_MAX_BYTES = 1_200_000
+
+
+class IngestCancelledError(Exception):
+    """Raised when archive ingestion or embedding is cancelled by the user."""
 
 
 def _resolve_bge_model_dir(custom_dir: Optional[Path] = None) -> Path:
@@ -54,6 +60,7 @@ class NativeBGEModel:
         from tokenizers import Tokenizer
 
         self.model_dir = _resolve_bge_model_dir(model_dir)
+        self._st_model = None
         weights = load_file(str(self.model_dir / "model.safetensors"))
         self.tokenizer = Tokenizer.from_file(str(self.model_dir / "tokenizer.json"))
         self.tokenizer.enable_truncation(max_length=512)
@@ -124,17 +131,33 @@ class NativeBGEModel:
         x = self._layer_norm(x, self.emb_ln_w, self.emb_ln_b)
         attn_bias = (np.float32(1.0) - mask[:, None, None, :]) * np.float32(-10000.0)
         scale = np.float32(1.0 / math.sqrt(32.0))
+        sqrt_2_pi = np.float32(math.sqrt(2.0 / math.pi))
+        c_gelu = np.float32(0.044715)
+        half = np.float32(0.5)
+        one = np.float32(1.0)
 
         for wqkv, bqkv, wo, bo, ln1w, ln1b, wi, bi, wod, bod, ln2w, ln2b in self.layers:
-            qkv = (x @ wqkv + bqkv).reshape(bsz, seq_len, 3, 12, 32).transpose(2, 0, 3, 1, 4)
+            # Flatten batch and sequence axes so NumPy uses 2D multi-threaded SGEMM.
+            qkv = (x.reshape(-1, 384) @ wqkv + bqkv).reshape(bsz, seq_len, 3, 12, 32).transpose(2, 0, 3, 1, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]
-            scores = (q @ k.transpose(0, 1, 3, 2)) * scale + attn_bias
-            scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
-            probs = scores / scores.sum(axis=-1, keepdims=True)
-            ctx = (probs @ v).transpose(0, 2, 1, 3).reshape(bsz, seq_len, 384)
-            x = self._layer_norm(x + (ctx @ wo + bo), ln1w, ln1b)
-            inter = self._gelu(x @ wi + bi)
-            x = self._layer_norm(x + (inter @ wod + bod), ln2w, ln2b)
+            scores = np.matmul(q, k.swapaxes(-1, -2))
+            scores *= scale
+            scores += attn_bias
+            scores -= scores.max(axis=-1, keepdims=True)
+            np.exp(scores, out=scores)
+            scores /= scores.sum(axis=-1, keepdims=True)
+            ctx = np.matmul(scores, v).transpose(0, 2, 1, 3).reshape(-1, 384)
+            x = self._layer_norm((ctx @ wo + bo).reshape(bsz, seq_len, 384) + x, ln1w, ln1b)
+            inter = x.reshape(-1, 384) @ wi + bi
+            gelu_arg = inter * inter * inter
+            gelu_arg *= c_gelu
+            gelu_arg += inter
+            gelu_arg *= sqrt_2_pi
+            np.tanh(gelu_arg, out=gelu_arg)
+            gelu_arg += one
+            inter *= half
+            inter *= gelu_arg
+            x = self._layer_norm((inter @ wod + bod).reshape(bsz, seq_len, 384) + x, ln2w, ln2b)
 
         cls = x[:, 0, :]
         norms = np.linalg.norm(cls, axis=-1, keepdims=True)
@@ -146,20 +169,32 @@ class NativeBGEModel:
         batch_size: int = 8,
         normalize_embeddings: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        start_offset: int = 0,
+        total_count: Optional[int] = None,
         **kwargs,
     ) -> np.ndarray:
         total = len(texts)
+        overall_total = total_count if total_count is not None else (start_offset + total)
         if total == 0:
             return np.zeros((0, 384), dtype=np.float32)
         if total <= 4:
-            return self._forward_batch(texts)
+            vecs = self._forward_batch(texts)
+            if progress_callback:
+                try:
+                    progress_callback(min(overall_total, start_offset + total), overall_total)
+                except IngestCancelledError as exc:
+                    exc.partial_vectors = vecs
+                    raise
+            return vecs
 
-        if total >= 64:
+        if total >= 64 or self._st_model is not None:
+            results: List[np.ndarray] = []
             try:
-                from sentence_transformers import SentenceTransformer
+                if self._st_model is None:
+                    from sentence_transformers import SentenceTransformer
 
-                st = SentenceTransformer(str(self.model_dir))
-                results: List[np.ndarray] = []
+                    self._st_model = SentenceTransformer(str(self.model_dir))
+                st = self._st_model
                 step = 64
                 for start in range(0, total, step):
                     sub = list(texts[start : start + step])
@@ -172,18 +207,27 @@ class NativeBGEModel:
                     )
                     results.append(np.asarray(vecs, dtype=np.float32))
                     if progress_callback:
-                        progress_callback(min(total, start + step), total)
+                        progress_callback(min(overall_total, start_offset + start + len(sub)), overall_total)
                 return np.vstack(results)
+            except IngestCancelledError as exc:
+                if results:
+                    exc.partial_vectors = np.vstack(results)
+                raise
             except Exception:
                 pass
 
         results = []
         step = max(1, min(batch_size, 8))
-        for start in range(0, total, step):
-            vecs = self._forward_batch(texts[start : start + step])
-            results.append(vecs)
-            if progress_callback:
-                progress_callback(min(total, start + len(vecs)), total)
+        try:
+            for start in range(0, total, step):
+                vecs = self._forward_batch(texts[start : start + step])
+                results.append(vecs)
+                if progress_callback:
+                    progress_callback(min(overall_total, start_offset + start + len(vecs)), overall_total)
+        except IngestCancelledError as exc:
+            if results:
+                exc.partial_vectors = np.vstack(results)
+            raise
         return np.vstack(results)
 
 
@@ -203,6 +247,31 @@ def _chunk_segment(text: str) -> List[str]:
         if end == len(text):
             break
         start = max(start + 1, end - OVERLAP)
+
+    header_match = re.match(r"^\s*#\s+\*\*DOCUMENT:\s*(.+?)\*\*", text)
+    if header_match and chunks:
+        doc_name = re.sub(r"\s+\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]$", "", header_match.group(1).strip()).strip()
+        lines_after = [ln.strip() for ln in text.splitlines()[1:] if ln.strip()][:2]
+        title_parts = [ln for ln in lines_after if len(ln) <= 80 and not ln.startswith("#")]
+        doc_label = f'{doc_name} ("{" — ".join(title_parts)}")' if title_parts else doc_name
+        total = len(chunks)
+        labeled: List[str] = []
+        for idx, chunk in enumerate(chunks, 1):
+            if total == 1:
+                pos_label = "Full Document"
+            elif idx == 1:
+                pos_label = "Opening"
+            elif idx == total:
+                pos_label = "Ending"
+            elif idx <= max(2, int(total * 0.25)):
+                pos_label = "Early"
+            elif idx >= min(total - 1, int(total * 0.75) + 1):
+                pos_label = "Late"
+            else:
+                pos_label = "Middle"
+            labeled.append(f"[Document: {doc_label} | Passage {idx} of {total} ({pos_label})]\n{chunk}")
+        return labeled
+
     return chunks
 
 
@@ -245,6 +314,14 @@ def load_pcp_chunks(data_dir: Path) -> Tuple[List[str], str, int]:
     return chunks, digest.hexdigest(), len(files)
 
 
+def _chunks_prefix_hash(chunks: Sequence[str]) -> str:
+    h = hashlib.sha256()
+    for ch in chunks:
+        h.update(ch.encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
 class PCPIndex:
     """In-memory semantic vector index backed by cached embeddings.npz."""
 
@@ -255,6 +332,7 @@ class PCPIndex:
         model: Optional[object] = None,
         model_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        cache_only: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.data_dir
@@ -264,7 +342,7 @@ class PCPIndex:
         self.vectors: Optional[np.ndarray] = None
         self.file_count: int = 0
         self.fingerprint: str = ""
-        self.reload(progress_callback=progress_callback)
+        self.reload(progress_callback=progress_callback, cache_only=cache_only)
 
     @property
     def ready(self) -> bool:
@@ -285,11 +363,22 @@ class PCPIndex:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = self.cache_dir / "embeddings.npz"
         temp_path = cache_path.with_suffix(".tmp.npz")
-        np.savez_compressed(temp_path, fingerprint=self.fingerprint, vectors=self.vectors)
+        np.savez_compressed(
+            temp_path,
+            fingerprint=self.fingerprint,
+            vectors=self.vectors,
+            prefix_sha256=_chunks_prefix_hash(self.chunks),
+        )
         os.replace(temp_path, cache_path)
 
-    def reload(self, progress_callback: Optional[Callable[[str, float], None]] = None) -> bool:
+    def reload(
+        self,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        cache_only: bool = False,
+    ) -> bool:
         """Load or rebuild the semantic index from ghost_pcp_*.md files."""
+        prev_chunks = list(self.chunks)
+        prev_vectors = self.vectors
         self.data_dir.mkdir(parents=True, exist_ok=True)
         files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
         if not files:
@@ -302,96 +391,169 @@ class PCPIndex:
         self.chunks, self.fingerprint, self.file_count = load_pcp_chunks(self.data_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = self.cache_dir / "embeddings.npz"
+        part_path = self.cache_dir / "embeddings.part.npz"
         self.vectors = None
+        cached_tail_prefix: Optional[np.ndarray] = None
 
         if cache_path.exists():
             try:
                 with np.load(cache_path, allow_pickle=False) as data:
                     cached_fp = str(data["fingerprint"].item())
-                    if cached_fp == self.fingerprint and data["vectors"].shape[0] == len(self.chunks):
-                        self.vectors = data["vectors"].astype(np.float32, copy=False)
+                    vecs = data["vectors"]
+                    if cached_fp == self.fingerprint and vecs.shape[0] == len(self.chunks):
+                        self.vectors = vecs.astype(np.float32, copy=False)
+                        if part_path.exists():
+                            try:
+                                part_path.unlink()
+                            except OSError:
+                                pass
                         if progress_callback:
                             progress_callback("Loaded cached PCP embeddings.", 1.0)
                         return True
+                    if vecs.ndim == 2 and 0 < vecs.shape[0] < len(self.chunks):
+                        cached_sha = str(data["prefix_sha256"].item()) if "prefix_sha256" in data else None
+                        if cached_sha is None or cached_sha == _chunks_prefix_hash(self.chunks[: vecs.shape[0]]):
+                            cached_tail_prefix = vecs.astype(np.float32, copy=False)
             except (OSError, ValueError, KeyError):
                 pass
 
+        if cache_only:
+            self.vectors = None
+            return False
+
+        completed_parts: List[np.ndarray] = []
+        done_offset = 0
+        if (
+            prev_vectors is not None
+            and len(prev_chunks) > 0
+            and prev_vectors.shape[0] == len(prev_chunks)
+            and len(self.chunks) > len(prev_chunks)
+            and self.chunks[: len(prev_chunks)] == prev_chunks
+        ):
+            completed_parts = [prev_vectors.astype(np.float32, copy=False)]
+            done_offset = len(prev_chunks)
+        elif cached_tail_prefix is not None:
+            completed_parts = [cached_tail_prefix]
+            done_offset = int(cached_tail_prefix.shape[0])
+
+        if part_path.exists():
+            try:
+                with np.load(part_path, allow_pickle=False) as part_data:
+                    part_fp = str(part_data["fingerprint"].item())
+                    part_vecs = part_data["vectors"]
+                    if (
+                        part_fp == self.fingerprint
+                        and part_vecs.ndim == 2
+                        and done_offset < part_vecs.shape[0] < len(self.chunks)
+                    ):
+                        completed_parts = [part_vecs.astype(np.float32, copy=False)]
+                        done_offset = int(part_vecs.shape[0])
+            except (OSError, ValueError, KeyError):
+                pass
+
+        total_chunks = len(self.chunks)
         if progress_callback:
-            progress_callback(
-                f"Indexing {self.file_count} PCP volumes ({len(self.chunks):,} passages)...",
-                0.52,
-            )
+            if done_offset > 0:
+                progress_callback(
+                    f"Resuming indexing at {done_offset:,} / {total_chunks:,} passages...",
+                    0.52 + 0.46 * (done_offset / total_chunks),
+                )
+            else:
+                progress_callback(
+                    f"Indexing {self.file_count} PCP volumes ({total_chunks:,} passages)...",
+                    0.52,
+                )
 
         model = self._get_model()
+        slice_size = 256
+        cursor = done_offset
 
-        def _on_batch(done: int, total: int):
-            if progress_callback and total > 0:
-                frac = 0.52 + 0.46 * (done / total)
-                progress_callback(
-                    f"Embedding passages: {done:,} / {total:,} ({int(done * 100 / total)}%)...",
-                    frac,
-                )
+        def _save_partial() -> None:
+            if not completed_parts:
+                return
+            merged = np.vstack(completed_parts).astype(np.float32, copy=False)
+            temp_part = part_path.with_suffix(".tmp.npz")
+            np.savez(temp_part, fingerprint=self.fingerprint, vectors=merged)
+            os.replace(temp_part, part_path)
 
-        if hasattr(model, "encode"):
-            try:
-                vectors = model.encode(
-                    self.chunks,
-                    batch_size=16,
-                    normalize_embeddings=True,
-                    progress_callback=_on_batch,
-                )
-            except TypeError:
-                vectors = model.encode(
-                    self.chunks,
-                    batch_size=32,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                )
-        else:
-            raise RuntimeError("Invalid embedding model object.")
+        try:
+            while cursor < total_chunks:
+                batch_end = min(total_chunks, cursor + slice_size)
+                sub_chunks = self.chunks[cursor:batch_end]
+                base_done = cursor
+                slice_len = len(sub_chunks)
+                pending_end_progress: Optional[Tuple[str, float]] = None
 
-        self.vectors = np.asarray(vectors, dtype=np.float32)
+                def _on_batch(done: int, total: int, _base: int = base_done, _slen: int = slice_len):
+                    nonlocal pending_end_progress
+                    if progress_callback and total_chunks > 0:
+                        overall = min(total_chunks, _base + done)
+                        frac = 0.52 + 0.46 * (overall / total_chunks)
+                        msg = f"Embedding passages: {overall:,} / {total_chunks:,} ({int(overall * 100 / total_chunks)}%)..."
+                        if done >= _slen:
+                            # Defer slice-boundary progress until the slice vectors are appended & checkpointed.
+                            pending_end_progress = (msg, frac)
+                        else:
+                            progress_callback(msg, frac)
+
+                if hasattr(model, "encode"):
+                    try:
+                        vecs = model.encode(
+                            sub_chunks,
+                            batch_size=16,
+                            normalize_embeddings=True,
+                            progress_callback=_on_batch,
+                        )
+                    except TypeError:
+                        vecs = model.encode(
+                            sub_chunks,
+                            batch_size=32,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                            convert_to_numpy=True,
+                        )
+                        _on_batch(slice_len, slice_len)
+                else:
+                    raise RuntimeError("Invalid embedding model object.")
+
+                completed_parts.append(np.asarray(vecs, dtype=np.float32))
+                cursor = batch_end
+                if cursor < total_chunks:
+                    _save_partial()
+                    if pending_end_progress and progress_callback:
+                        progress_callback(*pending_end_progress)
+        except IngestCancelledError as exc:
+            partial = getattr(exc, "partial_vectors", None)
+            if partial is not None and len(partial) > 0:
+                completed_parts.append(np.asarray(partial, dtype=np.float32))
+            _save_partial()
+            raise
+
+        self.vectors = np.vstack(completed_parts).astype(np.float32, copy=False)
         self._save_cache()
+        if part_path.exists():
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
         if progress_callback:
             progress_callback(
-                f"Indexed {self.file_count} volumes ({len(self.chunks):,} passages).",
+                f"Indexed {self.file_count} volumes ({total_chunks:,} passages).",
                 1.0,
             )
         return True
 
-    def append_session(self, messages: Sequence[dict], timestamp_str: Optional[str] = None) -> dict:
-        """Save a live conversation thread into ghost_pcp_*.md with a timestamp and index it immediately."""
+    def _append_text_block(self, block_text: str, ts: str) -> dict:
+        """Append a pre-formatted Markdown block into ghost_pcp_*.md and index it incrementally."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        ts = timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not _chunk_segment(block_text):
+            raise ValueError("Text produced no indexable passages.")
 
-        lines = [f"## **[SESSION LOG: {ts}]**", ""]
-        turn_count = 0
-        for m in messages:
-            role = str(m.get("role") or "").lower().strip()
-            content = str(m.get("content") or "").strip()
-            content = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", content, flags=re.IGNORECASE).strip()
-            if not content or role not in ("user", "assistant"):
-                continue
-            speaker = "USER" if role == "user" else "AI"
-            lines.append(f"**{speaker} [{ts}]:** {content}")
-            lines.append("")
-            turn_count += 1
-
-        if turn_count == 0:
-            raise ValueError("No conversation messages to save.")
-
-        session_block = "\n".join(lines).strip()
-        new_chunks = _chunk_segment(session_block)
-        if not new_chunks:
-            raise ValueError("Session text produced no indexable passages.")
-
-        # Determine target volume file in data_dir
         files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
         target_file: Optional[Path] = None
         if files:
             last_file = files[-1]
-            raw_last = last_file.read_text(encoding="utf-8-sig", errors="replace")
+            raw_last = last_file.read_bytes().decode("utf-8-sig", errors="replace")
             if SESSION_BOUNDARY in raw_last and last_file.stat().st_size < LIVE_VOLUME_MAX_BYTES:
                 target_file = last_file
             else:
@@ -402,11 +564,20 @@ class PCPIndex:
             target_file = self.data_dir / "ghost_pcp_01.md"
 
         if target_file.exists():
-            existing = target_file.read_text(encoding="utf-8-sig", errors="replace").rstrip()
-            updated_text = f"{existing}\n\n{SESSION_BOUNDARY}\n\n{session_block}\n"
+            existing = target_file.read_bytes().decode("utf-8-sig", errors="replace").rstrip()
+            updated_text = f"{existing}\n\n{SESSION_BOUNDARY}\n\n{block_text}\n"
         else:
-            updated_text = f"{SESSION_BOUNDARY}\n\n{session_block}\n"
-        target_file.write_text(updated_text, encoding="utf-8")
+            updated_text = f"{SESSION_BOUNDARY}\n\n{block_text}\n"
+        target_file.write_text(updated_text, encoding="utf-8", newline="\n")
+
+        # Chunk directly from the written disk bytes so Windows/POSIX line endings stay exact with load_pcp_chunks().
+        written_seg = (
+            target_file.read_bytes()
+            .decode("utf-8-sig", errors="replace")
+            .split(SESSION_BOUNDARY)[-1]
+            .strip()
+        )
+        new_chunks = _chunk_segment(written_seg)
 
         model = self._get_model()
         new_vecs = np.asarray(
@@ -429,11 +600,61 @@ class PCPIndex:
         return {
             "saved_to": target_file.name,
             "timestamp": ts,
-            "turns_saved": turn_count,
             "passages_added": len(new_chunks),
             "total_volumes": self.file_count,
             "total_passages": len(self.chunks),
         }
+
+    def append_session(self, messages: Sequence[dict], timestamp_str: Optional[str] = None) -> dict:
+        """Save a live conversation thread into ghost_pcp_*.md with a timestamp and index it immediately."""
+        ts = timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"## **[SESSION LOG: {ts}]**", ""]
+        turn_count = 0
+        for m in messages:
+            role = str(m.get("role") or "").lower().strip()
+            content = str(m.get("content") or "").strip()
+            content = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", content, flags=re.IGNORECASE).strip()
+            if not content or role not in ("user", "assistant"):
+                continue
+            speaker = "USER" if role == "user" else "AI"
+            lines.append(f"**{speaker} [{ts}]:** {content}")
+            lines.append("")
+            turn_count += 1
+
+        if turn_count == 0:
+            raise ValueError("No conversation messages to save.")
+
+        result = self._append_text_block("\n".join(lines).strip(), ts)
+        result["turns_saved"] = turn_count
+        return result
+
+    def append_document(self, filename: str, text: str, timestamp_str: Optional[str] = None) -> dict:
+        """Append an extracted document (.pdf/.txt/.md) into ghost_pcp_*.md and index it immediately."""
+        clean = str(text or "").strip()
+        if not clean:
+            raise ValueError("Document contains no readable text to save.")
+        ts = timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_name = Path(filename).name
+        files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
+        if files:
+            raw_last = files[-1].read_text(encoding="utf-8-sig", errors="replace")
+            header_prefix = f"# **DOCUMENT: {safe_name}"
+            if header_prefix in raw_last and (
+                clean in raw_last
+                or (len(clean) >= 400 and clean[:400] in raw_last and clean[-400:] in raw_last)
+            ):
+                return {
+                    "saved_to": files[-1].name,
+                    "timestamp": ts,
+                    "passages_added": 0,
+                    "total_volumes": self.file_count,
+                    "total_passages": len(self.chunks),
+                    "filename": safe_name,
+                }
+        doc_block = f"# **DOCUMENT: {safe_name} [{ts}]**\n\n{clean}"
+        result = self._append_text_block(doc_block, ts)
+        result["filename"] = safe_name
+        return result
 
     def search(self, query: str, limit: int = 4) -> List[str]:
         """Return top-k matching archive excerpts, prioritizing newer timestamped sessions."""
@@ -442,26 +663,26 @@ class PCPIndex:
         model = self._get_model()
         prompted = "Represent this sentence for searching relevant passages: " + query
         q_vec = model.encode([prompted], normalize_embeddings=True)[0]
-        scores = (self.vectors @ q_vec).astype(np.float32, copy=True)
+        raw_scores = (self.vectors @ q_vec).astype(np.float32, copy=True)
+        scores = raw_scores.copy()
 
-        # Give a recency boost to timestamped [SESSION LOG: ...] passages so newest memories win ties
         n_total = len(self.chunks)
-        latest_session_idx: Optional[int] = None
-        for idx in range(n_total - 1, max(-1, n_total - 500), -1):
-            if "[SESSION LOG:" in self.chunks[idx]:
-                if latest_session_idx is None:
-                    latest_session_idx = idx
-                recency_rank = (idx - (n_total - 500)) / 500.0
-                scores[idx] += np.float32(0.05 * max(0.2, recency_rank))
+        # Exported archive volumes place newest conversations first (index 0) and oldest last;
+        # apply a gentle chronological prior so recent persona chapters break close ties.
+        scores += np.linspace(0.035, 0.0, n_total, dtype=np.float32)
+
+        # Prioritize uploaded documents (# **DOCUMENT: / [Document:) and recent saved sessions in the tail
+        # when their semantic similarity actually clears a relevance threshold.
+        tail_window = min(n_total, 2000)
+        tail_start = n_total - tail_window
+        for idx in range(n_total - 1, tail_start - 1, -1):
+            chunk = self.chunks[idx]
+            if ("[Document:" in chunk or "# **DOCUMENT:" in chunk) and raw_scores[idx] >= 0.55:
+                scores[idx] += np.float32(0.075)
+            elif "[SESSION LOG:" in chunk and raw_scores[idx] >= 0.58:
+                recency_rank = (idx - tail_start + 1) / max(1, tail_window)
+                scores[idx] += np.float32(0.05 * max(0.25, recency_rank))
 
         k = max(1, int(limit))
         best_indices = [int(i) for i in np.argsort(-scores)[:k]]
-
-        # Always include the most recent saved session passage if one exists so "Save & Clear" never loses continuity
-        if latest_session_idx is not None and latest_session_idx not in best_indices:
-            if len(best_indices) >= k:
-                best_indices[-1] = latest_session_idx
-            else:
-                best_indices.append(latest_session_idx)
-
         return [self.chunks[i] for i in best_indices]

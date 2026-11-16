@@ -1,9 +1,11 @@
-"""Build the standalone GHost PCP desktop application (GHost-PCP.exe).
+# SPDX-FileCopyrightText: 2026 Kelly Spear
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Build the standalone GHostPCP desktop application (GHostPCP.exe).
 
 Run from this folder with the virtual environment active:
     python build_pcp.py
 
-Produces GHost-PCP.exe beside ./ghost_models, ./pcp_data, and ./backends.
+Produces GHostPCP.exe beside ./ghost_models, ./pcp_data, and ./backends.
 """
 from __future__ import annotations
 
@@ -117,8 +119,8 @@ def build() -> None:
     print(f"[build] external backends staged: {', '.join(backends)}")
 
     workpath = HERE / "build_pcp"
-    output = HERE / "GHost-PCP.exe"
-    old_output = HERE / "GHost-PCP.old.exe"
+    output = HERE / "GHostPCP.exe"
+    old_output = HERE / "GHostPCP.old.exe"
     if old_output.exists():
         try:
             old_output.unlink()
@@ -130,7 +132,7 @@ def build() -> None:
         except OSError:
             try:
                 output.rename(old_output)
-                print(f"[build] Running GHost-PCP.exe renamed to {old_output.name} so new build can write cleanly.")
+                print(f"[build] Running GHostPCP.exe renamed to {old_output.name} so new build can write cleanly.")
             except OSError:
                 pass
 
@@ -139,7 +141,7 @@ def build() -> None:
         "--noconfirm",
         "--onefile",
         "--windowed",
-        "--name", "GHost-PCP",
+        "--name", "GHostPCP",
         "--distpath", str(HERE),
         "--workpath", str(workpath),
         "--specpath", str(HERE),
@@ -149,6 +151,7 @@ def build() -> None:
         "--collect-submodules", "webview",
         "--collect-submodules", "llama_cpp",
         "--collect-submodules", "piper",
+        "--collect-submodules", "pypdf",
         "--collect-data", "piper",
         "--collect-all", "onnxruntime",
         "--collect-data", "_sounddevice_data",
@@ -168,12 +171,20 @@ def build() -> None:
         "--exclude-module", "scipy",
         "--exclude-module", "sklearn",
         "--exclude-module", "sentence_transformers",
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "pytorch_lightning",
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "F5_TTS",
         str(HERE / "ghost_pcp.py"),
     ]
     subprocess.check_call(args, cwd=HERE)
     if workpath.is_dir():
         shutil.rmtree(workpath, ignore_errors=True)
-    output = HERE / "GHost-PCP.exe"
+    output = HERE / "GHostPCP.exe"
     print(f"Built standalone executable: {output} ({output.stat().st_size / 1e6:.1f} MB)")
 
 

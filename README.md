@@ -1,43 +1,49 @@
-![GHost PCP — GPU Hosted Pure Concentrated Personality](GHostPCP%20Promo/pcp_banner_fixed.png)
+![GHostPCP — GPU Hosted Pure Concentrated Personality](GHostPCP%20Promo/1github_banner.jpg)
 
-# GHost PCP
+# GHostPCP
 
 **GPU Hosted Pure Concentrated Personality**  
 *Break Your AI Out of the Cloud and Onto Your Own Hardware*
 
-GHost PCP is a local-first desktop and mobile-paired application for Windows. Import your ChatGPT export archive (`.zip` or `conversations.json`), mount a local `.gguf` language model, and chat with a persona grounded in your conversation history.
+GHostPCP is a local-first desktop and mobile-paired application for Windows. Import your ChatGPT export archive (`.zip` or `conversations.json`), along with `.pdf`, `.txt`, or `.md` documents, mount a local `.gguf` language model, and chat with a persona grounded in your conversation history.
 
-![GHost PCP desktop interface](GHostPCP%20Promo/save_clear.png)
+![GHostPCP desktop interface](GHostPCP%20Promo/ghost_pcp_first_screen.png)
 
 ---
 
-## Why GHost PCP Exists
+## Why GHostPCP Exists
 
-Standard "chat with your docs" tools act like research librarians (*"According to source document 4..."*). GHost PCP prompts the model to treat your archive as the authoritative source for the persona's history and respond without citations. Like any language model, it can still make mistakes or invent details.
+![Why GHostPCP](GHostPCP%20Promo/why_gpcp.png)
 
-1. **Drop & Forget Onboarding**: Drop your ChatGPT export `.zip` (or `conversations.json`) into the app. In the background, GHost PCP unpacks the conversation tree, strips out canned corporate refusals (*"As an AI language model..."*), organizes your history into clean Markdown volumes (`ghost_pcp_01.md`, `ghost_pcp_02.md`, ...), and builds a cached semantic vector index (`embeddings.npz`) using `BAAI/bge-small-en-v1.5`.
-2. **Hardware-Aware GGUF Workbench**: Powered by `llama.cpp` with automatic NVIDIA VRAM preflight sizing (`Check Fit` / `Mount` / `Unload`), FP16/Q8_0 KV cache selection, and full sampling control.
-3. **Citation-Free Persona Grounding & Save & Clear Continuity**: Every turn retrieves the most relevant passages from your `ghost_pcp_*.md` volumes in ~24ms and grounds the model silently in character. Click **SAVE & CLEAR** at the top of the window to save the current chat thread with a timestamp directly into your PCP archive (`ghost_pcp_NN.md`), update the vector index in ~0.13s, and clear the window so the conversation continues without missing a beat.
+Standard "chat with your docs" tools act like research librarians (*"According to source document 4..."*). GHostPCP prompts the model to treat your archive and attached files as the authoritative source for the persona's history and respond without citations. Like any language model, it can still make mistakes or invent details.
+
+1. **Drop & Forget Onboarding (With PDF & Text Imports)**: Drop your ChatGPT export `.zip`, `conversations.json`, `.pdf`, `.txt`, or `.md` files into **[ ARCHIVE ]**. In the background (with live progress, a safe **CANCEL IMPORT** button, and resumable indexing), GHostPCP unpacks conversations, strips out canned corporate refusals (*"As an AI language model..."*), organizes everything into clean Markdown volumes (`ghost_pcp_01.md`, `ghost_pcp_02.md`, ...), stamps uploaded document passages with title & position headers (`Opening`, `Early`, `Middle`, `Late`, `Ending`), and builds a cached semantic vector index (`embeddings.npz`) using `BAAI/bge-small-en-v1.5`.
+2. **Hardware-Aware GGUF Workbench**: Powered by `llama.cpp` with automatic NVIDIA VRAM preflight sizing (`Check Fit` / `Mount` / `Unload`), FP16/Q8_0 KV cache selection, live token streaming, a per-turn **Stop** control, and sampling controls.
+3. **In-Chat File Uploads, Persona Grounding & Save & Clear Continuity**: Every turn retrieves the most relevant passages from your `ghost_pcp_*.md` volumes in ~24ms and grounds the model silently in character. Use **`[ + FILE ]`** right in the chat bar (desktop or phone) to attach `.pdf`, `.txt`, or `.md` files as collapsible attachment cards—with one-click **SAVE TO DB** (and automatic indexing for large documents). Click **SAVE & CLEAR** at the top of the window to save the current chat thread with a timestamp directly into your PCP archive (`ghost_pcp_NN.md`), update the vector index in ~0.13s, and clear the window so the conversation continues without missing a beat.
 4. **Built-In Fast Local Read-Aloud Voices**: Choose your preferred voice (such as **Silas** or **Kara**, or any `.onnx` voice dropped into `piper_models/`) in **[ CONFIG ]**, and click the speaker icon on any of the model's responses for instant local Piper ONNX synthesis (~0.17s latency) and seamless background playback via `sounddevice` on PC (or Web Audio when connected from your phone).
-5. **Use Anywhere (Wi-Fi, Tailscale, or One-Click HTTPS Tunnel)**: Open **[ PHONE / TUNNEL ]** to scan a pairing QR code on your phone over local Wi-Fi, Tailscale, or a one-click Cloudflare HTTPS Quick Tunnel. Your phone gets the full interface—chat, listen to voice responses, start a new session, or switch models remotely.
+5. **Use Anywhere (Wi-Fi, Tailscale, or One-Click HTTPS Tunnel)**: Open **[ PHONE / TUNNEL ]** to scan a pairing QR code on your phone over local Wi-Fi, Tailscale, or a one-click Cloudflare HTTPS Quick Tunnel. Your phone gets the full interface—chat, attach files, listen to voice responses, start a new session, or switch models remotely.
 
 ## See It in Action
 
-**Model and persona configuration**
+**Desktop Workspace**
 
-<img src="GHostPCP%20Promo/persona_config.png" alt="GHost PCP model and persona configuration" width="600">
+<img src="GHostPCP%20Promo/pcp_welcome.png" alt="GHostPCP desktop workspace" width="700">
 
-**Phone interface**
+**Archive Import & Indexing**
 
-<img src="GHostPCP%20Promo/pcp_phone_cropped.png" alt="GHost PCP phone interface" width="300">
+<img src="GHostPCP%20Promo/ingest_screen.png" alt="GHostPCP archive import and indexing" width="600">
+
+**Phone & Cloudflare Quick Tunnel**
+
+<img src="GHostPCP%20Promo/cloudflare_page.png" alt="GHostPCP Cloudflare remote mobile connection" width="400"> <img src="GHostPCP%20Promo/pcp_phone.png" alt="GHostPCP mobile chat interface" width="260">
 
 ---
 
 ## Folder Layout
 
 ```text
-GHost-PCP/
-  GHost-PCP.exe                Standalone desktop application (built locally)
+GHostPCP/
+GHostPCP.exe                 Standalone desktop application (built locally)
   ghost_pcp.py                 FastAPI + llama.cpp + PCP RAG server & desktop host
   pcp_ingest.py                ChatGPT export parser, corporate filter, & volume writer
   pcp_retrieval.py             Local BGE-small-en-v1.5 semantic indexer & search engine
@@ -62,12 +68,13 @@ GHost-PCP/
 > try the sample in a separate, clean installation.
 
 ### Option A: Download the Standalone Windows Release (Recommended)
-1. Download and extract **[`GHost-PCP-v1.0.0-win64.zip`](https://github.com/realkellyspear/GHost-PCP/releases/latest)** from Releases.
+1. Download and extract **[`GHostPCP-v1.1.0-win64.zip`](https://github.com/realkellyspear/GHostPCP/releases/latest)** from Releases.
 2. Copy one or more `.gguf` models (for example, `Qwen3-14B-Q5_K_M.gguf`) into `ghost_models/`.
-3. Double-click **`GHost-PCP.exe`**.
-4. Drop your ChatGPT export `.zip` or `conversations.json` (or the included `sample_chatgpt_export.zip`) into the **Archive Import** window.
+3. Double-click **`GHostPCP.exe`**.
+4. Drop your ChatGPT export `.zip`, `conversations.json`, `.pdf`, `.txt`, or `.md` files (or the included `sample_chatgpt_export.zip`) into the **Archive Import** window.
 5. In **[ CONFIG ]**, select your model and click **MOUNT**.
 6. *(Optional)* Click **[ PHONE / TUNNEL ]** and scan the QR code to pair your phone over Wi-Fi, Tailscale, or a 1-click Cloudflare HTTPS Quick Tunnel.
+7. Responses stream as they are generated. Click **Stop** on the active response to interrupt generation.
 
 ### Option B: Run from Python Source
 Install Python and dependencies, and supply your own GGUF model. The first run may need an internet connection to download the embedding model; model weights and voice files are not included.
@@ -99,7 +106,7 @@ volumes**.
 
 ---
 
-## Building `GHost-PCP.exe` from Source
+## Building `GHostPCP.exe` from Source
 
 ```powershell
 & .\.venv\Scripts\python.exe build_pcp.py
@@ -115,4 +122,11 @@ volumes**.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GHostPCP's application code is licensed under the **GNU General Public License
+v3.0 or later** (`GPL-3.0-or-later`). See [LICENSE](LICENSE). The standalone
+Windows release includes its first-party corresponding source in the `source/`
+directory, including the application, UI, and build scripts.
+
+The release also bundles third-party components and models under their own
+licenses; those retain their original terms. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.

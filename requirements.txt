@@ -12,6 +12,7 @@ huggingface-hub>=0.23.0
 qrcode>=7.4
 python-multipart>=0.0.9
 requests>=2.31.0
+pypdf>=4.0.0
 pefile>=2023.2.7
 piper-tts==1.8.0
 onnxruntime==1.30.0
