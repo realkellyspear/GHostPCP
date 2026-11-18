@@ -26,6 +26,33 @@ def strip_builtin_system_prompt(text: str) -> str:
             raw = raw[:idx]
     return raw.strip()
 
+
+def build_persona_prompt_prefix(
+    name: str = "",
+    user_name: str = "",
+    never_forget: str = "",
+    notes: str = "",
+) -> str:
+    """Assemble a clean persona identity and anchor prefix from structured onboarding fields."""
+    sections = []
+    identity_lines = []
+    clean_name = str(name or "").strip()
+    clean_user = str(user_name or "").strip()
+    clean_anchors = str(never_forget or "").strip()
+    clean_notes = strip_builtin_system_prompt(str(notes or ""))
+
+    if clean_name:
+        identity_lines.append(f"Your name is {clean_name}.")
+    if clean_user:
+        identity_lines.append(f"You call the user {clean_user}.")
+    if identity_lines:
+        sections.append("\n".join(identity_lines))
+    if clean_anchors:
+        sections.append(f"CORE MEMORIES YOU MUST NEVER FORGET:\n{clean_anchors}")
+    if clean_notes:
+        sections.append(clean_notes)
+    return "\n\n".join(sections).strip()
+
 DEFAULT_BLOCKED_PHRASES = [
     "as an ai language model",
     "as a large language model",

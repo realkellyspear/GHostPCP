@@ -36,8 +36,9 @@ import traceback
 import urllib.parse
 import urllib.request
 import wave
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
@@ -53,12 +54,18 @@ from starlette.background import BackgroundTask
 from gguf import GGUFReader, LlamaFileType
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
-from pcp_ingest import extract_pairs_from_data, extract_text_from_document, ingest_files
+from pcp_ingest import (
+    discover_source_paths,
+    extract_pairs_from_data,
+    extract_text_from_document,
+    ingest_files,
+)
 from pcp_retrieval import IngestCancelledError, PCPIndex
 from persona import (
     DEFAULT_BLOCKED_PHRASES,
     DEFAULT_PROTECTED_WORDS,
     SYSTEM_PROMPT,
+    build_persona_prompt_prefix,
     strip_builtin_system_prompt,
 )
 
@@ -558,19 +565,382 @@ def rotate_pairing_token() -> str:
     return token
 
 
+# =====================================================================
+# MULTI-PERSONA PROFILES & ISOLATED MEMORY FOLDERS
+# =====================================================================
+
+_PERSONA_LOCK = threading.RLock()
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def _personas_registry_path() -> Path:
+    return PCP_DATA_DIR / "personas.json"
+
+
+def _resolve_persona_folder(folder_rel: str) -> Path:
+    root = PCP_DATA_DIR.resolve()
+    rel = str(folder_rel or ".").strip()
+    if rel in ("", "."):
+        return root
+    candidate = (root / rel).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"Invalid persona folder outside PCP_DATA_DIR: {rel}")
+    return candidate
+
+
+def _slugify_persona_id(name: str, existing_ids: Set[str]) -> str:
+    base = re.sub(r"[^a-z0-9_-]+", "-", str(name or "").lower()).strip("-_") or "persona"
+    if base in _WINDOWS_RESERVED_NAMES:
+        base = f"{base}-ai"
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids or (PCP_DATA_DIR / "personas" / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _normalize_persona_record(raw: dict) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    pid = str(raw.get("id") or "").strip()
+    if not pid:
+        return None
+    folder = str(raw.get("folder") or f"personas/{pid}").strip()
+    try:
+        _resolve_persona_folder(folder)
+    except ValueError:
+        return None
+    return {
+        "id": pid,
+        "name": str(raw.get("name") or pid).strip() or pid,
+        "folder": folder,
+        "user_name": str(raw.get("user_name") or "").strip(),
+        "never_forget": str(raw.get("never_forget") or "").strip(),
+        "notes": strip_builtin_system_prompt(str(raw.get("notes") or "")),
+        "tts_voice": str(raw.get("tts_voice") or "silas").strip() or "silas",
+        "preferred_model": str(raw.get("preferred_model") or "").strip(),
+        "protected_words": str(raw.get("protected_words") or "").strip(),
+        "blocked_phrases": str(raw.get("blocked_phrases") or ""),
+        "source_type": str(raw.get("source_type") or "custom").strip(),
+        "passage_count": int(raw.get("passage_count") or 0),
+        "created_at": str(raw.get("created_at") or "").strip(),
+        "updated_at": str(raw.get("updated_at") or "").strip(),
+    }
+
+
+def _legacy_default_persona() -> dict:
+    try:
+        settings = load_settings()
+    except Exception:
+        settings = dict(DEFAULT_SETTINGS)
+    return {
+        "id": "default",
+        "name": "Existing Archive",
+        "folder": ".",
+        "user_name": "",
+        "never_forget": "",
+        "notes": strip_builtin_system_prompt(settings.get("system_prompt", "")),
+        "tts_voice": str(settings.get("tts_voice") or "silas"),
+        "preferred_model": "",
+        "protected_words": str(settings.get("protected_words") or ""),
+        "blocked_phrases": str(settings.get("blocked_phrases") or ""),
+        "source_type": "existing",
+        "passage_count": 0,
+        "created_at": "",
+        "updated_at": "",
+    }
+
+
+def _load_persona_registry() -> dict:
+    with _PERSONA_LOCK:
+        reg_path = _personas_registry_path()
+        if reg_path.is_file():
+            try:
+                raw = json.loads(reg_path.read_text(encoding="utf-8"))
+                items = [
+                    rec for rec in (_normalize_persona_record(p) for p in (raw.get("personas") or []))
+                    if rec is not None
+                ]
+                active_id = raw.get("active_persona_id")
+                valid_ids = {p["id"] for p in items}
+                if active_id not in valid_ids:
+                    active_id = items[0]["id"] if items else None
+                return {"version": 1, "active_persona_id": active_id, "personas": items}
+            except Exception as exc:
+                log.warning(f"Could not read personas.json: {exc}")
+
+        if PCP_DATA_DIR.is_dir() and any(PCP_DATA_DIR.glob("ghost_pcp_*.md")):
+            return {
+                "version": 1,
+                "active_persona_id": "default",
+                "personas": [_legacy_default_persona()],
+            }
+
+        return {"version": 1, "active_persona_id": None, "personas": []}
+
+
+def _save_persona_registry(registry: dict) -> dict:
+    with _PERSONA_LOCK:
+        PCP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        reg_path = _personas_registry_path()
+        tmp_path = reg_path.with_name("personas.json.tmp")
+        payload = {
+            "version": 1,
+            "active_persona_id": registry.get("active_persona_id"),
+            "personas": registry.get("personas") or [],
+        }
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, reg_path)
+        for p in payload["personas"]:
+            if p.get("folder") not in ("", "."):
+                p_dir = _resolve_persona_folder(p["folder"])
+                p_dir.mkdir(parents=True, exist_ok=True)
+                meta_path = p_dir / "persona.json"
+                meta_tmp = p_dir / "persona.json.tmp"
+                meta_tmp.write_text(json.dumps(p, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(meta_tmp, meta_path)
+        return payload
+
+
+def _get_persona_by_id(persona_id: Optional[str], registry: Optional[dict] = None) -> Optional[dict]:
+    if not persona_id:
+        return None
+    reg = registry if registry is not None else _load_persona_registry()
+    for p in reg.get("personas") or []:
+        if p["id"] == persona_id:
+            return dict(p)
+    return None
+
+
+def _get_active_persona(registry: Optional[dict] = None) -> Optional[dict]:
+    reg = registry if registry is not None else _load_persona_registry()
+    active_id = reg.get("active_persona_id")
+    if active_id:
+        found = _get_persona_by_id(active_id, reg)
+        if found:
+            return found
+    items = reg.get("personas") or []
+    return dict(items[0]) if items else None
+
+
+def _get_active_pcp_dir() -> Path:
+    persona = _get_active_persona()
+    if persona is None:
+        return PCP_DATA_DIR
+    return _resolve_persona_folder(persona.get("folder", "."))
+
+
+def _save_persona_chat_history(persona_dir: Path, messages: List[Dict[str, str]]) -> None:
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    hist_path = persona_dir / "chat_history.json"
+    tmp_path = persona_dir / "chat_history.json.tmp"
+    tmp_path.write_text(json.dumps({"messages": messages}, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, hist_path)
+
+
+def _load_persona_chat_history(persona_dir: Path) -> List[Dict[str, str]]:
+    hist_path = persona_dir / "chat_history.json"
+    if not hist_path.is_file():
+        return []
+    try:
+        raw = json.loads(hist_path.read_text(encoding="utf-8"))
+        cleaned: List[Dict[str, str]] = []
+        for item in raw.get("messages") or []:
+            if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
+                cleaned.append({"role": item["role"], "content": item["content"]})
+        return cleaned
+    except Exception:
+        return []
+
+
+def _create_persona_entry(
+    name: str,
+    user_name: str = "",
+    never_forget: str = "",
+    notes: str = "",
+    tts_voice: str = "silas",
+    preferred_model: str = "",
+    protected_words: str = "",
+    blocked_phrases: str = "",
+    source_type: str = "custom",
+    activate: bool = True,
+) -> dict:
+    with _PERSONA_LOCK:
+        reg = _load_persona_registry()
+        personas = list(reg.get("personas") or [])
+        existing_ids = {p["id"] for p in personas}
+        clean_name = str(name or "").strip() or "New AI"
+        pid = _slugify_persona_id(clean_name, existing_ids)
+        folder_rel = f"personas/{pid}"
+        folder_path = _resolve_persona_folder(folder_rel)
+        folder_path.mkdir(parents=True, exist_ok=True)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        record = {
+            "id": pid,
+            "name": clean_name,
+            "folder": folder_rel,
+            "user_name": str(user_name or "").strip(),
+            "never_forget": str(never_forget or "").strip(),
+            "notes": strip_builtin_system_prompt(str(notes or "")),
+            "tts_voice": str(tts_voice or "silas").strip() or "silas",
+            "preferred_model": str(preferred_model or "").strip(),
+            "protected_words": str(protected_words or "").strip(),
+            "blocked_phrases": str(blocked_phrases or ""),
+            "source_type": str(source_type or "custom").strip() or "custom",
+            "passage_count": 0,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        personas.append(record)
+        reg["personas"] = personas
+        if activate or not reg.get("active_persona_id"):
+            reg["active_persona_id"] = pid
+        _save_persona_registry(reg)
+        return record
+
+
+def _update_persona_entry(persona_id: str, updates: Dict[str, Any]) -> dict:
+    with _PERSONA_LOCK:
+        reg = _load_persona_registry()
+        personas = list(reg.get("personas") or [])
+        target_idx = next((i for i, p in enumerate(personas) if p["id"] == persona_id), None)
+        if target_idx is None:
+            raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+        rec = dict(personas[target_idx])
+        for key in (
+            "name",
+            "user_name",
+            "never_forget",
+            "notes",
+            "tts_voice",
+            "preferred_model",
+            "protected_words",
+            "blocked_phrases",
+            "source_type",
+        ):
+            if key in updates and updates[key] is not None:
+                val = str(updates[key])
+                if key == "notes":
+                    val = strip_builtin_system_prompt(val)
+                elif key != "blocked_phrases":
+                    val = val.strip()
+                if key == "name" and not val:
+                    continue
+                rec[key] = val
+        if "passage_count" in updates and updates["passage_count"] is not None:
+            rec["passage_count"] = int(updates["passage_count"])
+        rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        personas[target_idx] = rec
+        reg["personas"] = personas
+        _save_persona_registry(reg)
+        return rec
+
+
+def _persona_summary(persona: dict, active_id: Optional[str]) -> dict:
+    folder_path = _resolve_persona_folder(persona.get("folder", "."))
+    vol_files = sorted(folder_path.glob("ghost_pcp_*.md")) if folder_path.is_dir() else []
+    is_active = persona["id"] == active_id
+    ready = False
+    passages = int(persona.get("passage_count") or 0)
+    if is_active and PCP_INDEX is not None and PCP_INDEX.data_dir.resolve() == folder_path.resolve():
+        ready = PCP_INDEX.ready
+        passages = PCP_INDEX.passage_count
+    else:
+        ready = bool(vol_files) and (folder_path / "embeddings.npz").is_file()
+    return {
+        **persona,
+        "active": is_active,
+        "folder_path": str(folder_path),
+        "volumes": len(vol_files),
+        "passages": passages,
+        "ready": ready,
+    }
+
+
+def _activate_persona(persona_id: str) -> dict:
+    global PCP_INDEX
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before switching AI personas.")
+
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="Wait for current model operation to finish before switching AI personas.")
+        STATE.locked = True
+
+    try:
+        with _PERSONA_LOCK:
+            reg = _load_persona_registry()
+            target = _get_persona_by_id(persona_id, reg)
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+
+            prev_id = reg.get("active_persona_id")
+            prev_persona = _get_persona_by_id(prev_id, reg) if prev_id else None
+            if prev_persona and prev_persona["id"] != target["id"]:
+                prev_dir = _resolve_persona_folder(prev_persona.get("folder", "."))
+                with STATE._history_lock:
+                    _save_persona_chat_history(prev_dir, list(STATE.conversation))
+
+            target_dir = _resolve_persona_folder(target.get("folder", "."))
+            target_dir.mkdir(parents=True, exist_ok=True)
+            reg["active_persona_id"] = target["id"]
+            _save_persona_registry(reg)
+
+        if prev_persona is None or prev_persona["id"] != target["id"]:
+            loaded_msgs = _load_persona_chat_history(target_dir)
+            with STATE._history_lock:
+                STATE.conversation = loaded_msgs
+            STATE.prior_assistant_tokens = []
+            if STATE.llm is not None:
+                try:
+                    STATE.llm.reset()
+                except Exception as exc:
+                    log.warning(f"LLM reset warning after persona switch: {exc}")
+
+        bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
+        try:
+            PCP_INDEX = PCPIndex(target_dir, cache_dir=target_dir, model_dir=bge_dir, cache_only=True)
+            if PCP_INDEX.ready:
+                _update_persona_entry(target["id"], {"passage_count": PCP_INDEX.passage_count})
+        except Exception as exc:
+            log.warning(f"PCP Index reload warning for persona '{target['id']}': {exc}")
+            PCP_INDEX = None
+
+        updated_reg = _load_persona_registry()
+        updated_target = _get_persona_by_id(target["id"], updated_reg) or target
+        return {
+            "persona": _persona_summary(updated_target, updated_reg.get("active_persona_id")),
+            "messages": list(STATE.conversation),
+        }
+    finally:
+        with STATE._lease:
+            STATE.locked = False
+
+
 def _init_pcp_index() -> None:
     global PCP_INDEX
     PCP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    active_dir = _get_active_pcp_dir()
+    active_dir.mkdir(parents=True, exist_ok=True)
     bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
     try:
-        PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir, cache_only=True)
+        PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir, cache_only=True)
         if PCP_INDEX.ready:
             log.info(
-                f"PCP Index online: {PCP_INDEX.file_count} volume(s), {PCP_INDEX.passage_count:,} passages."
+                f"PCP Index online: {PCP_INDEX.file_count} volume(s), {PCP_INDEX.passage_count:,} passages ({active_dir})."
             )
+            if _personas_registry_path().is_file():
+                active = _get_active_persona()
+                if active:
+                    _update_persona_entry(active["id"], {"passage_count": PCP_INDEX.passage_count})
         elif PCP_INDEX.file_count > 0:
             log.info(
-                f"Detected {PCP_INDEX.file_count} unindexed PCP volume(s) in {PCP_DATA_DIR}. "
+                f"Detected {PCP_INDEX.file_count} unindexed PCP volume(s) in {active_dir}. "
                 "Open ARCHIVE and click RE-INDEX to finish indexing."
             )
         else:
@@ -1212,6 +1582,7 @@ class ChatRequest(BaseModel):
     response_format: Optional[ResponseFormat] = None
     tools: Optional[List[ToolSpec]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"], Dict[str, Any]]] = None
+    persona_id: Optional[StrictStr] = Field(default=None, max_length=120)
 
 
 class LoadRequest(BaseModel):
@@ -1252,6 +1623,35 @@ class LocalPathIngestRequest(BaseModel):
     blocked_phrases: Optional[str] = None
     protected_words: Optional[str] = None
     replace_existing: bool = False
+    persona_id: Optional[str] = None
+    persona_name: Optional[str] = None
+    user_name: Optional[str] = None
+    never_forget: Optional[str] = None
+    persona_notes: Optional[str] = None
+    tts_voice: Optional[str] = None
+
+
+class PersonaCreateRequest(BaseModel):
+    name: StrictStr = Field(min_length=1, max_length=120)
+    user_name: StrictStr = Field(default="", max_length=120)
+    never_forget: StrictStr = Field(default="", max_length=8000)
+    notes: StrictStr = Field(default="", max_length=8000)
+    tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=64)
+    preferred_model: StrictStr = Field(default="", max_length=255)
+    protected_words: StrictStr = Field(default="", max_length=8000)
+    blocked_phrases: Optional[StrictStr] = Field(default=None, max_length=8000)
+    activate: bool = True
+
+
+class PersonaUpdateRequest(BaseModel):
+    name: Optional[StrictStr] = Field(default=None, min_length=1, max_length=120)
+    user_name: Optional[StrictStr] = Field(default=None, max_length=120)
+    never_forget: Optional[StrictStr] = Field(default=None, max_length=8000)
+    notes: Optional[StrictStr] = Field(default=None, max_length=8000)
+    tts_voice: Optional[StrictStr] = Field(default=None, min_length=1, max_length=64)
+    preferred_model: Optional[StrictStr] = Field(default=None, max_length=255)
+    protected_words: Optional[StrictStr] = Field(default=None, max_length=8000)
+    blocked_phrases: Optional[StrictStr] = Field(default=None, max_length=8000)
 
 
 class SaveSessionRequest(BaseModel):
@@ -1312,11 +1712,99 @@ def _ingest_progress_callback(msg: str, frac: float) -> None:
     INGEST_STATE.progress = round(min(1.0, max(0.0, frac)), 3)
 
 
+def _delete_persona_entry(persona_id: str, delete_files: bool = False) -> dict:
+    with _PERSONA_LOCK:
+        reg = _load_persona_registry()
+        personas = list(reg.get("personas") or [])
+        target = next((p for p in personas if p["id"] == persona_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+        remaining = [p for p in personas if p["id"] != persona_id]
+        was_active = reg.get("active_persona_id") == persona_id
+        if was_active:
+            reg["active_persona_id"] = remaining[0]["id"] if remaining else None
+        reg["personas"] = remaining
+        _save_persona_registry(reg)
+
+    target_dir = _resolve_persona_folder(target.get("folder", "."))
+    if delete_files and target.get("folder") not in ("", ".") and target_dir.is_dir():
+        shutil.rmtree(target_dir, ignore_errors=True)
+    return {"deleted": persona_id, "active_persona_id": reg.get("active_persona_id")}
+
+
+def _prepare_ingest_target_persona(
+    persona_id: Optional[str],
+    persona_name: Optional[str],
+    user_name: Optional[str],
+    never_forget: Optional[str],
+    persona_notes: Optional[str],
+    tts_voice: Optional[str],
+    bp_raw: str,
+    pw_raw: str,
+) -> Tuple[Path, Optional[str], Optional[str], bool]:
+    """Resolve or create the destination persona folder for an archive import.
+
+    Returns (target_dir, target_persona_id, prev_active_id, created_new).
+    """
+    prev_active = _get_active_persona()
+    prev_active_id = prev_active["id"] if prev_active else None
+    wants_new = persona_id == "__new__" or (bool((persona_name or "").strip()) and not persona_id)
+
+    if wants_new:
+        created = _create_persona_entry(
+            name=(persona_name or "").strip() or "New AI",
+            user_name=user_name or "",
+            never_forget=never_forget or "",
+            notes=persona_notes or "",
+            tts_voice=(tts_voice or "silas").strip() or "silas",
+            protected_words=pw_raw,
+            blocked_phrases=bp_raw,
+            source_type="importing",
+            activate=False,
+        )
+        _activate_persona(created["id"])
+        target_dir = _resolve_persona_folder(created["folder"])
+        return target_dir, created["id"], prev_active_id, True
+
+    if persona_id:
+        updates: Dict[str, Any] = {}
+        if persona_name is not None and persona_name.strip():
+            updates["name"] = persona_name.strip()
+        if user_name is not None:
+            updates["user_name"] = user_name
+        if never_forget is not None:
+            updates["never_forget"] = never_forget
+        if persona_notes is not None:
+            updates["notes"] = persona_notes
+        if tts_voice is not None and tts_voice.strip():
+            updates["tts_voice"] = tts_voice.strip()
+        if pw_raw:
+            updates["protected_words"] = pw_raw
+        if bp_raw:
+            updates["blocked_phrases"] = bp_raw
+        if updates:
+            _update_persona_entry(persona_id, updates)
+        _activate_persona(persona_id)
+        target = _get_persona_by_id(persona_id)
+        assert target is not None
+        return _resolve_persona_folder(target["folder"]), persona_id, prev_active_id, False
+
+    active = _get_active_persona()
+    if active:
+        return _resolve_persona_folder(active["folder"]), active["id"], prev_active_id, False
+    return PCP_DATA_DIR, None, prev_active_id, False
+
+
 def _start_background_ingest(
-    file_items: List[Tuple[str, bytes]],
+    file_items: Optional[List[Tuple[str, bytes]]],
     blocked_phrases: List[str],
     protected_words: List[str],
     replace_existing: bool = False,
+    local_paths: Optional[List[Path]] = None,
+    target_dir: Optional[Path] = None,
+    target_persona_id: Optional[str] = None,
+    prev_persona_id: Optional[str] = None,
+    cleanup_new_persona_on_fail: bool = False,
 ) -> None:
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
@@ -1329,31 +1817,57 @@ def _start_background_ingest(
     INGEST_STATE.error = None
     INGEST_STATE.last_result = None
 
+    resolved_dir = Path(target_dir) if target_dir is not None else _get_active_pcp_dir()
+
     def _worker():
         global PCP_INDEX
         try:
+            loaded_items: List[Tuple[str, bytes]] = list(file_items or [])
+            if local_paths:
+                total_paths = len(local_paths)
+                for idx, lp in enumerate(local_paths, start=1):
+                    _ingest_progress_callback(
+                        f"Reading {lp.name} ({idx}/{total_paths})...",
+                        0.02 + 0.03 * (idx / max(1, total_paths)),
+                    )
+                    loaded_items.append((lp.name, lp.read_bytes()))
+
             summary = ingest_files(
-                file_items=file_items,
-                output_dir=PCP_DATA_DIR,
+                file_items=loaded_items,
+                output_dir=resolved_dir,
                 blocked_phrases=blocked_phrases,
                 protected_words=protected_words,
                 replace_existing=replace_existing,
                 progress_callback=_ingest_progress_callback,
             )
             bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
-            if PCP_INDEX is None:
+            if PCP_INDEX is None or PCP_INDEX.data_dir.resolve() != resolved_dir.resolve():
                 PCP_INDEX = PCPIndex(
-                    PCP_DATA_DIR,
-                    cache_dir=PCP_DATA_DIR,
+                    resolved_dir,
+                    cache_dir=resolved_dir,
                     model_dir=bge_dir,
                     progress_callback=_ingest_progress_callback,
                 )
             else:
                 PCP_INDEX.reload(progress_callback=_ingest_progress_callback)
             summary["passages_indexed"] = PCP_INDEX.passage_count if PCP_INDEX else 0
+            if target_persona_id:
+                summary["persona_id"] = target_persona_id
+                try:
+                    _update_persona_entry(
+                        target_persona_id,
+                        {
+                            "source_type": summary.get("source_type", "custom"),
+                            "passage_count": summary["passages_indexed"],
+                        },
+                    )
+                except Exception as exc:
+                    log.warning(f"Could not update persona metadata after ingest: {exc}")
             INGEST_STATE.last_result = summary
+            src_label = summary.get("source_label")
+            prefix = f"Complete ({src_label})" if src_label else "Complete"
             INGEST_STATE.stage = (
-                f"Complete: {summary['volumes_written']} PCP volume(s), "
+                f"{prefix}: {summary['volumes_written']} PCP volume(s), "
                 f"{summary['passages_indexed']:,} passages ready."
             )
             INGEST_STATE.progress = 1.0
@@ -1366,6 +1880,13 @@ def _start_background_ingest(
         except Exception as exc:
             log.error(f"Archive ingestion failed: {exc}")
             log.error(traceback.format_exc())
+            if cleanup_new_persona_on_fail and target_persona_id and not any(resolved_dir.glob("ghost_pcp_*.md")):
+                try:
+                    _delete_persona_entry(target_persona_id, delete_files=True)
+                    if prev_persona_id:
+                        _activate_persona(prev_persona_id)
+                except Exception:
+                    pass
             INGEST_STATE.error = str(exc)
             INGEST_STATE.stage = f"Failed: {exc}"
         finally:
@@ -1378,7 +1899,7 @@ def _start_background_ingest(
 # FASTAPI APPLICATION & ROUTES
 # =====================================================================
 
-app = FastAPI(title="GHostPCP", version="1.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="GHostPCP", version="1.2.0", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1484,6 +2005,7 @@ def reset_endpoint():
 @app.get("/v1/status", dependencies=[Depends(verify_access)])
 def status():
     pcp_ready = bool(PCP_INDEX and PCP_INDEX.ready)
+    active_persona = _get_active_persona()
     return {
         "engine": "GHostPCP",
         "backend": BACKEND_NAME,
@@ -1502,8 +2024,94 @@ def status():
         "pcp_volumes": PCP_INDEX.file_count if pcp_ready and PCP_INDEX else 0,
         "pcp_passages": PCP_INDEX.passage_count if pcp_ready and PCP_INDEX else 0,
         "ingesting": INGEST_STATE.running,
+        "active_persona": (
+            {"id": active_persona["id"], "name": active_persona["name"], "user_name": active_persona.get("user_name", "")}
+            if active_persona
+            else None
+        ),
         "offline": True,
     }
+
+
+# =====================================================================
+# PERSONA PROFILES & ISOLATED FOLDER ROUTES
+# =====================================================================
+
+@app.get("/v1/personas", dependencies=[Depends(verify_access)])
+def list_personas():
+    reg = _load_persona_registry()
+    active_id = reg.get("active_persona_id")
+    summaries = [_persona_summary(p, active_id) for p in (reg.get("personas") or [])]
+    return {"personas": summaries, "active_persona_id": active_id}
+
+
+@app.post("/v1/personas", dependencies=[Depends(verify_access)])
+def create_persona(req: PersonaCreateRequest):
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before creating an AI persona.")
+    settings = load_settings()
+    bp_raw = req.blocked_phrases if req.blocked_phrases is not None else settings.get("blocked_phrases", "")
+    created = _create_persona_entry(
+        name=req.name,
+        user_name=req.user_name,
+        never_forget=req.never_forget,
+        notes=req.notes,
+        tts_voice=req.tts_voice,
+        preferred_model=req.preferred_model,
+        protected_words=req.protected_words,
+        blocked_phrases=bp_raw,
+        source_type="custom",
+        activate=False,
+    )
+    if req.activate:
+        activated = _activate_persona(created["id"])
+        return {"persona": activated["persona"], "messages": activated["messages"]}
+    reg = _load_persona_registry()
+    return {"persona": _persona_summary(created, reg.get("active_persona_id")), "messages": list(STATE.conversation)}
+
+
+@app.put("/v1/personas/{persona_id}", dependencies=[Depends(verify_access)])
+def update_persona(persona_id: str, req: PersonaUpdateRequest):
+    reg = _load_persona_registry()
+    if _get_persona_by_id(persona_id, reg) is None:
+        raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+    # Ensure legacy default is persisted if user edits it for the first time
+    if not _personas_registry_path().is_file() and reg.get("personas"):
+        _save_persona_registry(reg)
+    updates = req.model_dump(exclude_none=True)
+    updated = _update_persona_entry(persona_id, updates)
+    updated_reg = _load_persona_registry()
+    return {"persona": _persona_summary(updated, updated_reg.get("active_persona_id"))}
+
+
+@app.post("/v1/personas/{persona_id}/select", dependencies=[Depends(verify_access)])
+def select_persona(persona_id: str):
+    reg = _load_persona_registry()
+    if _get_persona_by_id(persona_id, reg) is None:
+        raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+    if not _personas_registry_path().is_file() and reg.get("personas"):
+        _save_persona_registry(reg)
+    result = _activate_persona(persona_id)
+    return result
+
+
+@app.delete("/v1/personas/{persona_id}", dependencies=[Depends(verify_access)])
+def delete_persona(persona_id: str, delete_files: bool = False):
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before deleting an AI persona.")
+    with STATE._lease:
+        if STATE.locked or STATE.busy:
+            raise HTTPException(status_code=409, detail="Wait for current model operation to finish before deleting an AI persona.")
+    res = _delete_persona_entry(persona_id, delete_files=delete_files)
+    next_id = res.get("active_persona_id")
+    if next_id:
+        _activate_persona(next_id)
+    else:
+        global PCP_INDEX
+        PCP_INDEX = None
+        with STATE._history_lock:
+            STATE.conversation.clear()
+    return res
 
 
 # =====================================================================
@@ -1513,13 +2121,18 @@ def status():
 @app.get("/v1/pcp/status", dependencies=[Depends(verify_access)])
 def pcp_status():
     pcp_ready = bool(PCP_INDEX and PCP_INDEX.ready)
-    volume_files = sorted(p.name for p in PCP_DATA_DIR.glob("ghost_pcp_*.md")) if PCP_DATA_DIR.is_dir() else []
+    active_dir = _get_active_pcp_dir()
+    active_persona = _get_active_persona()
+    volume_files = sorted(p.name for p in active_dir.glob("ghost_pcp_*.md")) if active_dir.is_dir() else []
     return {
         "ready": pcp_ready,
         "volumes": PCP_INDEX.file_count if pcp_ready and PCP_INDEX else len(volume_files),
         "passages": PCP_INDEX.passage_count if pcp_ready and PCP_INDEX else 0,
         "volume_files": volume_files,
-        "data_dir": str(PCP_DATA_DIR),
+        "data_dir": str(active_dir),
+        "active_persona": (
+            _persona_summary(active_persona, active_persona["id"]) if active_persona else None
+        ),
         "ingesting": INGEST_STATE.running,
         "cancelling": INGEST_STATE.running and INGEST_STATE.cancel_event.is_set(),
         "cancelled": INGEST_STATE.cancelled,
@@ -1542,6 +2155,12 @@ async def pcp_ingest_upload(
     blocked_phrases: Optional[str] = Form(default=None),
     protected_words: Optional[str] = Form(default=None),
     replace_existing: bool = Form(default=False),
+    persona_id: Optional[str] = Form(default=None),
+    persona_name: Optional[str] = Form(default=None),
+    user_name: Optional[str] = Form(default=None),
+    never_forget: Optional[str] = Form(default=None),
+    persona_notes: Optional[str] = Form(default=None),
+    tts_voice: Optional[str] = Form(default=None),
 ):
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
@@ -1556,8 +2175,28 @@ async def pcp_ingest_upload(
         content = await up.read()
         items.append((up.filename or "conversations.json", content))
 
-    _start_background_ingest(items, bp_list, pw_list, replace_existing=replace_existing)
-    return {"status": "started", "files": len(items)}
+    target_dir, target_pid, prev_pid, created_new = _prepare_ingest_target_persona(
+        persona_id=persona_id,
+        persona_name=persona_name,
+        user_name=user_name,
+        never_forget=never_forget,
+        persona_notes=persona_notes,
+        tts_voice=tts_voice,
+        bp_raw=bp_raw,
+        pw_raw=pw_raw,
+    )
+
+    _start_background_ingest(
+        items,
+        bp_list,
+        pw_list,
+        replace_existing=replace_existing,
+        target_dir=target_dir,
+        target_persona_id=target_pid,
+        prev_persona_id=prev_pid,
+        cleanup_new_persona_on_fail=created_new,
+    )
+    return {"status": "started", "files": len(items), "persona_id": target_pid}
 
 
 @app.post("/v1/pcp/ingest-local", dependencies=[Depends(verify_access)])
@@ -1570,26 +2209,42 @@ def pcp_ingest_local(req: LocalPathIngestRequest):
     bp_list = [line.strip() for line in bp_raw.splitlines() if line.strip()]
     pw_list = [line.strip() for line in pw_raw.splitlines() if line.strip()]
 
-    items: List[Tuple[str, bytes]] = []
+    discovered_paths: List[Path] = []
     for raw_path in req.paths:
         p = Path(raw_path.strip().strip('"'))
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"Path not found: {p}")
-        if p.is_dir():
-            for ext in ("*.md", "*.txt", "*.pdf", "*.jsonl"):
-                for child in sorted(p.glob(ext)):
-                    items.append((child.name, child.read_bytes()))
-            conv = p / "conversations.json"
-            if conv.is_file():
-                items.append((conv.name, conv.read_bytes()))
-        else:
-            items.append((p.name, p.read_bytes()))
+        discovered_paths.extend(discover_source_paths(p))
 
-    if not items:
-        raise HTTPException(status_code=400, detail="No supported export or document files (.zip, .json, .jsonl, .md, .txt, .pdf) found at path.")
+    if not discovered_paths:
+        raise HTTPException(
+            status_code=400,
+            detail="No supported export or document files (.zip, .json, .jsonl, .html, .md, .txt, .pdf) found at path.",
+        )
 
-    _start_background_ingest(items, bp_list, pw_list, replace_existing=req.replace_existing)
-    return {"status": "started", "files": len(items)}
+    target_dir, target_pid, prev_pid, created_new = _prepare_ingest_target_persona(
+        persona_id=req.persona_id,
+        persona_name=req.persona_name,
+        user_name=req.user_name,
+        never_forget=req.never_forget,
+        persona_notes=req.persona_notes,
+        tts_voice=req.tts_voice,
+        bp_raw=bp_raw,
+        pw_raw=pw_raw,
+    )
+
+    _start_background_ingest(
+        file_items=None,
+        blocked_phrases=bp_list,
+        protected_words=pw_list,
+        replace_existing=req.replace_existing,
+        local_paths=discovered_paths,
+        target_dir=target_dir,
+        target_persona_id=target_pid,
+        prev_persona_id=prev_pid,
+        cleanup_new_persona_on_fail=created_new,
+    )
+    return {"status": "started", "files": len(discovered_paths), "persona_id": target_pid}
 
 
 @app.post("/v1/pcp/save-session", dependencies=[Depends(verify_access)])
@@ -1602,9 +2257,10 @@ def pcp_save_session(req: SaveSessionRequest):
             raise HTTPException(status_code=409, detail="Wait for current generation to finish before saving session.")
         STATE.locked = True
     try:
+        active_dir = _get_active_pcp_dir()
         bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
-        if PCP_INDEX is None:
-            PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
+        if PCP_INDEX is None or PCP_INDEX.data_dir.resolve() != active_dir.resolve():
+            PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir)
 
         raw_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
         try:
@@ -1617,6 +2273,11 @@ def pcp_save_session(req: SaveSessionRequest):
 
         with STATE._history_lock:
             STATE.conversation.clear()
+        if _personas_registry_path().is_file():
+            active_persona = _get_active_persona()
+            if active_persona:
+                _save_persona_chat_history(active_dir, [])
+                _update_persona_entry(active_persona["id"], {"passage_count": PCP_INDEX.passage_count})
 
         if STATE.llm is not None:
             try:
@@ -1639,6 +2300,8 @@ def pcp_reindex():
     if INGEST_STATE.running:
         raise HTTPException(status_code=409, detail="Archive processing is already running.")
 
+    active_dir = _get_active_pcp_dir()
+    active_persona = _get_active_persona()
     INGEST_STATE.cancel_event.clear()
     INGEST_STATE.cancelled = False
     INGEST_STATE.running = True
@@ -1650,19 +2313,21 @@ def pcp_reindex():
         global PCP_INDEX
         try:
             bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
-            if PCP_INDEX is None:
+            if PCP_INDEX is None or PCP_INDEX.data_dir.resolve() != active_dir.resolve():
                 PCP_INDEX = PCPIndex(
-                    PCP_DATA_DIR,
-                    cache_dir=PCP_DATA_DIR,
+                    active_dir,
+                    cache_dir=active_dir,
                     model_dir=bge_dir,
                     progress_callback=_ingest_progress_callback,
                 )
             else:
                 PCP_INDEX.reload(progress_callback=_ingest_progress_callback)
+            if active_persona and _personas_registry_path().is_file() and PCP_INDEX and PCP_INDEX.ready:
+                _update_persona_entry(active_persona["id"], {"passage_count": PCP_INDEX.passage_count})
             INGEST_STATE.stage = (
                 f"Indexed {PCP_INDEX.file_count} volume(s), {PCP_INDEX.passage_count:,} passages."
                 if PCP_INDEX and PCP_INDEX.ready
-                else "No ghost_pcp_*.md files found in pcp_data."
+                else f"No ghost_pcp_*.md files found in {active_dir}."
             )
             INGEST_STATE.progress = 1.0
         except IngestCancelledError:
@@ -1812,6 +2477,10 @@ def set_chat_history(req: ChatHistoryRequest):
     cleaned = [{"role": m.role, "content": m.content} for m in req.messages]
     with STATE._history_lock:
         STATE.conversation = cleaned
+    if _personas_registry_path().is_file():
+        active = _get_active_persona()
+        if active:
+            _save_persona_chat_history(_resolve_persona_folder(active.get("folder", ".")), cleaned)
     return {"status": "ok", "count": len(cleaned)}
 
 
@@ -1891,12 +2560,17 @@ async def chat_extract_file(
         }
         should_save = bool(save_to_archive) or (len(text) > 12000 and not INGEST_STATE.running)
         if should_save:
+            active_dir = _get_active_pcp_dir()
             bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
-            if PCP_INDEX is None:
-                PCP_INDEX = PCPIndex(PCP_DATA_DIR, cache_dir=PCP_DATA_DIR, model_dir=bge_dir)
+            if PCP_INDEX is None or PCP_INDEX.data_dir.resolve() != active_dir.resolve():
+                PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir)
             try:
                 save_res = PCP_INDEX.append_document(safe_name, text)
                 entry["saved_to"] = save_res.get("saved_to")
+                if _personas_registry_path().is_file():
+                    active_persona = _get_active_persona()
+                    if active_persona:
+                        _update_persona_entry(active_persona["id"], {"passage_count": PCP_INDEX.passage_count})
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to index '{safe_name}': {exc}") from exc
         extracted_files.append(entry)
@@ -2033,8 +2707,27 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
     configured_custom = strip_builtin_system_prompt(settings.get("system_prompt") or "")
     has_system = raw_messages[0].get("role") == "system"
     incoming_sys = str(raw_messages[0].get("content") or "").strip() if has_system else ""
+    target_persona = None
+    if req.persona_id:
+        target_persona = _get_persona_by_id(req.persona_id)
+    elif _personas_registry_path().is_file() and not (has_system and incoming_sys):
+        target_persona = _get_active_persona()
+
     if has_system and "ARCHIVE EXCERPTS:" in incoming_sys:
         effective_sys = incoming_sys
+    elif target_persona is not None:
+        notes_source = (
+            strip_builtin_system_prompt(incoming_sys)
+            if (has_system and incoming_sys)
+            else (target_persona.get("notes") or configured_custom)
+        )
+        persona_prefix = build_persona_prompt_prefix(
+            name=target_persona.get("name", ""),
+            user_name=target_persona.get("user_name", ""),
+            never_forget=target_persona.get("never_forget", ""),
+            notes=notes_source,
+        )
+        effective_sys = _build_effective_system_prompt(persona_prefix)
     else:
         custom_prefix = strip_builtin_system_prompt(incoming_sys) if (has_system and incoming_sys) else configured_custom
         effective_sys = _build_effective_system_prompt(custom_prefix)
@@ -2377,6 +3070,12 @@ def chat_completions(req: ChatRequest):
 def startup_banner():
     _init_pairing_token()
     _init_pcp_index()
+    if _personas_registry_path().is_file():
+        active_persona = _get_active_persona()
+        if active_persona:
+            active_dir = _resolve_persona_folder(active_persona.get("folder", "."))
+            with STATE._history_lock:
+                STATE.conversation = _load_persona_chat_history(active_dir)
     if sys.stdout is not None:
         try:
             print(GHOST_BANNER)

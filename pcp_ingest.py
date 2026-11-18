@@ -2,27 +2,326 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """GHostPCP — Archive Extractor, Corporate Refusal Stripper, and Volume Writer.
 
-Transforms ChatGPT export archives (.zip or conversations.json), JSONL pairs,
-or Markdown files into clean, high-density Markdown volumes:
+Auto-detects and transforms OpenAI ChatGPT exports (.zip, conversations.json,
+conversations-*.json), Google Gemini Takeout exports (MyActivity.json,
+MyActivity.html, or Takeout .zip/folders), JSONL pairs, and Markdown/text/PDF
+documents into clean, high-density Markdown volumes:
     ghost_pcp_01.md, ghost_pcp_02.md, ...
 """
 from __future__ import annotations
 
+import argparse
+from datetime import datetime
+import html as html_lib
+from html.parser import HTMLParser
 import io
 import json
 import os
+from pathlib import Path
 import re
 import shutil
+import sys
 import tempfile
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import zipfile
-from datetime import datetime
-from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from persona import DEFAULT_BLOCKED_PHRASES, DEFAULT_PROTECTED_WORDS
 
 INTERACTIONS_PER_VOLUME = 1000
 SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log"}
+
+_IGNORED_DIR_NAMES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "backups",
+}
+
+_NON_CONVERSATION_JSON_NAMES = {
+    "user.json",
+    "message_feedback.json",
+    "model_comparisons.json",
+    "shared_conversations.json",
+    "settings.json",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "personas.json",
+    "persona.json",
+    "ghost_pcp_settings.json",
+}
+
+_NON_GEMINI_TAKEOUT_HEADERS = (
+    "search",
+    "youtube",
+    "maps",
+    "chrome",
+    "google play",
+    "play store",
+    "ads",
+    "shopping",
+    "gmail",
+    "drive",
+    "photos",
+    "news",
+    "discover",
+    "android",
+)
+
+
+class _HTMLToMarkdownParser(HTMLParser):
+    """Zero-dependency HTML-to-Markdown converter for Gemini safeHtmlItem payloads."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self.list_stack: List[Tuple[str, int]] = []
+        self.in_pre = False
+        self.pre_lang = ""
+        self.in_code = False
+        self.in_blockquote = False
+        self.skip_depth = 0
+        self.link_stack: List[Tuple[str, int]] = []
+        self.in_table_row = False
+        self.row_cells: List[str] = []
+        self.in_cell = False
+        self.cell_parts: List[str] = []
+
+    def _emit(self, text: str) -> None:
+        if self.skip_depth > 0:
+            return
+        if self.in_cell:
+            self.cell_parts.append(text)
+        else:
+            self.parts.append(text)
+
+    def _ensure_blank_line(self) -> None:
+        if self.in_cell:
+            return
+        joined = "".join(self.parts)
+        if not joined:
+            return
+        if joined.endswith("\n\n"):
+            return
+        if joined.endswith("\n"):
+            self.parts.append("\n")
+        else:
+            self.parts.append("\n\n")
+
+    def _ensure_newline(self) -> None:
+        if self.in_cell:
+            return
+        joined = "".join(self.parts)
+        if joined and not joined.endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        attr_map = {k.lower(): (v or "") for k, v in attrs}
+
+        if t in ("script", "style"):
+            self.skip_depth += 1
+            return
+        if self.skip_depth > 0:
+            return
+
+        if t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._ensure_blank_line()
+            level = int(t[1])
+            self._emit("#" * level + " ")
+        elif t == "p":
+            if not self.list_stack:
+                self._ensure_blank_line()
+        elif t == "br":
+            self._emit(" " if self.in_cell else "\n")
+        elif t == "hr":
+            self._ensure_blank_line()
+            self._emit("---\n\n")
+        elif t in ("strong", "b"):
+            self._emit("**")
+        elif t in ("em", "i"):
+            self._emit("*")
+        elif t == "blockquote":
+            self._ensure_blank_line()
+            self.in_blockquote = True
+            self._emit("> ")
+        elif t == "pre":
+            self._ensure_blank_line()
+            self.in_pre = True
+            cls = attr_map.get("class", "")
+            m = re.search(r"language-([A-Za-z0-9_+-]+)", cls)
+            self.pre_lang = m.group(1) if m else ""
+            self._emit(f"```{self.pre_lang}\n")
+        elif t == "code":
+            if self.in_pre:
+                cls = attr_map.get("class", "")
+                if not self.pre_lang:
+                    m = re.search(r"language-([A-Za-z0-9_+-]+)", cls)
+                    if m and self.parts and self.parts[-1] == "```\n":
+                        self.pre_lang = m.group(1)
+                        self.parts[-1] = f"```{self.pre_lang}\n"
+            else:
+                self.in_code = True
+                self._emit("`")
+        elif t == "ul":
+            if not self.list_stack:
+                self._ensure_blank_line()
+            else:
+                self._ensure_newline()
+            self.list_stack.append(("ul", 0))
+        elif t == "ol":
+            if not self.list_stack:
+                self._ensure_blank_line()
+            else:
+                self._ensure_newline()
+            self.list_stack.append(("ol", 0))
+        elif t == "li":
+            self._ensure_newline()
+            indent = "  " * max(0, len(self.list_stack) - 1)
+            if self.list_stack:
+                kind, count = self.list_stack[-1]
+                count += 1
+                self.list_stack[-1] = (kind, count)
+                bullet = f"{count}. " if kind == "ol" else "- "
+            else:
+                bullet = "- "
+            self._emit(f"{indent}{bullet}")
+        elif t == "a":
+            href = attr_map.get("href", "").strip()
+            self.link_stack.append((href, len(self.cell_parts if self.in_cell else self.parts)))
+            self._emit("[")
+        elif t == "tr":
+            self.in_table_row = True
+            self.row_cells = []
+        elif t in ("th", "td"):
+            self.in_cell = True
+            self.cell_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in ("script", "style"):
+            self.skip_depth = max(0, self.skip_depth - 1)
+            return
+        if self.skip_depth > 0:
+            return
+
+        if t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._ensure_blank_line()
+        elif t == "p":
+            if self.list_stack:
+                self._ensure_newline()
+            else:
+                self._ensure_blank_line()
+        elif t in ("div", "section", "article"):
+            if not self.in_pre and not self.list_stack:
+                self._ensure_newline()
+        elif t in ("strong", "b"):
+            self._emit("**")
+        elif t in ("em", "i"):
+            self._emit("*")
+        elif t == "blockquote":
+            self.in_blockquote = False
+            self._ensure_blank_line()
+        elif t == "pre":
+            if self.in_pre:
+                joined = "".join(self.parts)
+                if not joined.endswith("\n"):
+                    self._emit("\n")
+                self._emit("```\n\n")
+                self.in_pre = False
+                self.pre_lang = ""
+        elif t == "code":
+            if self.in_code and not self.in_pre:
+                self._emit("`")
+                self.in_code = False
+        elif t in ("ul", "ol"):
+            if self.list_stack:
+                self.list_stack.pop()
+            if not self.list_stack:
+                self._ensure_blank_line()
+        elif t == "li":
+            self._ensure_newline()
+        elif t == "a":
+            href, start_idx = self.link_stack.pop() if self.link_stack else ("", -1)
+            target_buf = self.cell_parts if self.in_cell else self.parts
+            if start_idx >= 0 and start_idx < len(target_buf):
+                label = "".join(target_buf[start_idx + 1 :]).strip()
+            else:
+                label = ""
+            if href and href.startswith(("http://", "https://")) and label and label != href:
+                self._emit(f"]({href})")
+            else:
+                # Strip the opening '[' so plain URLs or empty links stay clean
+                if start_idx >= 0 and start_idx < len(target_buf) and target_buf[start_idx] == "[":
+                    target_buf[start_idx] = ""
+        elif t in ("th", "td"):
+            if self.in_cell:
+                cell_text = re.sub(r"\s+", " ", "".join(self.cell_parts)).strip()
+                self.row_cells.append(cell_text)
+                self.in_cell = False
+                self.cell_parts = []
+        elif t == "tr":
+            if self.in_table_row and self.row_cells:
+                self._ensure_newline()
+                self._emit("| " + " | ".join(self.row_cells) + " |\n")
+            self.in_table_row = False
+            self.row_cells = []
+        elif t == "table":
+            self._ensure_blank_line()
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth > 0:
+            return
+        if self.in_pre or self.in_code:
+            self._emit(data)
+            return
+        text = re.sub(r"[ \t\r\n]+", " ", data)
+        if not text:
+            return
+        if text == " ":
+            target = self.cell_parts if self.in_cell else self.parts
+            if not target or target[-1].endswith((" ", "\n", "[", "**", "*")):
+                return
+        if self.in_blockquote and "\n" in text:
+            text = text.replace("\n", "\n> ")
+        self._emit(text)
+
+    def get_markdown(self) -> str:
+        raw = "".join(self.parts)
+        lines = [ln.rstrip() for ln in raw.splitlines()]
+        cleaned = "\n".join(lines)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+
+def html_to_markdown(raw_html: str) -> str:
+    """Convert safeHtmlItem HTML to Markdown (uses html2text if installed, else stdlib parser)."""
+    raw = str(raw_html or "").strip()
+    if not raw:
+        return ""
+    try:
+        import html2text  # type: ignore
+
+        h = html2text.HTML2Text()
+        h.body_width = 0
+        h.ignore_images = True
+        h.ignore_links = False
+        h.skip_internal_links = True
+        h.single_newline_on_list_items = True
+        return h.handle(raw).strip()
+    except ImportError:
+        pass
+
+    parser = _HTMLToMarkdownParser()
+    parser.feed(raw)
+    parser.close()
+    md = parser.get_markdown()
+    if md:
+        return md
+    # Fallback plain unescaped text if markup had only text nodes
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", raw)).strip()
 
 
 def extract_text_from_document(filename: str, raw_bytes: bytes) -> str:
@@ -53,11 +352,14 @@ def extract_text_from_document(filename: str, raw_bytes: bytes) -> str:
 
 
 def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
-    """Return (role, text) from a ChatGPT mapping message or flat message dict."""
+    """Return (role, text) from a ChatGPT/AI Studio mapping message or flat message dict."""
     if not isinstance(msg_obj, dict):
         return "", ""
     inner = msg_obj.get("message") if isinstance(msg_obj.get("message"), dict) else msg_obj
     if not isinstance(inner, dict):
+        return "", ""
+
+    if inner.get("isThought") is True:
         return "", ""
 
     author = inner.get("author")
@@ -96,7 +398,6 @@ def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
 def _ordered_nodes_from_mapping(mapping: dict) -> List[dict]:
     """Traverse a ChatGPT conversation mapping in chronological order."""
     nodes = [v for v in mapping.values() if isinstance(v, dict)]
-    # Find root node(s) (no parent or parent not in mapping)
     roots = [
         n for n in nodes
         if not n.get("parent") or n.get("parent") not in mapping
@@ -123,13 +424,298 @@ def _ordered_nodes_from_mapping(mapping: dict) -> List[dict]:
     return ordered
 
 
-def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
-    """Extract (user_text, assistant_text) pairs from parsed JSON export data."""
+def _is_gemini_activity_entry(entry: dict) -> bool:
+    """Return True when a JSON dict resembles a Google Takeout Gemini MyActivity entry."""
+    if not isinstance(entry, dict):
+        return False
+    if isinstance(entry.get("safeHtmlItem"), list):
+        return True
+    title = entry.get("title")
+    if isinstance(title, str) and title.startswith(("Prompted ", "Uploaded ")):
+        return True
+    header = entry.get("header")
+    if isinstance(header, str) and any(tok in header.lower() for tok in ("gemini", "bard")):
+        return True
+    products = entry.get("products")
+    if isinstance(products, list) and any(
+        "gemini" in str(p).lower() or "bard" in str(p).lower() for p in products
+    ):
+        return True
+    return False
+
+
+def _is_non_gemini_activity_entry(entry: dict) -> bool:
+    """Skip non-Gemini entries if a multi-service Google Takeout MyActivity.json is supplied."""
+    title = str(entry.get("title") or "")
+    header = str(entry.get("header") or "").strip().lower()
+    products = entry.get("products")
+    product_text = " ".join(str(p).lower() for p in products) if isinstance(products, list) else ""
+
+    is_gemini_tagged = ("gemini" in header or "bard" in header or "gemini" in product_text or "bard" in product_text)
+    if is_gemini_tagged:
+        return False
+    if header and any(bad in header for bad in _NON_GEMINI_TAKEOUT_HEADERS):
+        return True
+    if header and not title.startswith(("Prompted ", "Uploaded ")):
+        return True
+    if isinstance(products, list) and products and not title.startswith(("Prompted ", "Uploaded ")):
+        return True
+    return False
+
+
+def _extract_gemini_entries_from_data(data: object) -> List[Tuple[str, str, str]]:
+    """Extract (user_text, ai_markdown, timestamp) tuples from Gemini MyActivity.json data."""
+    items = data if isinstance(data, list) else [data]
+    results: List[Tuple[str, str, str]] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        if _is_non_gemini_activity_entry(entry):
+            continue
+
+        title = str(entry.get("title") or "")
+        if title.startswith("Uploaded "):
+            continue
+
+        user_text = ""
+        if title.startswith("Prompted "):
+            user_text = title[len("Prompted "):].strip()
+        elif title.strip().rstrip(":") == "Prompted":
+            user_text = ""
+
+        ts = str(entry.get("time") or entry.get("date") or "").strip()
+
+        ai_parts: List[str] = []
+        safe_items = entry.get("safeHtmlItem")
+        if isinstance(safe_items, list):
+            for item in safe_items:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.get("html") or ""
+                if raw:
+                    converted = html_to_markdown(raw)
+                    if converted:
+                        ai_parts.append(converted)
+        ai_text = "\n\n".join(ai_parts).strip()
+
+        if not user_text and ai_text:
+            attached = entry.get("attachedFiles")
+            if isinstance(attached, list) and attached:
+                names = [str(a.get("name") if isinstance(a, dict) else a) for a in attached if a]
+                if names:
+                    user_text = f"[Attached: {', '.join(names)}]"
+            if not user_text and (title.strip().startswith("Prompted") or _is_gemini_activity_entry(entry)):
+                user_text = "[Attachment / non-text prompt]"
+
+        if user_text and ai_text:
+            results.append((user_text, ai_text, ts))
+    return results
+
+
+def is_gemini_takeout_html(raw_html: str) -> bool:
+    """Return True if raw_html looks like a Google Takeout Gemini MyActivity.html export."""
+    head = raw_html[:50000]
+    has_takeout_cells = ("content-cell" in head) or ("outer-cell" in head)
+    has_gemini_cues = ("Gemini Apps" in raw_html or "Bard" in raw_html) and ("Prompted" in raw_html)
+    return bool(has_takeout_cells and has_gemini_cues)
+
+
+class _TakeoutHTMLCardsParser(HTMLParser):
+    """Extract outer-cell/content-cell cards from Google Takeout MyActivity.html."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.cards: List[Tuple[str, str]] = []
+        self._in_card = False
+        self._card_depth = 0
+        self._in_header = False
+        self._header_depth = 0
+        self._in_body = False
+        self._body_depth = 0
+        self._header_buf: List[str] = []
+        self._body_buf: List[str] = []
+
+    def _attr_class(self, attrs: List[Tuple[str, Optional[str]]]) -> str:
+        for k, v in attrs:
+            if k.lower() == "class" and v:
+                return v
+        return ""
+
+    @staticmethod
+    def _format_start(tag: str, attrs: List[Tuple[str, Optional[str]]]) -> str:
+        if not attrs:
+            return f"<{tag}>"
+        parts = []
+        for k, v in attrs:
+            if v is None:
+                parts.append(k)
+            else:
+                parts.append(f'{k}="{html_lib.escape(v, quote=True)}"')
+        return f"<{tag} {' '.join(parts)}>"
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        cls = self._attr_class(attrs)
+        classes = set(cls.split())
+
+        if not self._in_card and "outer-cell" in classes:
+            self._in_card = True
+            self._card_depth = 1
+            self._header_buf = []
+            self._body_buf = []
+            return
+
+        if not self._in_card:
+            return
+
+        if t not in ("br", "hr", "img", "meta", "link", "input"):
+            self._card_depth += 1
+
+        if not self._in_header and "header-cell" in classes:
+            self._in_header = True
+            self._header_depth = 1
+            return
+        if self._in_header:
+            if t not in ("br", "hr", "img", "meta", "link", "input"):
+                self._header_depth += 1
+            self._header_buf.append(self._format_start(t, attrs))
+            return
+
+        if not self._in_body and "content-cell" in classes and "mdl-typography--text-right" not in classes:
+            self._in_body = True
+            self._body_depth = 1
+            return
+        if self._in_body:
+            if t not in ("br", "hr", "img", "meta", "link", "input"):
+                self._body_depth += 1
+            self._body_buf.append(self._format_start(t, attrs))
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if not self._in_card or t in ("br", "hr", "img", "meta", "link", "input"):
+            return
+
+        if self._in_header:
+            self._header_depth -= 1
+            if self._header_depth <= 0:
+                self._in_header = False
+            else:
+                self._header_buf.append(f"</{t}>")
+        elif self._in_body:
+            self._body_depth -= 1
+            if self._body_depth <= 0:
+                self._in_body = False
+            else:
+                self._body_buf.append(f"</{t}>")
+
+        self._card_depth -= 1
+        if self._card_depth <= 0:
+            self._in_card = False
+            if self._body_buf:
+                self.cards.append(("".join(self._header_buf), "".join(self._body_buf)))
+
+    def handle_data(self, data: str) -> None:
+        if self._in_header:
+            self._header_buf.append(data)
+        elif self._in_body:
+            self._body_buf.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        text = f"&{name};"
+        if self._in_header:
+            self._header_buf.append(text)
+        elif self._in_body:
+            self._body_buf.append(text)
+
+    def handle_charref(self, name: str) -> None:
+        text = f"&#{name};"
+        if self._in_header:
+            self._header_buf.append(text)
+        elif self._in_body:
+            self._body_buf.append(text)
+
+
+def extract_gemini_html_pairs(raw_html: str) -> List[Tuple[str, str]]:
+    """Extract (user_text, ai_markdown) pairs from a Google Takeout MyActivity.html file."""
+    if not is_gemini_takeout_html(raw_html):
+        return []
+    parser = _TakeoutHTMLCardsParser()
+    parser.feed(raw_html)
+    parser.close()
+
+    pairs: List[Tuple[str, str]] = []
+    ts_re = re.compile(
+        r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?(?:\s+[A-Z]{2,5})?$"
+    )
+    for header_html, body_html in parser.cards:
+        header_plain = html_to_markdown(header_html).lower()
+        if header_plain and not any(tok in header_plain for tok in ("gemini", "bard")):
+            continue
+        md = html_to_markdown(body_html)
+        if not md:
+            continue
+        lines = [ln.strip() for ln in md.splitlines()]
+        # Strip trailing Takeout metadata lines if present
+        while lines and (not lines[-1] or lines[-1].startswith(("Products:", "Why is this here?"))):
+            lines.pop()
+        if not lines:
+            continue
+        first = lines[0]
+        if first.startswith("Uploaded "):
+            continue
+        if not first.startswith("Prompted"):
+            continue
+        user_text = first[len("Prompted"):].lstrip(":").strip()
+        rest = lines[1:]
+        while rest and (not rest[0] or ts_re.match(rest[0])):
+            rest.pop(0)
+        ai_text = "\n".join(rest).strip()
+        if not user_text and ai_text:
+            user_text = "[Attachment / non-text prompt]"
+        if user_text and ai_text:
+            pairs.append((user_text, ai_text))
+    return pairs
+
+
+def detect_json_source(data: object) -> str:
+    """Detect whether parsed JSON data is from Google ('google'), OpenAI ('openai'), or 'unknown'."""
+    if isinstance(data, dict) and isinstance(data.get("chunkedPrompt"), dict):
+        return "google"
+
+    items = data if isinstance(data, list) else [data]
+    sample = [x for x in items[:50] if isinstance(x, dict)]
+    if not sample:
+        return "unknown"
+
+    for entry in sample:
+        if "mapping" in entry and isinstance(entry["mapping"], dict):
+            return "openai"
+
+    if any(_is_gemini_activity_entry(entry) for entry in sample):
+        return "google"
+
+    for entry in sample:
+        if any(k in entry for k in ("messages", "history", "threads", "items", "role", "instruction")):
+            return "openai"
+        if isinstance(entry.get("chunkedPrompt"), dict):
+            return "google"
+
+    return "unknown"
+
+
+def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
+    """Extract (user_text, assistant_text) pairs from OpenAI ChatGPT or generic JSON/JSONL data."""
     pairs: List[Tuple[str, str]] = []
     items = data if isinstance(data, list) else [data]
 
     # Case 1: Flat list of {role, text/content} or {instruction, response} messages
-    if items and all(isinstance(x, dict) and ("role" in x or "instruction" in x) and "mapping" not in x for x in items[:5]):
+    if items and all(
+        isinstance(x, dict)
+        and ("role" in x or "instruction" in x)
+        and "mapping" not in x
+        and not _is_gemini_activity_entry(x)
+        for x in items[:5]
+    ):
         user_bucket: List[str] = []
         ai_bucket: List[str] = []
         for entry in items:
@@ -158,7 +744,7 @@ def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
         if pairs:
             return pairs
 
-    # Case 2: Standard ChatGPT conversations.json (with mapping or message containers)
+    # Case 2: Standard ChatGPT conversations.json (or Google AI Studio chunkedPrompt)
     for entry in items:
         if not isinstance(entry, dict):
             continue
@@ -167,10 +753,9 @@ def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
         if isinstance(mapping, dict):
             msg_nodes = _ordered_nodes_from_mapping(mapping)
         else:
-            # Recursive search for message container
             def find_messages(obj: object) -> Optional[Iterable]:
                 if isinstance(obj, dict):
-                    for key in ("mapping", "messages", "history", "threads", "items"):
+                    for key in ("mapping", "messages", "history", "threads", "items", "chunks"):
                         if key in obj and isinstance(obj[key], (list, dict)):
                             return obj[key]
                     for val in obj.values():
@@ -205,6 +790,36 @@ def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
     return pairs
 
 
+def extract_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str]], str]:
+    """Detect source provider ('google', 'openai', or 'unknown') and return (pairs, source)."""
+    source = detect_json_source(data)
+    if source == "google":
+        gemini_entries = _extract_gemini_entries_from_data(data)
+        if gemini_entries:
+            return [(u, a) for u, a, _ in gemini_entries], "google"
+        # Google AI Studio chunkedPrompt fallback
+        aistudio_pairs = _extract_chatgpt_or_generic_pairs(data)
+        if aistudio_pairs:
+            return aistudio_pairs, "google"
+        return [], "google"
+
+    pairs = _extract_chatgpt_or_generic_pairs(data)
+    if pairs:
+        return pairs, ("openai" if source == "openai" else "unknown")
+
+    # Secondary check in case Gemini entries appeared later in a mixed list
+    gemini_entries = _extract_gemini_entries_from_data(data)
+    if gemini_entries:
+        return [(u, a) for u, a, _ in gemini_entries], "google"
+    return [], source
+
+
+def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
+    """Extract (user_text, assistant_text) pairs from parsed Google Gemini or OpenAI JSON data."""
+    pairs, _ = extract_pairs_with_source(data)
+    return pairs
+
+
 def filter_pairs(
     pairs: Sequence[Tuple[str, str]],
     blocked_phrases: Optional[Sequence[str]] = None,
@@ -232,11 +847,22 @@ def filter_pairs(
 
 
 def _clean_text(text: str) -> str:
-    """Strip stray HTML tags and ChatGPT private-use citation markers."""
-    # Remove ChatGPT private-use citation blocks (\ue200...\ue201)
+    """Strip stray HTML tags (outside code blocks) and ChatGPT private-use citation markers."""
     text = re.sub(r"\ue200.*?\ue201", "", text)
-    # Strip raw HTML tags while preserving normal prose
+
+    # Preserve fenced and inline code blocks so HTML code samples remain intact
+    placeholders: List[str] = []
+
+    def _stash(match: re.Match) -> str:
+        idx = len(placeholders)
+        placeholders.append(match.group(0))
+        return f"\x00CODEPH_{idx}\x00"
+
+    text = re.sub(r"```[\s\S]*?```", _stash, text)
+    text = re.sub(r"`[^`\n]+`", _stash, text)
     text = re.sub(r"<[^>]+>", "", text)
+    for idx, original in enumerate(placeholders):
+        text = text.replace(f"\x00CODEPH_{idx}\x00", original)
     return text.strip()
 
 
@@ -275,7 +901,6 @@ def write_pcp_volumes(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Filter out any empty pairs BEFORE touching existing files
     cleaned_pairs: List[Tuple[str, str]] = []
     for u_raw, a_raw in pairs:
         u_clean = _clean_text(u_raw)
@@ -352,6 +977,224 @@ def _write_markdown_payloads(
     return written_paths
 
 
+def _is_gemini_activity_filename(name: str) -> bool:
+    low = Path(name).name.lower()
+    return low in ("myactivity.json", "my activity.json")
+
+
+def _is_gemini_activity_html_filename(name: str) -> bool:
+    low = Path(name).name.lower()
+    return low in ("myactivity.html", "my activity.html")
+
+
+def _is_chatgpt_conversations_filename(name: str) -> bool:
+    low = Path(name).name.lower()
+    return low == "conversations.json" or (low.startswith("conversations-") and low.endswith(".json"))
+
+
+def _is_gemini_takeout_path(path_str: str) -> bool:
+    low = path_str.replace("\\", "/").lower()
+    return "gemini" in low or "bard" in low
+
+
+def _is_obviously_unrelated_takeout_path(path_str: str) -> bool:
+    parts = [p.lower() for p in Path(path_str).parts[:-1]]
+    if any("gemini" in p or "bard" in p for p in parts):
+        return False
+    for part in parts:
+        if any(bad in part for bad in _NON_GEMINI_TAKEOUT_HEADERS):
+            return True
+    return False
+
+
+def _is_generated_volume_md(path_str: str, raw_bytes: Optional[bytes] = None) -> bool:
+    name = Path(path_str).name.lower()
+    if re.match(r"^ghost_pcp_\d+\.md$", name):
+        return True
+    if raw_bytes is not None:
+        head = raw_bytes[:120].decode("utf-8-sig", errors="ignore").lstrip()
+        if head.startswith(("# **ARCHIVE VOLUME ", "# ARCHIVE VOLUME ")):
+            return True
+    return False
+
+
+def _source_summary_fields(detected_sources: Set[str], mode_override: Optional[str] = None) -> Dict[str, str]:
+    clean = {s for s in detected_sources if s in ("google", "openai")}
+    if clean == {"google"}:
+        return {
+            "mode": mode_override or "gemini_export",
+            "source_type": "google",
+            "source_label": "Google Gemini",
+        }
+    if clean == {"openai"}:
+        return {
+            "mode": mode_override or "chatgpt_export",
+            "source_type": "openai",
+            "source_label": "OpenAI ChatGPT",
+        }
+    if clean == {"google", "openai"}:
+        return {
+            "mode": mode_override or "mixed_export",
+            "source_type": "mixed",
+            "source_label": "Google Gemini + OpenAI ChatGPT",
+        }
+    if mode_override == "markdown_import":
+        return {
+            "mode": "markdown_import",
+            "source_type": "markdown",
+            "source_label": "Documents / Markdown",
+        }
+    return {
+        "mode": mode_override or "chatgpt_export",
+        "source_type": "generic",
+        "source_label": "Conversation Archive",
+    }
+
+
+def _select_zip_json_members(members: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
+    """Classify structured export files inside a .zip archive."""
+    files = [m for m in members if not m.endswith("/")]
+    openai_jsons = [m for m in files if _is_chatgpt_conversations_filename(m)]
+
+    all_activity_jsons = [m for m in files if _is_gemini_activity_filename(m)]
+    gemini_tagged_jsons = [m for m in all_activity_jsons if _is_gemini_takeout_path(m)]
+    gemini_jsons = gemini_tagged_jsons if gemini_tagged_jsons else [
+        m for m in all_activity_jsons if not _is_obviously_unrelated_takeout_path(m)
+    ]
+
+    json_dirs_with_activity = {str(Path(m).parent).replace("\\", "/").lower() for m in gemini_jsons}
+    all_activity_htmls = [m for m in files if _is_gemini_activity_html_filename(m)]
+    gemini_tagged_htmls = [m for m in all_activity_htmls if _is_gemini_takeout_path(m)]
+    candidate_htmls = gemini_tagged_htmls if gemini_tagged_htmls else [
+        m for m in all_activity_htmls if not _is_obviously_unrelated_takeout_path(m)
+    ]
+    gemini_htmls = [
+        m for m in candidate_htmls
+        if str(Path(m).parent).replace("\\", "/").lower() not in json_dirs_with_activity
+    ]
+
+    structured = openai_jsons + gemini_jsons
+    if structured:
+        return structured, gemini_htmls, []
+
+    if gemini_htmls:
+        return [], gemini_htmls, []
+
+    fallback_jsons = [
+        m for m in files
+        if m.lower().endswith(".json")
+        and Path(m).name.lower() not in _NON_CONVERSATION_JSON_NAMES
+        and not _is_obviously_unrelated_takeout_path(m)
+    ]
+    return [], [], fallback_jsons
+
+
+def discover_source_paths(source_path: Path) -> List[Path]:
+    """Discover export files in a source file or directory (auto-detecting Google vs OpenAI)."""
+    root = Path(source_path)
+    if not root.exists():
+        raise FileNotFoundError(f"Path not found: {root}")
+    if root.is_file():
+        return [root]
+
+    all_files: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d.lower() not in _IGNORED_DIR_NAMES and not d.startswith(".")
+        )
+        for fname in sorted(filenames):
+            all_files.append(Path(dirpath) / fname)
+
+    openai_jsons: List[Path] = []
+    activity_jsons: List[Path] = []
+    activity_htmls: List[Path] = []
+    other_jsons: List[Path] = []
+    jsonl_files: List[Path] = []
+    zip_files: List[Path] = []
+    top_docs: List[Path] = []
+
+    for f in all_files:
+        rel_str = str(f.relative_to(root))
+        low_name = f.name.lower()
+        suffix = f.suffix.lower()
+
+        if re.match(r"^ghost_pcp_\d+\.md$", low_name):
+            continue
+        if low_name in _NON_CONVERSATION_JSON_NAMES:
+            continue
+
+        if _is_chatgpt_conversations_filename(f.name):
+            openai_jsons.append(f)
+        elif _is_gemini_activity_filename(f.name):
+            activity_jsons.append(f)
+        elif _is_gemini_activity_html_filename(f.name):
+            activity_htmls.append(f)
+        elif suffix == ".json":
+            if not _is_obviously_unrelated_takeout_path(rel_str):
+                other_jsons.append(f)
+        elif suffix == ".jsonl":
+            jsonl_files.append(f)
+        elif suffix == ".zip":
+            zip_files.append(f)
+        elif suffix in (".md", ".txt", ".pdf"):
+            if f.parent == root and not _is_generated_volume_md(rel_str):
+                if suffix == ".md":
+                    try:
+                        with f.open("rb") as fh:
+                            if _is_generated_volume_md(rel_str, fh.read(160)):
+                                continue
+                    except OSError:
+                        pass
+                top_docs.append(f)
+
+    # Filter multiple Google Takeout MyActivity.json files to Gemini/Bard when present
+    if activity_jsons:
+        tagged = [f for f in activity_jsons if _is_gemini_takeout_path(str(f.relative_to(root)))]
+        if tagged:
+            activity_jsons = tagged
+        else:
+            activity_jsons = [
+                f for f in activity_jsons
+                if not _is_obviously_unrelated_takeout_path(str(f.relative_to(root)))
+            ]
+
+    json_parent_dirs = {f.parent.resolve() for f in activity_jsons}
+    if activity_htmls:
+        tagged_html = [f for f in activity_htmls if _is_gemini_takeout_path(str(f.relative_to(root)))]
+        cand_html = tagged_html if tagged_html else [
+            f for f in activity_htmls
+            if not _is_obviously_unrelated_takeout_path(str(f.relative_to(root)))
+        ]
+        activity_htmls = [f for f in cand_html if f.parent.resolve() not in json_parent_dirs]
+
+    # Validate generic .json candidates quickly so config/metadata JSONs aren't picked as exports
+    valid_other_jsons: List[Path] = []
+    if not openai_jsons and not activity_jsons:
+        for f in other_jsons:
+            try:
+                parsed = json.loads(f.read_text(encoding="utf-8-sig", errors="replace"))
+                if detect_json_source(parsed) in ("google", "openai"):
+                    valid_other_jsons.append(f)
+            except Exception:
+                continue
+
+    structured = openai_jsons + activity_jsons + activity_htmls + valid_other_jsons + jsonl_files
+    if structured:
+        # Avoid re-ingesting unextracted .zip copies or subdirectory volume exports alongside raw exports
+        return structured + top_docs
+
+    if zip_files:
+        return zip_files + top_docs
+
+    # Fallback: folder of .md/.txt/.pdf files (e.g. pre-split archive volumes)
+    return [
+        f for f in all_files
+        if f.suffix.lower() in (".md", ".txt", ".pdf")
+        and not _is_generated_volume_md(f.name)
+    ]
+
+
 def ingest_files(
     file_items: Sequence[Tuple[str, bytes]],
     output_dir: Path,
@@ -361,7 +1204,7 @@ def ingest_files(
     replace_existing: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> dict:
-    """Ingest one or more dropped files (.zip, .json, .jsonl, .md, .txt, or .pdf) into output_dir."""
+    """Ingest one or more dropped files (.zip, .json, .jsonl, .html, .md, .txt, .pdf) into output_dir."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -370,6 +1213,17 @@ def ingest_files(
 
     all_pairs: List[Tuple[str, str]] = []
     md_payloads: List[Tuple[str, bytes]] = []
+    detected_sources: Set[str] = set()
+
+    def _consume_json_data(label: str, data_obj: object) -> None:
+        pairs, src = extract_pairs_with_source(data_obj)
+        if pairs:
+            if src in ("google", "openai"):
+                detected_sources.add(src)
+                if progress_callback:
+                    src_name = "Google Gemini" if src == "google" else "OpenAI ChatGPT"
+                    progress_callback(f"Detected {src_name} ({label}): {len(pairs):,} turns...", 0.18)
+            all_pairs.extend(pairs)
 
     for name, raw_bytes in file_items:
         safe_name = Path(name).name
@@ -379,36 +1233,61 @@ def ingest_files(
                 progress_callback(f"Unpacking {safe_name}...", 0.10)
             with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                 members = sorted(zf.namelist())
-                json_members = [
+                structured_jsons, gemini_htmls, fallback_jsons = _select_zip_json_members(members)
+                jsonl_members = [m for m in members if not m.endswith("/") and m.lower().endswith(".jsonl")]
+                has_exports = bool(structured_jsons or gemini_htmls or jsonl_members)
+
+                md_members = [
                     m for m in members
                     if not m.endswith("/")
-                    and (
-                        Path(m).name.lower() == "conversations.json"
-                        or (Path(m).name.lower().startswith("conversations-") and m.lower().endswith(".json"))
-                    )
+                    and m.lower().endswith(".md")
+                    and not (has_exports and _is_generated_volume_md(m))
                 ]
-                md_members = [m for m in members if not m.endswith("/") and m.lower().endswith(".md")]
                 doc_members = [
                     m for m in members
-                    if not m.endswith("/") and Path(m).suffix.lower() in (".txt", ".pdf")
+                    if not m.endswith("/")
+                    and Path(m).suffix.lower() in (".txt", ".pdf")
+                    and not _is_obviously_unrelated_takeout_path(m)
                 ]
-                if json_members:
-                    for jm in json_members:
-                        if progress_callback:
-                            progress_callback(f"Parsing {Path(jm).name}...", 0.15)
-                        data = json.loads(zf.read(jm).decode("utf-8-sig", errors="replace"))
-                        all_pairs.extend(extract_pairs_from_data(data))
-                else:
-                    # Fallback: try any .json file inside the zip
-                    any_json = [m for m in members if not m.endswith("/") and m.lower().endswith(".json")]
-                    for jm in any_json:
+
+                for jm in structured_jsons:
+                    if progress_callback:
+                        progress_callback(f"Parsing {Path(jm).name}...", 0.15)
+                    data = json.loads(zf.read(jm).decode("utf-8-sig", errors="replace"))
+                    _consume_json_data(Path(jm).name, data)
+
+                for hm in gemini_htmls:
+                    if progress_callback:
+                        progress_callback(f"Parsing {Path(hm).name}...", 0.15)
+                    html_text = zf.read(hm).decode("utf-8-sig", errors="replace")
+                    html_pairs = extract_gemini_html_pairs(html_text)
+                    if html_pairs:
+                        detected_sources.add("google")
+                        all_pairs.extend(html_pairs)
+
+                for jlm in jsonl_members:
+                    if progress_callback:
+                        progress_callback(f"Parsing {Path(jlm).name}...", 0.15)
+                    rows = [
+                        json.loads(line)
+                        for line in zf.read(jlm).decode("utf-8-sig", errors="replace").splitlines()
+                        if line.strip()
+                    ]
+                    _consume_json_data(Path(jlm).name, rows)
+
+                if not all_pairs and fallback_jsons:
+                    for jm in fallback_jsons:
                         try:
                             data = json.loads(zf.read(jm).decode("utf-8-sig", errors="replace"))
-                            all_pairs.extend(extract_pairs_from_data(data))
+                            _consume_json_data(Path(jm).name, data)
                         except Exception:
                             continue
+
                 for mm in md_members:
-                    md_payloads.append((Path(mm).name, zf.read(mm)))
+                    md_bytes = zf.read(mm)
+                    if has_exports and _is_generated_volume_md(mm, md_bytes):
+                        continue
+                    md_payloads.append((Path(mm).name, md_bytes))
                 for dm in doc_members:
                     doc_title = Path(dm).name
                     if progress_callback:
@@ -416,11 +1295,12 @@ def ingest_files(
                     extracted = extract_text_from_document(doc_title, zf.read(dm))
                     formatted = f"# **DOCUMENT: {doc_title}**\n\n{extracted}\n".encode("utf-8")
                     md_payloads.append((doc_title, formatted))
+
         elif lower_name.endswith(".json"):
             if progress_callback:
                 progress_callback(f"Parsing {safe_name}...", 0.15)
             data = json.loads(raw_bytes.decode("utf-8-sig", errors="replace"))
-            all_pairs.extend(extract_pairs_from_data(data))
+            _consume_json_data(safe_name, data)
         elif lower_name.endswith(".jsonl"):
             if progress_callback:
                 progress_callback(f"Parsing {safe_name}...", 0.15)
@@ -429,7 +1309,16 @@ def ingest_files(
                 for line in raw_bytes.decode("utf-8-sig", errors="replace").splitlines()
                 if line.strip()
             ]
-            all_pairs.extend(extract_pairs_from_data(rows))
+            _consume_json_data(safe_name, rows)
+        elif lower_name.endswith((".html", ".htm")):
+            html_text = raw_bytes.decode("utf-8-sig", errors="replace")
+            if is_gemini_takeout_html(html_text):
+                if progress_callback:
+                    progress_callback(f"Parsing Google Takeout HTML {safe_name}...", 0.15)
+                html_pairs = extract_gemini_html_pairs(html_text)
+                if html_pairs:
+                    detected_sources.add("google")
+                    all_pairs.extend(html_pairs)
         elif lower_name.endswith(".md"):
             md_payloads.append((safe_name, raw_bytes))
         elif Path(lower_name).suffix in (".txt", ".pdf"):
@@ -442,14 +1331,15 @@ def ingest_files(
     # If only Markdown/document files were provided
     if md_payloads and not all_pairs:
         written_paths = _write_markdown_payloads(md_payloads, output_dir, replace_existing=replace_existing)
-        return {
-            "mode": "markdown_import",
+        summary = {
+            **_source_summary_fields(set(), mode_override="markdown_import"),
             "interactions_total": 0,
             "interactions_kept": 0,
             "interactions_stripped": 0,
             "volumes_written": len(written_paths),
             "volume_files": [p.name for p in written_paths],
         }
+        return summary
 
     if progress_callback:
         progress_callback("Filtering corporate refusals and boilerplate...", 0.22)
@@ -470,11 +1360,80 @@ def ingest_files(
         written_paths.extend(
             _write_markdown_payloads(md_payloads, output_dir, replace_existing=False)
         )
-    return {
-        "mode": "chatgpt_export",
+    summary = {
+        **_source_summary_fields(detected_sources),
         "interactions_total": len(all_pairs),
         "interactions_kept": len(kept_pairs),
         "interactions_stripped": stripped_count,
         "volumes_written": len(written_paths),
         "volume_files": [p.name for p in written_paths],
     }
+    return summary
+
+
+def ingest_path(
+    source_path: Path | str,
+    output_dir: Path | str,
+    blocked_phrases: Optional[Sequence[str]] = None,
+    protected_words: Optional[Sequence[str]] = None,
+    interactions_per_volume: int = INTERACTIONS_PER_VOLUME,
+    replace_existing: bool = False,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+) -> dict:
+    """Discover export files in source_path (file or folder), auto-detect Google/OpenAI, and write volumes."""
+    paths = discover_source_paths(Path(source_path))
+    if not paths:
+        raise ValueError(f"No supported export or document files found in {source_path}")
+    file_items: List[Tuple[str, bytes]] = []
+    for p in paths:
+        if progress_callback:
+            progress_callback(f"Reading {p.name}...", 0.04)
+        file_items.append((p.name, p.read_bytes()))
+    return ingest_files(
+        file_items=file_items,
+        output_dir=Path(output_dir),
+        blocked_phrases=blocked_phrases,
+        protected_words=protected_words,
+        interactions_per_volume=interactions_per_volume,
+        replace_existing=replace_existing,
+        progress_callback=progress_callback,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="GHostPCP Archive Ingester — auto-detects Google Gemini and OpenAI ChatGPT exports."
+    )
+    parser.add_argument("source", help="Source export file (.zip, .json, .html, .md, .txt, .pdf) or folder.")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=str(Path(__file__).resolve().parent / "pcp_data"),
+        help="Target output directory for ghost_pcp_*.md volumes (default: ./pcp_data).",
+    )
+    parser.add_argument("--per-volume", type=int, default=INTERACTIONS_PER_VOLUME, help="Interactions per volume.")
+    parser.add_argument("--replace", action="store_true", help="Backup and replace existing ghost_pcp_*.md volumes.")
+    parser.add_argument("--protect", action="append", default=[], help="Protected word/name to never strip (repeatable).")
+    args = parser.parse_args(argv)
+
+    def _cli_progress(msg: str, frac: float) -> None:
+        print(f"[{int(frac * 100):3d}%] {msg}")
+
+    summary = ingest_path(
+        source_path=args.source,
+        output_dir=args.output,
+        protected_words=args.protect or None,
+        interactions_per_volume=args.per_volume,
+        replace_existing=args.replace,
+        progress_callback=_cli_progress,
+    )
+    print(
+        f"Complete ({summary['source_label']}): {summary['interactions_kept']:,} kept / "
+        f"{summary['interactions_total']:,} total ({summary['interactions_stripped']:,} stripped) -> "
+        f"{summary['volumes_written']} volume(s) in {Path(args.output).resolve()}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

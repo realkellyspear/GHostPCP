@@ -616,6 +616,11 @@ class GHostPCPTests(unittest.TestCase):
             '.pdf',
             'Custom Prefix',
             'chat-attachment-card',
+            'id="persona-modal"',
+            'id="persona-pill"',
+            'id="ingest-persona-name"',
+            'id="ingest-user-name"',
+            'id="ingest-never-forget"',
         ):
             self.assertIn(control_id, html)
 
@@ -630,6 +635,13 @@ class GHostPCPTests(unittest.TestCase):
             "closeArchiveModal",
             "openRemoteModal",
             "closeRemoteModal",
+            "openPersonaModal",
+            "closePersonaModal",
+            "fetchPersonas",
+            "choosePersona",
+            "openPersonaEditor",
+            "savePersonaEditor",
+            "startStagedIngest",
             "saveAndClearChat",
             "startNewChat",
             "sendMessage",
@@ -1112,6 +1124,327 @@ class GHostPCPTests(unittest.TestCase):
                         ghost_pcp.STATE.loaded_context_size = orig_n_ctx
             finally:
                 ghost_pcp.PCP_INDEX = orig_pcp
+
+    def test_gemini_parser_source_detection_folder_and_cli_ingest(self):
+        from pcp_ingest import (
+            detect_json_source,
+            discover_source_paths,
+            extract_gemini_html_pairs,
+            extract_pairs_with_source,
+            html_to_markdown,
+            ingest_path,
+            main as ingest_cli_main,
+        )
+
+        # 1. HTML-to-Markdown conversion fidelity
+        md_out = html_to_markdown(
+            "<h2>Station Log</h2>"
+            "<p>Hey <strong>Kelly</strong>, check <em>this</em> out &amp; stay sharp.</p>"
+            "<ul><li>Alpha <code>ping</code></li><li>Beta</li></ul>"
+            '<pre><code class="language-python">print("&lt;div&gt;")</code></pre>'
+        )
+        self.assertIn("## Station Log", md_out)
+        self.assertIn("Hey **Kelly**", md_out)
+        self.assertIn("*this*", md_out)
+        self.assertIn("& stay sharp", md_out)
+        self.assertIn("- Alpha `ping`", md_out)
+        self.assertIn("```python", md_out)
+
+        # 2. Google Gemini MyActivity.json (both 'date' and 'time' fields, Uploaded skip, Search skip)
+        gemini_activity = [
+            {
+                "header": "Gemini Apps",
+                "title": "Prompted Remember the lighthouse on Pine Ridge?",
+                "date": "2025-09-14T18:22:10Z",
+                "safeHtmlItem": [
+                    {"html": "<p>Of course, <b>Kelly</b>. The brass lantern at Pine Ridge never goes out.</p>"}
+                ],
+            },
+            {
+                "header": "Gemini Apps",
+                "title": "Uploaded blueprint.png",
+                "time": "2025-09-14T18:20:00Z",
+            },
+            {
+                "header": "Gemini Apps",
+                "title": "Prompted How do you feel?",
+                "time": "2025-09-14T18:15:00Z",
+                "safeHtmlItem": [{"html": "<p>As an AI language model, I do not have feelings.</p>"}],
+            },
+            {
+                "header": "Search",
+                "title": "Searched for weather today",
+                "time": "2025-09-14T18:10:00Z",
+                "safeHtmlItem": [{"html": "<p>Sunny 72F</p>"}],
+            },
+        ]
+        self.assertEqual(detect_json_source(gemini_activity), "google")
+        pairs, detected = extract_pairs_with_source(gemini_activity)
+        self.assertEqual(detected, "google")
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0][0], "Remember the lighthouse on Pine Ridge?")
+        self.assertIn("**Kelly**", pairs[0][1])
+
+        # 3. OpenAI detection vs Google detection
+        openai_sample = [
+            {
+                "title": "OpenAI Chat",
+                "mapping": {
+                    "r": {"id": "r", "parent": None, "children": ["u"]},
+                    "u": {
+                        "id": "u",
+                        "parent": "r",
+                        "children": ["a"],
+                        "message": {"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["Callsign?"]}},
+                    },
+                    "a": {
+                        "id": "a",
+                        "parent": "u",
+                        "children": [],
+                        "message": {"author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["Vanguard-7."]}},
+                    },
+                },
+            }
+        ]
+        self.assertEqual(detect_json_source(openai_sample), "openai")
+
+        # 4. Takeout MyActivity.html parsing + archive_browser.html rejection
+        takeout_html = """<!doctype html><html><body>
+        <div class="outer-cell mdl-cell">
+          <div class="header-cell"><p>Gemini Apps</p></div>
+          <div class="content-cell">Prompted Where did we park the boat?<br>Sep 14, 2025, 6:00 PM<br><p>Slip <b>14</b> at North Harbor.</p></div>
+        </div>
+        <div class="outer-cell mdl-cell">
+          <div class="header-cell"><p>Search</p></div>
+          <div class="content-cell">Searched for harbor hours<br><p>Open 24h</p></div>
+        </div>
+        </body></html>"""
+        html_pairs = extract_gemini_html_pairs(takeout_html)
+        self.assertEqual(len(html_pairs), 1)
+        self.assertEqual(html_pairs[0][0], "Where did we park the boat?")
+        self.assertIn("Slip **14** at North Harbor.", html_pairs[0][1])
+        self.assertEqual(extract_gemini_html_pairs("<html><body><p>Takeout browser</p></body></html>"), [])
+
+        # 5. Source folder discovery avoids duplicate zips / pre-split md volumes / Search Takeout / archive_browser.html
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gemini_src = root / "september_gemini"
+            gemini_dir = gemini_src / "Takeout" / "My Activity" / "Gemini Apps"
+            search_dir = gemini_src / "Takeout" / "My Activity" / "Search"
+            old_out_dir = gemini_src / "EXPORT_VOLUMES"
+            gemini_dir.mkdir(parents=True)
+            search_dir.mkdir(parents=True)
+            old_out_dir.mkdir(parents=True)
+
+            (gemini_dir / "MyActivity.json").write_text(json.dumps(gemini_activity), encoding="utf-8")
+            (search_dir / "MyActivity.json").write_text(
+                json.dumps([{"header": "Search", "title": "Searched for cats"}]),
+                encoding="utf-8",
+            )
+            (gemini_src / "Takeout" / "archive_browser.html").write_text("<html>archive</html>", encoding="utf-8")
+            (old_out_dir / "vol_1.md").write_text("# ARCHIVE VOLUME 1\nduplicate", encoding="utf-8")
+            with zipfile.ZipFile(gemini_src / "takeout.zip", "w") as zf:
+                zf.writestr("Takeout/My Activity/Gemini Apps/MyActivity.json", json.dumps(gemini_activity))
+
+            discovered = discover_source_paths(gemini_src)
+            self.assertEqual([p.name for p in discovered], ["MyActivity.json"])
+            self.assertIn("Gemini Apps", str(discovered[0]))
+
+            out_vol_dir = root / "out_gemini"
+            summary = ingest_path(gemini_src, out_vol_dir)
+            self.assertEqual(summary["mode"], "gemini_export")
+            self.assertEqual(summary["source_type"], "google")
+            self.assertEqual(summary["interactions_total"], 2)
+            self.assertEqual(summary["interactions_stripped"], 1)
+            self.assertEqual(summary["interactions_kept"], 1)
+            vol_text = (out_vol_dir / "ghost_pcp_01.md").read_text(encoding="utf-8")
+            self.assertIn("Remember the lighthouse on Pine Ridge?", vol_text)
+            self.assertIn("**Kelly**", vol_text)
+            self.assertNotIn("duplicate", vol_text)
+
+            # OpenAI split conversations-000.json folder discovery + CLI invocation
+            openai_src = root / "openai_folder"
+            openai_src.mkdir()
+            (openai_src / "conversations-000.json").write_text(json.dumps(openai_sample), encoding="utf-8")
+            (openai_src / "user.json").write_text(json.dumps({"id": "user-123"}), encoding="utf-8")
+            cli_out = root / "out_cli"
+            rc = ingest_cli_main([str(openai_src), "-o", str(cli_out)])
+            self.assertEqual(rc, 0)
+            self.assertIn("Vanguard-7.", (cli_out / "ghost_pcp_01.md").read_text(encoding="utf-8"))
+
+    def test_multi_persona_isolated_folders_and_onboarding(self):
+        import ghost_pcp
+        from pcp_retrieval import PCPIndex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "pcp_data"
+            data_dir.mkdir(parents=True)
+            settings_file = root / "ghost_pcp_settings.json"
+            settings_file.write_text(json.dumps({"system_prompt": ""}), encoding="utf-8")
+
+            # Seed an existing legacy volume right in pcp_data root (must stay preserved!)
+            (data_dir / "ghost_pcp_01.md").write_text(
+                "# **ARCHIVE VOLUME 1**\n\n**USER:** Legacy question\n\n**AI:** Legacy answer about Pine Ridge.\n",
+                encoding="utf-8",
+            )
+
+            gemini_src = root / "gemini_source"
+            gemini_src.mkdir()
+            (gemini_src / "MyActivity.json").write_text(
+                json.dumps([
+                    {
+                        "header": "Gemini Apps",
+                        "title": "Prompted Where is our hideout?",
+                        "date": "2025-09-10T10:00:00Z",
+                        "safeHtmlItem": [{"html": "<p>Cabin <b>Seven</b> by the cedar creek.</p>"}],
+                    }
+                ]),
+                encoding="utf-8",
+            )
+
+            openai_zip_buf = io.BytesIO()
+            with zipfile.ZipFile(openai_zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(
+                    "conversations.json",
+                    json.dumps([
+                        {
+                            "title": "Nova Chat",
+                            "mapping": {
+                                "r": {"id": "r", "parent": None, "children": ["u"]},
+                                "u": {
+                                    "id": "u",
+                                    "parent": "r",
+                                    "children": ["a"],
+                                    "message": {"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["What is our ship name?"]}},
+                                },
+                                "a": {
+                                    "id": "a",
+                                    "parent": "u",
+                                    "children": [],
+                                    "message": {"author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["The Nightjar."]}},
+                                },
+                            },
+                        }
+                    ]),
+                )
+
+            orig_pcp = ghost_pcp.PCP_INDEX
+            orig_conv = list(ghost_pcp.STATE.conversation)
+            try:
+                with (
+                    patch.object(ghost_pcp, "PCP_DATA_DIR", data_dir),
+                    patch.object(ghost_pcp, "PAIRING_TOKEN_PATH", data_dir / ".pairing_token"),
+                    patch.object(ghost_pcp, "SETTINGS_PATH", settings_file),
+                    patch.object(ghost_pcp, "PCPIndex", lambda d, **kw: PCPIndex(d, cache_dir=d, model=FakeEmbedder(), cache_only=kw.get("cache_only", False))),
+                    TestClient(ghost_pcp.app) as client,
+                ):
+                    # 1. Existing root archive shows up as an initial persona without moving files
+                    res0 = client.get("/v1/personas")
+                    self.assertEqual(res0.status_code, 200)
+                    self.assertEqual(len(res0.json()["personas"]), 1)
+                    self.assertEqual(res0.json()["personas"][0]["folder"], ".")
+
+                    # 2. Ingest local Gemini folder into a brand new persona with onboarding answers
+                    res_local = client.post(
+                        "/v1/pcp/ingest-local",
+                        json={
+                            "paths": [str(gemini_src)],
+                            "persona_id": "__new__",
+                            "persona_name": "Orion",
+                            "user_name": "Kelly",
+                            "never_forget": "Never forget Cabin Seven by the cedar creek.",
+                            "persona_notes": "Speak gently and directly.",
+                            "tts_voice": "silas",
+                        },
+                    )
+                    self.assertEqual(res_local.status_code, 200)
+
+                    # Wait for background ingest thread to complete
+                    for _ in range(100):
+                        st = client.get("/v1/pcp/status").json()
+                        if not st["ingesting"]:
+                            break
+                        import time
+                        time.sleep(0.05)
+                    self.assertFalse(st["ingesting"])
+                    self.assertIsNone(st["error"])
+                    self.assertEqual(st["last_result"]["source_type"], "google")
+
+                    orion_dir = data_dir / "personas" / "orion"
+                    self.assertTrue((orion_dir / "ghost_pcp_01.md").is_file())
+                    self.assertTrue((orion_dir / "embeddings.npz").is_file())
+                    self.assertIn("Cabin **Seven**", (orion_dir / "ghost_pcp_01.md").read_text(encoding="utf-8"))
+
+                    # 3. Upload OpenAI zip into a second persona ("Nova")
+                    res_up = client.post(
+                        "/v1/pcp/ingest",
+                        files={"files": ("nova_export.zip", openai_zip_buf.getvalue(), "application/zip")},
+                        data={
+                            "persona_id": "__new__",
+                            "persona_name": "Nova",
+                            "user_name": "Captain",
+                            "never_forget": "We built The Nightjar together.",
+                            "tts_voice": "kara",
+                        },
+                    )
+                    self.assertEqual(res_up.status_code, 200)
+                    for _ in range(100):
+                        st = client.get("/v1/pcp/status").json()
+                        if not st["ingesting"]:
+                            break
+                        import time
+                        time.sleep(0.05)
+                    self.assertFalse(st["ingesting"])
+                    self.assertEqual(st["last_result"]["source_type"], "openai")
+
+                    nova_dir = data_dir / "personas" / "nova"
+                    self.assertTrue((nova_dir / "ghost_pcp_01.md").is_file())
+
+                    # 4. Save a conversation while Nova is active -> goes ONLY to Nova's folder
+                    client.post("/v1/chat/history", json={"messages": [{"role": "user", "content": "Checking reactor"}]})
+                    save_nova = client.post(
+                        "/v1/pcp/save-session",
+                        json={
+                            "messages": [
+                                {"role": "user", "content": "How is The Nightjar holding up?"},
+                                {"role": "assistant", "content": "Engines are warm, Captain."},
+                            ]
+                        },
+                    )
+                    self.assertEqual(save_nova.status_code, 200)
+                    self.assertIn("Engines are warm, Captain.", (nova_dir / "ghost_pcp_02.md").read_text(encoding="utf-8"))
+                    self.assertFalse((orion_dir / "ghost_pcp_02.md").exists())
+
+                    # 5. Switch to Orion -> Orion's folder becomes active, chat history switches cleanly
+                    sel_orion = client.post("/v1/personas/orion/select")
+                    self.assertEqual(sel_orion.status_code, 200)
+                    self.assertEqual(sel_orion.json()["persona"]["name"], "Orion")
+                    self.assertEqual(client.get("/v1/pcp/status").json()["data_dir"], str(orion_dir.resolve()))
+
+                    # 6. Grounding prompt includes Orion's name, what he calls the user, and what to never forget
+                    req_orion = ghost_pcp.ChatRequest(
+                        model="Qwen3-14B-Q5_K_M.gguf",
+                        persona_id="orion",
+                        messages=[{"role": "user", "content": "Where is our hideout?"}],
+                    )
+                    prepared, _ = ghost_pcp._prepare_pcp_messages(req_orion)
+                    sys_content = prepared[0]["content"]
+                    self.assertIn("Your name is Orion.", sys_content)
+                    self.assertIn("You call the user Kelly.", sys_content)
+                    self.assertIn("Never forget Cabin Seven by the cedar creek.", sys_content)
+                    self.assertIn("Cabin **Seven**", sys_content)
+
+                    # 7. Delete Nova persona + folder cleanly while keeping Orion and legacy intact
+                    del_res = client.delete("/v1/personas/nova?delete_files=true")
+                    self.assertEqual(del_res.status_code, 200)
+                    self.assertFalse(nova_dir.exists())
+                    self.assertTrue((orion_dir / "ghost_pcp_01.md").is_file())
+                    self.assertTrue((data_dir / "ghost_pcp_01.md").is_file())
+            finally:
+                ghost_pcp.PCP_INDEX = orig_pcp
+                with ghost_pcp.STATE._history_lock:
+                    ghost_pcp.STATE.conversation = orig_conv
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 Public License v3.0 or later (see `LICENSE`). Bundled third-party components
 and models retain their own licenses.
 
-The standalone Windows release bundle (`GHostPCP-v1.1.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
+The standalone Windows release bundle (`GHostPCP-v1.2.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
 
 ---
 

@@ -295,7 +295,7 @@ if __name__ == "__main__":
     print(f"Staging clean first-time-user test folder at: {sandbox}")
     stage_clean_sandbox(sandbox, link_sample_gguf=True)
 
-    release_zip = ROOT.parent / "GHostPCP-v1.1.0-win64.zip"
+    release_zip = ROOT.parent / "GHostPCP-v1.2.0-win64.zip"
     print(f"Packaging distributable GitHub Release archive: {release_zip} ...")
     build_release_zip(sandbox, release_zip)
     print(f"Done! Release zip size: {release_zip.stat().st_size / (1024**2):.1f} MB")

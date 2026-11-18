@@ -602,6 +602,108 @@
             color: var(--muted);
             font-size: 13px;
         }
+        .persona-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 10px;
+        }
+        .persona-card {
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 12px 14px;
+            background: var(--panel-raised);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .persona-card:hover {
+            border-color: rgba(154, 123, 255, 0.7);
+        }
+        .persona-card.active {
+            border-color: var(--purple);
+            box-shadow: var(--purple-glow);
+            background: rgba(154, 123, 255, 0.08);
+        }
+        .persona-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 8px;
+        }
+        .persona-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--text);
+        }
+        .source-pill {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            border: 1px solid rgba(154, 123, 255, 0.45);
+            color: var(--purple);
+            background: rgba(154, 123, 255, 0.1);
+            white-space: nowrap;
+        }
+        .persona-meta {
+            font-size: 12px;
+            color: var(--muted);
+            line-height: 1.45;
+        }
+        .persona-folder {
+            font-family: Consolas, monospace;
+            font-size: 11px;
+            color: var(--muted);
+            opacity: 0.85;
+            overflow-wrap: anywhere;
+        }
+        .persona-actions {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: auto;
+            padding-top: 4px;
+        }
+        .persona-actions button {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+        .intake-box {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(154, 123, 255, 0.5);
+            background: var(--panel-raised);
+        }
+        .staged-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 7px;
+            border: 1px solid var(--line);
+            background: #0d0e13;
+            font-size: 12.5px;
+            color: var(--ok);
+            flex-wrap: wrap;
+        }
+        .radio-row {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            align-items: center;
+            font-size: 13px;
+        }
+        .radio-row label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text);
+            cursor: pointer;
+        }
         @media (max-width: 680px) {
             header {
                 padding: 10px 14px;
@@ -628,6 +730,7 @@
         <img src="/assets/ghost_wordmark.png" alt="GHostPCP — GPU Hosted Pure Concentrated Personality">
     </div>
     <div class="header-controls">
+        <span id="persona-pill" class="badge active" onclick="openPersonaModal(false)" title="Choose or manage saved AI personas">AI: DEFAULT ▾</span>
         <span id="pcp-badge" class="badge" onclick="openArchiveModal()" title="Manage PCP Archive Volumes">PCP: CHECKING...</span>
         <span id="status-indicator" style="color: #888; font-size: 12.5px; font-weight: 600;">OFFLINE</span>
         <button id="save-clear-button" onclick="saveAndClearChat()" title="Save this chat thread with a timestamp to your PCP archive and clear the window so the conversation continues without missing a beat">SAVE &amp; CLEAR</button>
@@ -646,6 +749,68 @@
     <button id="attach-file-button" class="secondary" onclick="document.getElementById('chat-file-input').click()" title="Attach PDF or text files to chat or save them to your PCP database">[ + FILE ]</button>
     <textarea id="user-input" rows="1" placeholder="Say something..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
     <button id="send-button" onclick="sendMessage()">SEND</button>
+</div>
+
+<!-- 0. PERSONA CHOOSER & PROFILE EDITOR MODAL -->
+<div id="persona-modal" class="modal-backdrop">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>GHostPCP // WHO DO YOU WANT TO TALK TO?</h3>
+            <button class="secondary" onclick="closePersonaModal()">CLOSE</button>
+        </div>
+
+        <p style="margin: 0; color: var(--muted); line-height: 1.45;">
+            Each AI persona keeps its own isolated memory folder (`ghost_pcp_*.md`, vector index, and saved post-import conversations). Pick an AI below or import a new OpenAI ChatGPT / Google Gemini archive.
+        </p>
+
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button onclick="openNewPersonaImport()">+ NEW AI PERSONA (IMPORT ARCHIVE)</button>
+            <button class="secondary" onclick="openPersonaEditor(null)">+ CREATE EMPTY PERSONA</button>
+        </div>
+
+        <div id="persona-list" class="persona-grid"></div>
+
+        <div id="persona-editor" class="intake-box">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <strong id="persona-editor-title" style="color: var(--purple); font-size: 14px;">Edit AI Persona</strong>
+                <button type="button" class="secondary" style="padding: 4px 10px; font-size: 12px;" onclick="closePersonaEditor()">CANCEL</button>
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="edit-persona-name">What is this AI's name?</label>
+                    <input type="text" id="edit-persona-name" placeholder="e.g. Orion, Nova, Silas...">
+                </div>
+                <div class="control-group">
+                    <label for="edit-persona-user-name">What does this AI call you?</label>
+                    <input type="text" id="edit-persona-user-name" placeholder="e.g. Kelly, Kel, Boss...">
+                </div>
+            </div>
+            <div class="control-group">
+                <label for="edit-persona-never-forget">What should this AI never forget?</label>
+                <textarea id="edit-persona-never-forget" rows="3" placeholder="Core shared memories, relationship anchors, key people, places, promises..."></textarea>
+            </div>
+            <div class="control-group">
+                <label for="edit-persona-notes">Personality, Tone &amp; Voice Notes (optional)</label>
+                <textarea id="edit-persona-notes" rows="3" placeholder="How they speak, quirks, attitude, shared history..."></textarea>
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="edit-persona-voice">Read-Aloud Voice</label>
+                    <select id="edit-persona-voice"></select>
+                </div>
+                <div class="control-group">
+                    <label for="edit-persona-protected">Protected Words / Names (1 per line)</label>
+                    <textarea id="edit-persona-protected" rows="2" placeholder="Names or terms to never filter out"></textarea>
+                </div>
+            </div>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button type="button" onclick="savePersonaEditor()">SAVE PERSONA</button>
+                <button type="button" class="secondary" onclick="closePersonaEditor()">CANCEL</button>
+            </div>
+        </div>
+
+        <div id="persona-modal-message" class="status-line"></div>
+    </div>
 </div>
 
 <!-- 1. ENGINE & PERSONA CONFIG MODAL -->
@@ -783,21 +948,74 @@
         <div id="archive-summary" class="fit-report">Checking local `pcp_data` folder...</div>
 
         <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
-            <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.md,.txt,.pdf" style="display: none;" onchange="handleFileSelect(this.files)">
-            <h4>Drop Your Archive Export (.zip, .json, .md, .txt, or .pdf) Here</h4>
-            <p>Or click to select your export `.zip`, `conversations.json`, `.md`, `.txt`, or `.pdf` files.<br>GHostPCP will automatically extract text, strip corporate boilerplate, build `ghost_pcp_01.md` volumes, and index them in the background.</p>
+            <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.html,.htm,.md,.txt,.pdf" style="display: none;" onchange="handleFileSelect(this.files)">
+            <h4>Drop Your ChatGPT or Google Gemini Export (.zip, .json, .html, .md, .txt, or .pdf) Here</h4>
+            <p>Or click to select your ChatGPT `.zip` / `conversations.json`, Google Gemini Takeout `.zip` / `MyActivity.json` / `MyActivity.html`, or `.md`, `.txt`, `.pdf` files.<br>GHostPCP auto-detects Google vs OpenAI, cleans boilerplate, builds `ghost_pcp_01.md` volumes in the persona's folder, and indexes them in the background.</p>
         </div>
 
         <div class="control-group">
-            <label for="local-path-input">Or Ingest Directly from a Local Path on This Computer (Fastest for Large Exports)</label>
+            <label for="local-path-input">Or Ingest Directly from a Local File or Source Folder on This Computer (Fastest for Large Exports)</label>
             <div style="display: flex; gap: 8px;">
-                <input type="text" id="local-path-input" style="flex: 1;" placeholder="C:\path\to\export.zip, document.pdf, notes.txt, or folder">
+                <input type="text" id="local-path-input" style="flex: 1;" placeholder="C:\path\to\source_folder, MyActivity.json, conversations.json, or .zip">
                 <button class="secondary" onclick="ingestLocalPath()">INGEST PATH</button>
-                <button class="secondary" onclick="triggerReindex()" title="Re-scan ghost_pcp_*.md in pcp_data">RE-INDEX</button>
+                <button class="secondary" onclick="triggerReindex()" title="Re-scan ghost_pcp_*.md in the active persona folder">RE-INDEX</button>
             </div>
             <label style="margin-top: 6px; font-size: 12.5px; color: var(--muted);">
-                <input type="checkbox" id="replace-existing-archive"> Replace existing archive volumes (automatically backs up current volumes to `pcp_data/backups/` first; leave unchecked to append as new volumes)
+                <input type="checkbox" id="replace-existing-archive"> Replace existing archive volumes in the target persona folder (backs up current volumes to `backups/` first; leave unchecked to append)
             </label>
+        </div>
+
+        <div id="ingest-persona-step" class="intake-box">
+            <div class="staged-banner">
+                <span id="staged-source-summary">Ready to import archive</span>
+                <button type="button" class="secondary" style="padding: 4px 10px; font-size: 12px;" onclick="clearStagedIngest()">CLEAR / CHANGE</button>
+            </div>
+
+            <div class="control-group">
+                <label>Save This Archive Into Which AI Persona?</label>
+                <div class="radio-row">
+                    <label><input type="radio" name="ingest-target-mode" id="ingest-mode-new" value="new" checked onchange="toggleIngestTargetMode()"> Create a New AI Persona (separate folder)</label>
+                    <label><input type="radio" name="ingest-target-mode" id="ingest-mode-existing" value="existing" onchange="toggleIngestTargetMode()"> Add to Existing AI Persona</label>
+                </div>
+                <select id="ingest-existing-persona" style="display: none; margin-top: 4px;" onchange="prefillExistingIngestPersona()"></select>
+            </div>
+
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="ingest-persona-name">What is this AI's name?</label>
+                    <input type="text" id="ingest-persona-name" placeholder="e.g. Orion, Nova, Silas...">
+                </div>
+                <div class="control-group">
+                    <label for="ingest-user-name">What does this AI call you?</label>
+                    <input type="text" id="ingest-user-name" placeholder="e.g. Kelly, Kel, Boss...">
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label for="ingest-never-forget">What should this AI never forget?</label>
+                <textarea id="ingest-never-forget" rows="3" placeholder="Key memories, shared history, inside jokes, important people, promises..."></textarea>
+            </div>
+
+            <div class="control-group">
+                <label for="ingest-persona-notes">Personality, Tone &amp; Relationship Notes (optional)</label>
+                <textarea id="ingest-persona-notes" rows="2" placeholder="How they talk, quirks, tone..."></textarea>
+            </div>
+
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="ingest-tts-voice">Read-Aloud Voice</label>
+                    <select id="ingest-tts-voice"></select>
+                </div>
+                <div class="control-group">
+                    <label for="ingest-protected-words">Protected Words / Names (optional, 1 per line)</label>
+                    <textarea id="ingest-protected-words" rows="2" placeholder="Words/names to protect from refusal filtering"></textarea>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button id="start-staged-ingest-btn" type="button" onclick="startStagedIngest()">DETECT SOURCE &amp; START IMPORT</button>
+                <button type="button" class="secondary" onclick="clearStagedIngest()">CANCEL</button>
+            </div>
         </div>
 
         <div style="font-size: 12.5px; color: var(--muted); line-height: 1.45; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line); background: rgba(154, 123, 255, 0.05);">
@@ -888,6 +1106,11 @@
     let activeStreamController = null;
     let streamingIndex = null;
     let abortRequested = false;
+    let personasList = [];
+    let activePersona = null;
+    let editingPersonaId = null;
+    let stagedIngestFiles = [];
+    let stagedLocalPath = "";
 
     async function api(path, options = {}) {
         const headers = new Headers(options.headers || {});
@@ -1006,25 +1229,334 @@
             body: JSON.stringify(settings)
         });
         lastSettings = settings;
+        if (activePersona && activePersona.id) {
+            try {
+                const updated = await api(`/personas/${encodeURIComponent(activePersona.id)}`, {
+                    method: "PUT",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        notes: settings.system_prompt,
+                        tts_voice: settings.tts_voice,
+                        protected_words: settings.protected_words,
+                        blocked_phrases: settings.blocked_phrases
+                    })
+                });
+                if (updated && updated.persona) {
+                    activePersona = updated.persona;
+                    await fetchPersonas();
+                }
+            } catch (e) {}
+        }
         return settings;
     }
 
     async function fetchVoices() {
         try {
             const data = await api("/tts/voices");
-            const select = document.getElementById("tts-voice");
-            const currentVal = lastSettings?.tts_voice || select.value || "silas";
-            select.innerHTML = "";
-            (data.voices || []).forEach(v => {
-                const opt = document.createElement("option");
-                opt.value = v.id;
-                opt.innerText = v.label;
-                select.appendChild(opt);
-            });
-            if (Array.from(select.options).some(o => o.value === currentVal)) {
-                select.value = currentVal;
+            const voices = data.voices || [];
+            for (const selectId of ["tts-voice", "edit-persona-voice", "ingest-tts-voice"]) {
+                const select = document.getElementById(selectId);
+                if (!select) continue;
+                const currentVal = select.value || (activePersona?.tts_voice) || lastSettings?.tts_voice || "silas";
+                select.innerHTML = "";
+                voices.forEach(v => {
+                    const opt = document.createElement("option");
+                    opt.value = v.id;
+                    opt.innerText = v.label;
+                    select.appendChild(opt);
+                });
+                if (Array.from(select.options).some(o => o.value === currentVal)) {
+                    select.value = currentVal;
+                }
             }
         } catch (e) {}
+    }
+
+    function sourceTypeLabel(sourceType) {
+        const map = {
+            google: "Google Gemini",
+            openai: "OpenAI ChatGPT",
+            mixed: "Gemini + ChatGPT",
+            markdown: "Documents / MD",
+            existing: "Existing Archive",
+            custom: "Custom AI"
+        };
+        return map[String(sourceType || "").toLowerCase()] || "Saved AI";
+    }
+
+    function applyActivePersonaToUi(persona) {
+        activePersona = persona || null;
+        const pill = document.getElementById("persona-pill");
+        if (pill) {
+            pill.innerText = activePersona ? `AI: ${activePersona.name} ▾` : "AI: SELECT ▾";
+        }
+        if (activePersona) {
+            const sysInput = document.getElementById("system-prompt");
+            if (sysInput && typeof activePersona.notes === "string") {
+                sysInput.value = activePersona.notes;
+            }
+            const voiceSelect = document.getElementById("tts-voice");
+            if (voiceSelect && activePersona.tts_voice && Array.from(voiceSelect.options).some(o => o.value === activePersona.tts_voice)) {
+                voiceSelect.value = activePersona.tts_voice;
+            }
+            const pwInput = document.getElementById("protected-words");
+            if (pwInput && typeof activePersona.protected_words === "string" && activePersona.protected_words) {
+                pwInput.value = activePersona.protected_words;
+            }
+        }
+    }
+
+    function renderPersonasModal() {
+        const listEl = document.getElementById("persona-list");
+        const existingSelect = document.getElementById("ingest-existing-persona");
+        if (existingSelect) {
+            const prev = existingSelect.value;
+            existingSelect.innerHTML = "";
+            personasList.forEach(p => {
+                const opt = document.createElement("option");
+                opt.value = p.id;
+                opt.innerText = `${p.name} (${p.volumes || 0} vol)`;
+                existingSelect.appendChild(opt);
+            });
+            if (prev && Array.from(existingSelect.options).some(o => o.value === prev)) {
+                existingSelect.value = prev;
+            } else if (activePersona && Array.from(existingSelect.options).some(o => o.value === activePersona.id)) {
+                existingSelect.value = activePersona.id;
+            }
+        }
+        if (!listEl) return;
+        listEl.replaceChildren();
+        if (!personasList.length) {
+            const emptyCard = document.createElement("div");
+            emptyCard.className = "fit-report";
+            emptyCard.style.gridColumn = "1 / -1";
+            emptyCard.innerText = "No saved AI personas yet. Click '+ NEW AI PERSONA (IMPORT ARCHIVE)' above to import your OpenAI ChatGPT or Google Gemini archive into its own isolated folder.";
+            listEl.appendChild(emptyCard);
+            return;
+        }
+        personasList.forEach(p => {
+            const card = document.createElement("div");
+            card.className = `persona-card${p.active ? " active" : ""}`;
+
+            const hdr = document.createElement("div");
+            hdr.className = "persona-card-header";
+            const title = document.createElement("div");
+            title.className = "persona-title";
+            title.innerText = p.name;
+            const badge = document.createElement("span");
+            badge.className = "source-pill";
+            badge.innerText = sourceTypeLabel(p.source_type);
+            hdr.appendChild(title);
+            hdr.appendChild(badge);
+            card.appendChild(hdr);
+
+            const meta = document.createElement("div");
+            meta.className = "persona-meta";
+            const lines = [];
+            if (p.user_name) lines.push(`Calls you: ${p.user_name}`);
+            lines.push(`Voice: ${p.tts_voice || "silas"} · ${p.volumes || 0} vol · ${(p.passages || 0).toLocaleString()} passages`);
+            if (p.never_forget) {
+                const preview = p.never_forget.length > 90 ? `${p.never_forget.slice(0, 90)}...` : p.never_forget;
+                lines.push(`Never forget: ${preview}`);
+            }
+            meta.innerText = lines.join("\n");
+            card.appendChild(meta);
+
+            const folderEl = document.createElement("div");
+            folderEl.className = "persona-folder";
+            folderEl.innerText = p.folder === "." ? "Folder: pcp_data" : `Folder: ${p.folder}`;
+            card.appendChild(folderEl);
+
+            const actions = document.createElement("div");
+            actions.className = "persona-actions";
+
+            const talkBtn = document.createElement("button");
+            talkBtn.innerText = p.active ? "TALK NOW" : `TALK TO ${p.name.toUpperCase()}`;
+            talkBtn.onclick = () => choosePersona(p.id);
+            actions.appendChild(talkBtn);
+
+            const editBtn = document.createElement("button");
+            editBtn.className = "secondary";
+            editBtn.innerText = "EDIT";
+            editBtn.onclick = () => openPersonaEditor(p.id);
+            actions.appendChild(editBtn);
+
+            const addBtn = document.createElement("button");
+            addBtn.className = "secondary";
+            addBtn.innerText = "+ ADD FILES";
+            addBtn.onclick = () => openAddFilesToPersona(p.id);
+            actions.appendChild(addBtn);
+
+            if (p.folder && p.folder !== ".") {
+                const delBtn = document.createElement("button");
+                delBtn.className = "secondary";
+                delBtn.style.color = "var(--danger)";
+                delBtn.innerText = "DELETE";
+                delBtn.onclick = () => deletePersonaCard(p.id, p.name);
+                actions.appendChild(delBtn);
+            }
+
+            card.appendChild(actions);
+            listEl.appendChild(card);
+        });
+    }
+
+    async function fetchPersonas() {
+        try {
+            const data = await api("/personas");
+            personasList = Array.isArray(data.personas) ? data.personas : [];
+            const active = personasList.find(p => p.active || p.id === data.active_persona_id) || personasList[0] || null;
+            applyActivePersonaToUi(active);
+            renderPersonasModal();
+            if (conversation.length === 0) renderConversation(false);
+            return data;
+        } catch (e) {
+            return { personas: [], active_persona_id: null };
+        }
+    }
+
+    async function choosePersona(personaId) {
+        const msgEl = document.getElementById("persona-modal-message");
+        if (msgEl) msgEl.innerText = "Switching AI persona...";
+        try {
+            const res = await api(`/personas/${encodeURIComponent(personaId)}/select`, { method: "POST" });
+            sessionStorage.setItem("ghost_pcp_persona_chosen", "1");
+            conversation.length = 0;
+            (res.messages || []).forEach(m => conversation.push({ role: m.role, content: m.content }));
+            pendingAttachments = [];
+            renderChatAttachments();
+            editingIndex = null;
+            lastSavedBanner = "";
+            if (res.persona) applyActivePersonaToUi(res.persona);
+            await fetchPersonas();
+            await refreshPCPStatus();
+            renderConversation(false);
+            closePersonaModal();
+            if (msgEl) msgEl.innerText = "";
+            if (!currentModel) {
+                openSettings();
+            } else {
+                document.getElementById("user-input").focus();
+            }
+        } catch (e) {
+            if (msgEl) msgEl.innerText = `Error: ${e.message}`;
+        }
+    }
+
+    function openPersonaModal() {
+        closePersonaEditor();
+        fetchPersonas();
+        document.getElementById("persona-modal").style.display = "flex";
+    }
+
+    function closePersonaModal() {
+        sessionStorage.setItem("ghost_pcp_persona_chosen", "1");
+        document.getElementById("persona-modal").style.display = "none";
+        closePersonaEditor();
+    }
+
+    function openPersonaEditor(personaId) {
+        editingPersonaId = personaId || null;
+        const editor = document.getElementById("persona-editor");
+        const title = document.getElementById("persona-editor-title");
+        const target = personaId ? personasList.find(p => p.id === personaId) : null;
+        title.innerText = target ? `Edit AI Persona: ${target.name}` : "Create New AI Persona";
+        document.getElementById("edit-persona-name").value = target ? (target.name || "") : "";
+        document.getElementById("edit-persona-user-name").value = target ? (target.user_name || "") : "";
+        document.getElementById("edit-persona-never-forget").value = target ? (target.never_forget || "") : "";
+        document.getElementById("edit-persona-notes").value = target ? (target.notes || "") : "";
+        document.getElementById("edit-persona-protected").value = target ? (target.protected_words || "") : "";
+        const voiceSel = document.getElementById("edit-persona-voice");
+        if (voiceSel && target?.tts_voice && Array.from(voiceSel.options).some(o => o.value === target.tts_voice)) {
+            voiceSel.value = target.tts_voice;
+        }
+        editor.style.display = "flex";
+        document.getElementById("edit-persona-name").focus();
+    }
+
+    function closePersonaEditor() {
+        editingPersonaId = null;
+        const editor = document.getElementById("persona-editor");
+        if (editor) editor.style.display = "none";
+    }
+
+    async function savePersonaEditor() {
+        const msgEl = document.getElementById("persona-modal-message");
+        const name = document.getElementById("edit-persona-name").value.trim();
+        if (!name) {
+            if (msgEl) msgEl.innerText = "Please enter a name for this AI persona.";
+            document.getElementById("edit-persona-name").focus();
+            return;
+        }
+        const payload = {
+            name,
+            user_name: document.getElementById("edit-persona-user-name").value.trim(),
+            never_forget: document.getElementById("edit-persona-never-forget").value.trim(),
+            notes: document.getElementById("edit-persona-notes").value.trim(),
+            tts_voice: document.getElementById("edit-persona-voice").value || "silas",
+            protected_words: document.getElementById("edit-persona-protected").value.trim()
+        };
+        try {
+            if (editingPersonaId) {
+                await api(`/personas/${encodeURIComponent(editingPersonaId)}`, {
+                    method: "PUT",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(payload)
+                });
+                if (msgEl) msgEl.innerText = `Updated ${name}.`;
+            } else {
+                const res = await api("/personas", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ ...payload, activate: true })
+                });
+                sessionStorage.setItem("ghost_pcp_persona_chosen", "1");
+                conversation.length = 0;
+                if (res.persona) applyActivePersonaToUi(res.persona);
+                if (msgEl) msgEl.innerText = `Created ${name}.`;
+            }
+            closePersonaEditor();
+            await fetchPersonas();
+            await refreshPCPStatus();
+            renderConversation(false);
+        } catch (e) {
+            if (msgEl) msgEl.innerText = `Error: ${e.message}`;
+        }
+    }
+
+    async function deletePersonaCard(personaId, personaName) {
+        if (!window.confirm(`Delete AI persona "${personaName}" and remove its isolated folder from pcp_data/personas?`)) return;
+        const msgEl = document.getElementById("persona-modal-message");
+        try {
+            await api(`/personas/${encodeURIComponent(personaId)}?delete_files=true`, { method: "DELETE" });
+            await fetchPersonas();
+            await loadConversationFromServer(false);
+            await refreshPCPStatus();
+            if (msgEl) msgEl.innerText = `Deleted ${personaName}.`;
+        } catch (e) {
+            if (msgEl) msgEl.innerText = `Error: ${e.message}`;
+        }
+    }
+
+    function openNewPersonaImport() {
+        closePersonaModal();
+        clearStagedIngest();
+        const modeNew = document.getElementById("ingest-mode-new");
+        if (modeNew) modeNew.checked = true;
+        toggleIngestTargetMode();
+        openArchiveModal();
+    }
+
+    function openAddFilesToPersona(personaId) {
+        closePersonaModal();
+        clearStagedIngest();
+        const modeExisting = document.getElementById("ingest-mode-existing");
+        const existingSel = document.getElementById("ingest-existing-persona");
+        if (modeExisting) modeExisting.checked = true;
+        if (existingSel && personaId) existingSel.value = personaId;
+        toggleIngestTargetMode();
+        prefillExistingIngestPersona();
+        openArchiveModal();
     }
 
     async function fetchModels() {
@@ -1066,7 +1598,8 @@
             } else if (pcp.ready) {
                 badge.innerText = `PCP ACTIVE · ${pcp.volumes} VOL (${pcp.passages.toLocaleString()} PASSAGES)`;
                 badge.className = "badge active";
-                summary.innerText = `PCP Archive Ready: ${pcp.volumes} volume(s) (ghost_pcp_01.md .. ghost_pcp_${String(pcp.volumes).padStart(2, '0')}.md) · ${pcp.passages.toLocaleString()} indexed passages.\nFolder: ${pcp.data_dir}`;
+                const personaLabel = pcp.active_persona ? `Persona: ${pcp.active_persona.name} · ` : "";
+                summary.innerText = `${personaLabel}${pcp.volumes} volume(s) (ghost_pcp_01.md .. ghost_pcp_${String(pcp.volumes).padStart(2, '0')}.md) · ${pcp.passages.toLocaleString()} indexed passages.\nFolder: ${pcp.data_dir}`;
             } else if (pcp.volumes > 0) {
                 badge.innerText = `PCP: ${pcp.volumes} VOL UNINDEXED (CLICK TO RESUME)`;
                 badge.className = "badge";
@@ -1074,7 +1607,7 @@
             } else {
                 badge.innerText = "PCP: NO ARCHIVE (CLICK TO IMPORT)";
                 badge.className = "badge";
-                summary.innerText = `No ghost_pcp_*.md volumes found in ${pcp.data_dir}.\nDrop a ChatGPT export .zip or conversations.json below to build your PCP archive.`;
+                summary.innerText = `No ghost_pcp_*.md volumes found in ${pcp.data_dir}.\nDrop an OpenAI ChatGPT or Google Gemini export (.zip, conversations.json, MyActivity.json, or source folder) below.`;
             }
             return pcp;
         } catch (e) {
@@ -1274,10 +1807,18 @@
             const bannerHtml = lastSavedBanner
                 ? `<div style="margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(95, 227, 161, 0.45); background: rgba(95, 227, 161, 0.08); color: var(--ok); font-size: 13px;">${escapeHtml(lastSavedBanner)}</div>`
                 : "";
+            const personaHtml = activePersona
+                ? `<div style="margin-bottom: 10px; font-size: 13px; color: var(--purple); font-weight: 650;">Active AI: ${escapeHtml(activePersona.name)}${activePersona.user_name ? ` · Calls you ${escapeHtml(activePersona.user_name)}` : ""}</div>`
+                : "";
             empty.innerHTML = `
                 ${bannerHtml}
                 <img src="/assets/ghost_logo_portrait.png" alt="GHostPCP — GPU Hosted Pure Concentrated Personality">
+                ${personaHtml}
                 <p>GPU Hosted Pure Concentrated Personality.<br>Your archive volumes are treated as authoritative lived memory—with zero citations or document labels.</p>
+                <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 14px;">
+                    <button type="button" class="secondary" onclick="openPersonaModal()">CHOOSE / SWITCH AI</button>
+                    <button type="button" onclick="openNewPersonaImport()">+ IMPORT NEW AI</button>
+                </div>
             `;
             container.appendChild(empty);
             return;
@@ -1651,7 +2192,7 @@
             }
             cleanedHistory.push(cur);
         }
-        const messages = settings.system_prompt
+        const messages = (!activePersona && settings.system_prompt)
             ? [{role: "system", content: settings.system_prompt}, ...cleanedHistory]
             : [...cleanedHistory];
         const controller = new AbortController();
@@ -1704,6 +2245,7 @@
                 body: JSON.stringify({
                     model: currentModel,
                     messages: messages,
+                    persona_id: activePersona ? activePersona.id : null,
                     stream: true,
                     temperature: settings.temperature,
                     top_p: settings.top_p,
@@ -2016,48 +2558,165 @@
         }
     });
 
+    function toggleIngestTargetMode() {
+        const isExisting = Boolean(document.getElementById("ingest-mode-existing")?.checked) && personasList.length > 0;
+        const existingSel = document.getElementById("ingest-existing-persona");
+        const nameInput = document.getElementById("ingest-persona-name");
+        if (existingSel) {
+            existingSel.style.display = isExisting ? "block" : "none";
+        }
+        if (isExisting) {
+            prefillExistingIngestPersona();
+        } else if (nameInput) {
+            nameInput.disabled = false;
+        }
+    }
+
+    function prefillExistingIngestPersona() {
+        const isExisting = Boolean(document.getElementById("ingest-mode-existing")?.checked);
+        const existingSel = document.getElementById("ingest-existing-persona");
+        if (!isExisting || !existingSel) return;
+        const p = personasList.find(item => item.id === existingSel.value);
+        if (!p) return;
+        document.getElementById("ingest-persona-name").value = p.name || "";
+        document.getElementById("ingest-user-name").value = p.user_name || "";
+        document.getElementById("ingest-never-forget").value = p.never_forget || "";
+        document.getElementById("ingest-persona-notes").value = p.notes || "";
+        document.getElementById("ingest-protected-words").value = p.protected_words || "";
+        const vSel = document.getElementById("ingest-tts-voice");
+        if (vSel && p.tts_voice && Array.from(vSel.options).some(o => o.value === p.tts_voice)) {
+            vSel.value = p.tts_voice;
+        }
+    }
+
+    function clearStagedIngest() {
+        stagedIngestFiles = [];
+        stagedLocalPath = "";
+        const fileInput = document.getElementById("file-input");
+        if (fileInput) fileInput.value = "";
+        const step = document.getElementById("ingest-persona-step");
+        if (step) step.style.display = "none";
+    }
+
+    function showStagedOnboarding(summaryText) {
+        const step = document.getElementById("ingest-persona-step");
+        const summaryEl = document.getElementById("staged-source-summary");
+        if (summaryEl) summaryEl.innerText = summaryText;
+        const modeExisting = document.getElementById("ingest-mode-existing");
+        const modeNew = document.getElementById("ingest-mode-new");
+        if (modeExisting) {
+            modeExisting.disabled = personasList.length === 0;
+            if (personasList.length === 0 && modeNew) {
+                modeNew.checked = true;
+            }
+        }
+        if (modeNew?.checked) {
+            document.getElementById("ingest-persona-name").value = "";
+            document.getElementById("ingest-user-name").value = "";
+            document.getElementById("ingest-never-forget").value = "";
+            document.getElementById("ingest-persona-notes").value = "";
+            document.getElementById("ingest-protected-words").value = document.getElementById("protected-words")?.value || "";
+        }
+        toggleIngestTargetMode();
+        if (step) step.style.display = "flex";
+        document.getElementById("archive-message").innerText = "Answer the questions below, then click DETECT SOURCE & START IMPORT.";
+        if (modeNew?.checked) {
+            document.getElementById("ingest-persona-name")?.focus();
+        }
+    }
+
     async function handleFileSelect(fileList) {
         if (!fileList || !fileList.length) return;
-        const formData = new FormData();
-        for (const file of fileList) {
-            formData.append("files", file);
-        }
-        formData.append("blocked_phrases", document.getElementById("blocked-phrases").value);
-        formData.append("protected_words", document.getElementById("protected-words").value);
-        formData.append("replace_existing", document.getElementById("replace-existing-archive")?.checked ? "true" : "false");
-
-        document.getElementById("archive-message").innerText = "Uploading and starting background processing...";
-        try {
-            const headers = {};
-            const token = getAuthToken();
-            if (token) headers["Authorization"] = `Bearer ${token}`;
-            const res = await fetch(`${API}/pcp/ingest`, { method: "POST", headers, body: formData });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || "Upload failed");
-            startIngestPolling();
-        } catch (e) {
-            document.getElementById("archive-message").innerText = `Error: ${e.message}`;
-        }
+        stagedIngestFiles = Array.from(fileList);
+        stagedLocalPath = "";
+        const totalMb = (stagedIngestFiles.reduce((acc, f) => acc + (f.size || 0), 0) / (1024 * 1024)).toFixed(2);
+        const names = stagedIngestFiles.map(f => f.name).slice(0, 3).join(", ");
+        const extra = stagedIngestFiles.length > 3 ? ` +${stagedIngestFiles.length - 3} more` : "";
+        showStagedOnboarding(`Staged ${stagedIngestFiles.length} file(s): ${names}${extra} (${totalMb} MB)`);
     }
 
     async function ingestLocalPath() {
         const raw = document.getElementById("local-path-input").value.trim();
         if (!raw) return;
-        document.getElementById("archive-message").innerText = "Starting local path ingestion...";
+        stagedLocalPath = raw;
+        stagedIngestFiles = [];
+        showStagedOnboarding(`Staged local source: ${raw}`);
+    }
+
+    async function startStagedIngest() {
+        const isExisting = Boolean(document.getElementById("ingest-mode-existing")?.checked) && personasList.length > 0;
+        const existingId = document.getElementById("ingest-existing-persona")?.value || "";
+        const personaName = document.getElementById("ingest-persona-name").value.trim();
+        const userName = document.getElementById("ingest-user-name").value.trim();
+        const neverForget = document.getElementById("ingest-never-forget").value.trim();
+        const personaNotes = document.getElementById("ingest-persona-notes").value.trim();
+        const ttsVoice = document.getElementById("ingest-tts-voice")?.value || "silas";
+        const protectedWords = document.getElementById("ingest-protected-words").value.trim()
+            || document.getElementById("protected-words").value.trim();
+        const blockedPhrases = document.getElementById("blocked-phrases").value;
+        const replaceExisting = Boolean(document.getElementById("replace-existing-archive")?.checked);
+
+        if (!isExisting && !personaName) {
+            document.getElementById("archive-message").innerText = "Please enter what this AI's name is before importing.";
+            document.getElementById("ingest-persona-name")?.focus();
+            return;
+        }
+        const targetPersonaId = isExisting ? existingId : "__new__";
+
+        const btn = document.getElementById("start-staged-ingest-btn");
+        if (btn) btn.disabled = true;
         try {
-            await api("/pcp/ingest-local", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({
-                    paths: [raw],
-                    blocked_phrases: document.getElementById("blocked-phrases").value,
-                    protected_words: document.getElementById("protected-words").value,
-                    replace_existing: Boolean(document.getElementById("replace-existing-archive")?.checked)
-                })
-            });
+            if (stagedIngestFiles.length > 0) {
+                const formData = new FormData();
+                for (const file of stagedIngestFiles) {
+                    formData.append("files", file);
+                }
+                formData.append("blocked_phrases", blockedPhrases);
+                formData.append("protected_words", protectedWords);
+                formData.append("replace_existing", replaceExisting ? "true" : "false");
+                formData.append("persona_id", targetPersonaId);
+                formData.append("persona_name", personaName);
+                formData.append("user_name", userName);
+                formData.append("never_forget", neverForget);
+                formData.append("persona_notes", personaNotes);
+                formData.append("tts_voice", ttsVoice);
+
+                document.getElementById("archive-message").innerText = "Uploading archive and detecting Google vs OpenAI format...";
+                const headers = {};
+                const token = getAuthToken();
+                if (token) headers["Authorization"] = `Bearer ${token}`;
+                const res = await fetch(`${API}/pcp/ingest`, { method: "POST", headers, body: formData });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || "Upload failed");
+            } else if (stagedLocalPath) {
+                document.getElementById("archive-message").innerText = "Scanning source folder and detecting Google vs OpenAI format...";
+                await api("/pcp/ingest-local", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        paths: [stagedLocalPath],
+                        blocked_phrases: blockedPhrases,
+                        protected_words: protectedWords,
+                        replace_existing: replaceExisting,
+                        persona_id: targetPersonaId,
+                        persona_name: personaName,
+                        user_name: userName,
+                        never_forget: neverForget,
+                        persona_notes: personaNotes,
+                        tts_voice: ttsVoice
+                    })
+                });
+            } else {
+                document.getElementById("archive-message").innerText = "Drop an archive file or enter a local folder/file path first.";
+                return;
+            }
+            sessionStorage.setItem("ghost_pcp_persona_chosen", "1");
+            clearStagedIngest();
             startIngestPolling();
         } catch (e) {
             document.getElementById("archive-message").innerText = `Error: ${e.message}`;
+        } finally {
+            if (btn) btn.disabled = false;
         }
     }
 
@@ -2128,8 +2787,11 @@
                     if (bar) bar.style.background = "var(--ok)";
                     if (doneBanner) doneBanner.style.display = "flex";
                     document.getElementById("archive-message").innerText = "";
+                    await fetchPersonas();
+                    await loadConversationFromServer(false);
                 } else if (pcp.error) {
                     document.getElementById("archive-message").innerText = `Error: ${pcp.error}`;
+                    await fetchPersonas();
                 } else {
                     document.getElementById("archive-message").innerText = pcp.stage || "Archive ready!";
                 }
@@ -2287,6 +2949,8 @@
         }
     }
     function openArchiveModal() {
+        fetchPersonas();
+        fetchVoices();
         refreshPCPStatus();
         document.getElementById("archive-modal").style.display = "flex";
     }
@@ -2334,18 +2998,26 @@
         await loadConversationFromServer(true);
         await fetchModels();
         await fetchVoices();
+        await fetchPersonas();
         if (lastSettings) writeSettings(lastSettings);
+        if (activePersona) applyActivePersonaToUi(activePersona);
         const pcp = await refreshPCPStatus();
         try {
             const st = await api("/status");
             currentModel = st.resident_model || "";
+            const chosenBefore = sessionStorage.getItem("ghost_pcp_persona_chosen") === "1";
             if (currentModel) {
                 setStatus(`ONLINE: ${currentModel}`, "var(--purple)");
                 document.getElementById("user-input").disabled = false;
                 document.getElementById("send-button").disabled = false;
+                if (!chosenBefore && personasList.length > 0) {
+                    openPersonaModal();
+                }
             } else {
                 setStatus("NO MODEL MOUNTED", "#888");
-                if (pcp && !pcp.ready) {
+                if (!chosenBefore && personasList.length > 0) {
+                    openPersonaModal();
+                } else if (pcp && !pcp.ready) {
                     openArchiveModal();
                 } else {
                     openSettings();
