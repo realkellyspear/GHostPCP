@@ -284,7 +284,11 @@ DEFAULT_SETTINGS = {
     "system_prompt": "",
     "pcp_enabled": True,
     "pcp_top_k": 4,
+    "tts_engine": "piper",
     "tts_voice": "silas",
+    "tts_api_url": "http://127.0.0.1:3900",
+    "tts_api_model": "tts-1",
+    "tts_api_key": "",
     "mic_device": "auto",
     "blocked_phrases": "\n".join(DEFAULT_BLOCKED_PHRASES),
     "protected_words": "\n".join(DEFAULT_PROTECTED_WORDS),
@@ -638,6 +642,219 @@ def stop_read_aloud() -> None:
         sd.stop()
     except Exception:
         pass
+
+
+def _normalize_openai_tts_urls(raw_url: str) -> Tuple[str, List[str]]:
+    """Return (speech_post_url, voice_list_candidate_urls) for an OpenAI-compatible TTS server."""
+    raw = str(raw_url or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("TTS server URL is empty.")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError("TTS server URL must start with http:// or https://")
+
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1/audio/speech"):
+        speech_url = raw
+        v1_base = raw[: -len("/audio/speech")]
+    elif path.endswith("/audio/speech"):
+        speech_url = raw
+        v1_base = raw[: -len("/audio/speech")]
+    elif path.endswith("/v1"):
+        speech_url = f"{raw}/audio/speech"
+        v1_base = raw
+    else:
+        speech_url = f"{raw}/v1/audio/speech"
+        v1_base = f"{raw}/v1"
+
+    voice_urls = [f"{v1_base}/audio/voices", f"{v1_base}/voices"]
+    return speech_url, voice_urls
+
+
+def _split_text_for_tts(text: str, max_chars: int = 3000) -> List[str]:
+    """Split long speech text along sentence/newline boundaries without exceeding server limits."""
+    clean = str(text or "").strip()
+    if not clean:
+        return []
+    if len(clean) <= max_chars:
+        return [clean]
+
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean)
+    chunks: List[str] = []
+    cur = ""
+    for sent in sentences:
+        part = sent.strip()
+        if not part:
+            continue
+        while len(part) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            cut = part[:max_chars].rsplit(" ", 1)[0].strip() or part[:max_chars]
+            chunks.append(cut)
+            part = part[len(cut):].strip()
+        if not part:
+            continue
+        cand = f"{cur} {part}".strip() if cur else part
+        if len(cand) <= max_chars:
+            cur = cand
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = part
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def scan_openai_tts_voices(
+    api_url: str,
+    api_key: str = "",
+    timeout: float = 4.0,
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """Query an OpenAI/VoiceStudio-compatible local TTS server for available voice profiles."""
+    import requests
+
+    try:
+        _speech_url, voice_urls = _normalize_openai_tts_urls(api_url)
+    except ValueError as exc:
+        return [], str(exc)
+
+    headers: Dict[str, str] = {}
+    key = str(api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    last_err: Optional[str] = None
+    for vurl in voice_urls:
+        try:
+            resp = requests.get(vurl, headers=headers, timeout=timeout)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            raw_list = payload.get("voices") if isinstance(payload, dict) else payload
+            if not isinstance(raw_list, list):
+                continue
+
+            profiles: List[Dict[str, str]] = []
+            presets: List[Dict[str, str]] = []
+            seen_ids: Set[str] = set()
+            for item in raw_list:
+                if isinstance(item, str):
+                    vid = item.strip()
+                    if vid and vid not in seen_ids:
+                        seen_ids.add(vid)
+                        presets.append({"id": vid, "label": vid})
+                elif isinstance(item, dict):
+                    vid = str(item.get("voice_id") or item.get("id") or item.get("name") or "").strip()
+                    name = str(item.get("name") or vid).strip()
+                    vtype = str(item.get("type") or "").strip().lower()
+                    if not vid or vid in seen_ids:
+                        continue
+                    seen_ids.add(vid)
+                    if vtype == "profile":
+                        profiles.append({"id": vid, "label": f"{name} (Cloned Profile)"})
+                    else:
+                        label = f"{name} (Built-in)" if vtype == "openai_alias" else name
+                        presets.append({"id": vid, "label": label})
+            return profiles + presets, None
+        except requests.exceptions.ConnectionError:
+            last_err = f"Could not reach TTS server at {api_url} — open VoiceStudio (or start your TTS server) first."
+        except Exception as exc:
+            last_err = f"Voice lookup failed: {exc}"
+
+    return [], last_err or f"No /v1/audio/voices endpoint found at {api_url}"
+
+
+def read_aloud_openai_api(
+    text: str,
+    voice_name: str,
+    api_url: str,
+    api_model: str = "tts-1",
+    api_key: str = "",
+) -> bytes:
+    """Synthesize speech via an OpenAI-compatible local TTS endpoint (e.g. VoiceStudio on :3900)."""
+    import numpy as np
+    import requests
+
+    cleaned_text = _clean_text_for_speech(text)
+    if not cleaned_text:
+        raise ValueError("No speakable text in message.")
+
+    speech_url, _ = _normalize_openai_tts_urls(api_url)
+    chunks = _split_text_for_tts(cleaned_text, max_chars=3000)
+    if not chunks:
+        raise ValueError("No speakable text in message.")
+
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    key = str(api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    chosen_model = str(api_model or "tts-1").strip() or "tts-1"
+    chosen_voice = str(voice_name or "default").strip() or "default"
+
+    arrays: List[Any] = []
+    target_sr: Optional[int] = None
+    raw_first: Optional[bytes] = None
+
+    for chunk in chunks:
+        payload = {
+            "model": chosen_model,
+            "input": chunk,
+            "voice": chosen_voice,
+            "response_format": "wav",
+        }
+        try:
+            resp = requests.post(speech_url, json=payload, headers=headers, timeout=(6, 180))
+        except requests.exceptions.ConnectionError as exc:
+            raise ConnectionError(
+                f"Could not connect to external TTS server ({speech_url}). Make sure VoiceStudio is running."
+            ) from exc
+
+        if not resp.ok:
+            msg = f"External TTS returned HTTP {resp.status_code}"
+            try:
+                err_json = resp.json()
+                if isinstance(err_json, dict):
+                    err_obj = err_json.get("error")
+                    if isinstance(err_obj, dict) and err_obj.get("message"):
+                        msg = str(err_obj["message"])
+                    elif err_json.get("detail"):
+                        msg = str(err_json["detail"])
+            except Exception:
+                pass
+            raise RuntimeError(msg)
+
+        if not resp.content:
+            raise RuntimeError("External TTS server returned empty audio.")
+        if raw_first is None:
+            raw_first = resp.content
+
+        data, sr = sf.read(io.BytesIO(resp.content), dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1).astype(np.float32)
+        if target_sr is None:
+            target_sr = int(sr)
+        elif int(sr) != target_sr and data.size > 0:
+            n_out = max(1, int(round(len(data) * target_sr / int(sr))))
+            data = np.interp(np.linspace(0, len(data) - 1, n_out), np.arange(len(data)), data).astype(np.float32)
+        arrays.append(data)
+
+    if len(chunks) == 1 and raw_first is not None and raw_first[:4] == b"RIFF":
+        return raw_first
+
+    pause = np.zeros(int((target_sr or 24000) * 0.15), dtype=np.float32)
+    stitched: List[Any] = []
+    for idx, arr in enumerate(arrays):
+        if idx > 0:
+            stitched.append(pause)
+        stitched.append(arr)
+    combined = np.concatenate(stitched) if stitched else np.zeros((0,), dtype=np.float32)
+    out_buf = io.BytesIO()
+    sf.write(out_buf, combined, target_sr or 24000, format="WAV", subtype="PCM_16")
+    return out_buf.getvalue()
 
 
 _STT_ENGINE: Optional["_WhisperSTT"] = None
@@ -2944,7 +3161,11 @@ class LoaderSettings(BaseModel):
     system_prompt: StrictStr = Field(default=DEFAULT_SETTINGS["system_prompt"], max_length=12000)
     pcp_enabled: bool = True
     pcp_top_k: StrictInt = Field(default=4, ge=1, le=12)
-    tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=64)
+    tts_engine: Literal["piper", "openai_api"] = "piper"
+    tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=128)
+    tts_api_url: StrictStr = Field(default="http://127.0.0.1:3900", max_length=500)
+    tts_api_model: StrictStr = Field(default="tts-1", max_length=120)
+    tts_api_key: StrictStr = Field(default="", max_length=500)
     mic_device: StrictStr = Field(default="auto", max_length=200)
     blocked_phrases: StrictStr = Field(default=DEFAULT_SETTINGS["blocked_phrases"], max_length=8000)
     protected_words: StrictStr = Field(default=DEFAULT_SETTINGS["protected_words"], max_length=8000)
@@ -2987,7 +3208,7 @@ class PersonaCreateRequest(BaseModel):
     never_forget: StrictStr = Field(default="", max_length=8000)
     notes: StrictStr = Field(default="", max_length=8000)
     continuity_notes: StrictStr = Field(default="", max_length=8000)
-    tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=64)
+    tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=128)
     preferred_model: StrictStr = Field(default="", max_length=255)
     protected_words: StrictStr = Field(default="", max_length=8000)
     blocked_phrases: Optional[StrictStr] = Field(default=None, max_length=8000)
@@ -3000,7 +3221,7 @@ class PersonaUpdateRequest(BaseModel):
     never_forget: Optional[StrictStr] = Field(default=None, max_length=8000)
     notes: Optional[StrictStr] = Field(default=None, max_length=8000)
     continuity_notes: Optional[StrictStr] = Field(default=None, max_length=8000)
-    tts_voice: Optional[StrictStr] = Field(default=None, min_length=1, max_length=64)
+    tts_voice: Optional[StrictStr] = Field(default=None, min_length=1, max_length=128)
     preferred_model: Optional[StrictStr] = Field(default=None, max_length=255)
     protected_words: Optional[StrictStr] = Field(default=None, max_length=8000)
     blocked_phrases: Optional[StrictStr] = Field(default=None, max_length=8000)
@@ -3050,8 +3271,11 @@ class ModelDownloadRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text: StrictStr = Field(min_length=1, max_length=100000)
-    voice: StrictStr = Field(default="silas", max_length=64)
+    voice: StrictStr = Field(default="silas", max_length=128)
     play_on_host: Optional[bool] = None
+    engine: Optional[Literal["piper", "openai_api"]] = None
+    api_url: Optional[StrictStr] = Field(default=None, max_length=500)
+    api_model: Optional[StrictStr] = Field(default=None, max_length=120)
 
 
 _SETTINGS_LOCK = threading.Lock()
@@ -4281,21 +4505,48 @@ def remote_qr_svg(target: str = "tunnel"):
 # =====================================================================
 
 @app.get("/v1/tts/voices", dependencies=[Depends(verify_access)])
-def tts_voices_endpoint():
-    return {"voices": scan_piper_voices()}
+def tts_voices_endpoint(
+    engine: Optional[str] = None,
+    api_url: Optional[str] = None,
+    x_tts_api_key: Optional[str] = Header(default=None),
+):
+    settings = load_settings()
+    chosen_engine = (engine or settings.get("tts_engine") or "piper").strip().lower()
+    if chosen_engine == "openai_api":
+        chosen_url = (api_url if api_url is not None else settings.get("tts_api_url")) or "http://127.0.0.1:3900"
+        chosen_key = x_tts_api_key if x_tts_api_key is not None else str(settings.get("tts_api_key") or "")
+        voices, err = scan_openai_tts_voices(chosen_url, api_key=chosen_key)
+        return {"voices": voices, "engine": "openai_api", "api_url": chosen_url, "error": err}
+    return {"voices": scan_piper_voices(), "engine": "piper", "error": None}
 
 
 @app.post("/v1/tts", dependencies=[Depends(verify_access)])
 def tts_endpoint(req: TTSRequest, request: Request):
     is_local_loopback = _is_local_loopback_request(request)
     play_locally = req.play_on_host if req.play_on_host is not None else is_local_loopback
+    settings = load_settings()
+    chosen_engine = (req.engine or settings.get("tts_engine") or "piper").strip().lower()
 
     try:
-        wav_bytes = read_aloud(req.text, req.voice, play_locally=False)
+        if chosen_engine == "openai_api":
+            chosen_url = (req.api_url or settings.get("tts_api_url") or "http://127.0.0.1:3900").strip()
+            chosen_model = (req.api_model or settings.get("tts_api_model") or "tts-1").strip()
+            chosen_key = str(settings.get("tts_api_key") or "")
+            wav_bytes = read_aloud_openai_api(
+                req.text,
+                req.voice,
+                api_url=chosen_url,
+                api_model=chosen_model,
+                api_key=chosen_key,
+            )
+        else:
+            wav_bytes = read_aloud(req.text, req.voice, play_locally=False)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         log.error(f"TTS error: {exc}")
         raise HTTPException(status_code=500, detail=f"TTS failed: {exc}") from exc

@@ -2062,6 +2062,95 @@ class GHostPCPTests(unittest.TestCase):
         self.assertIn("@media (max-width: 760px)", html_src)
         self.assertIn("flex: 1 1 calc(100% - 110px);", html_src)
 
+    def test_openai_compatible_external_tts_integration(self):
+        import soundfile as sf
+        import ghost_pcp
+
+        self.assertEqual(
+            ghost_pcp._normalize_openai_tts_urls("http://127.0.0.1:3900"),
+            ("http://127.0.0.1:3900/v1/audio/speech", ["http://127.0.0.1:3900/v1/audio/voices", "http://127.0.0.1:3900/v1/voices"]),
+        )
+        self.assertEqual(
+            ghost_pcp._normalize_openai_tts_urls("http://127.0.0.1:3900/v1/audio/speech"),
+            ("http://127.0.0.1:3900/v1/audio/speech", ["http://127.0.0.1:3900/v1/audio/voices", "http://127.0.0.1:3900/v1/voices"]),
+        )
+        with self.assertRaises(ValueError):
+            ghost_pcp._normalize_openai_tts_urls("ftp://127.0.0.1:3900")
+
+        wav_buf = io.BytesIO()
+        tone = (0.1 * np.sin(2 * np.pi * 220.0 * np.arange(4800) / 24000.0)).astype(np.float32)
+        sf.write(wav_buf, tone, 24000, format="WAV", subtype="PCM_16")
+        sample_wav = wav_buf.getvalue()
+
+        class FakeResp:
+            def __init__(self, status_code=200, json_data=None, content=b""):
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 300
+                self._json = json_data
+                self.content = content
+
+            def raise_for_status(self):
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def json(self):
+                return self._json
+
+        fake_voices_payload = {
+            "voices": [
+                {"voice_id": "alloy", "name": "Alloy", "type": "openai_alias"},
+                {"voice_id": "prof-123", "name": "Custom Clone", "type": "profile"},
+            ]
+        }
+
+        import requests
+
+        posted_chunks = []
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            posted_chunks.append((url, json, headers))
+            return FakeResp(200, content=sample_wav)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ghost_pcp, "SETTINGS_PATH", Path(tmp) / "settings.json"
+        ), patch.object(
+            ghost_pcp, "PCP_DATA_DIR", Path(tmp) / "pcp_data"
+        ), patch.object(
+            requests, "get", return_value=FakeResp(200, json_data=fake_voices_payload)
+        ), patch.object(
+            requests, "post", side_effect=fake_post
+        ), TestClient(ghost_pcp.app) as client:
+            # Configure OpenAI-compatible VoiceStudio engine
+            s = ghost_pcp.load_settings()
+            s.update({
+                "tts_engine": "openai_api",
+                "tts_api_url": "http://127.0.0.1:3900",
+                "tts_api_model": "tts-1",
+                "tts_voice": "prof-123",
+            })
+            ghost_pcp.save_settings(ghost_pcp.LoaderSettings(**s))
+
+            v_res = client.get("/v1/tts/voices")
+            self.assertEqual(v_res.status_code, 200)
+            v_data = v_res.json()
+            self.assertEqual(v_data["engine"], "openai_api")
+            # Cloned profile must sort ahead of OpenAI built-in aliases
+            self.assertEqual(v_data["voices"][0]["id"], "prof-123")
+            self.assertIn("Cloned Profile", v_data["voices"][0]["label"])
+
+            # Long text > 3000 chars chunks cleanly into multiple requests and stitches valid WAV
+            long_text = " ".join(["This is a clean test sentence for VoiceStudio playback."] * 70)
+            with patch.object(ghost_pcp, "_is_local_loopback_request", return_value=False):
+                t_res = client.post("/v1/tts", json={"text": long_text, "voice": "prof-123"})
+            self.assertEqual(t_res.status_code, 200)
+            self.assertEqual(t_res.headers.get("content-type"), "audio/wav")
+            self.assertGreaterEqual(len(posted_chunks), 2)
+            self.assertEqual(posted_chunks[0][0], "http://127.0.0.1:3900/v1/audio/speech")
+            self.assertEqual(posted_chunks[0][1]["voice"], "prof-123")
+            decoded, sr = sf.read(io.BytesIO(t_res.content), dtype="float32")
+            self.assertEqual(sr, 24000)
+            self.assertGreater(len(decoded), len(tone) * 2)
+
 
 if __name__ == "__main__":
     unittest.main()

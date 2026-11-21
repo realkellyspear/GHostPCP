@@ -1114,12 +1114,29 @@
                 <input type="number" id="pcp-top-k" min="1" max="12" step="1" value="4">
             </div>
             <div class="control-group">
-                <label for="tts-voice">Read-Aloud Voice (`./piper_models`)</label>
+                <label for="tts-engine">Read-Aloud Voice Engine</label>
+                <select id="tts-engine" onchange="updateTtsEngineFields(); fetchVoices(true);">
+                    <option value="piper">Built-in Piper (.onnx, 0 GB VRAM)</option>
+                    <option value="openai_api">VoiceStudio / Local OpenAI TTS API</option>
+                </select>
+                <div id="tts-api-fields" style="display: none; flex-direction: column; gap: 6px; margin-top: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: #0d0f14;">
+                    <label for="tts-api-url">TTS Server URL (e.g. VoiceStudio http://127.0.0.1:3900)</label>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                        <input type="text" id="tts-api-url" style="flex: 1;" value="http://127.0.0.1:3900" placeholder="http://127.0.0.1:3900">
+                        <button type="button" class="secondary" onclick="fetchVoices(true)" style="white-space: nowrap;">DETECT VOICES</button>
+                    </div>
+                    <label for="tts-api-model">TTS Model / Engine ID</label>
+                    <input type="text" id="tts-api-model" value="tts-1" placeholder="tts-1 (active engine) or omnivoice / cosyvoice">
+                    <label for="tts-api-key">API Key (optional — leave blank for VoiceStudio)</label>
+                    <input type="password" id="tts-api-key" placeholder="Optional Bearer key">
+                    <small id="tts-api-status">Start VoiceStudio (or Qwen3-TTS / Kokoro / Chatterbox) and click DETECT VOICES.</small>
+                </div>
+                <label for="tts-voice" style="margin-top: 6px;">Read-Aloud Voice</label>
                 <select id="tts-voice">
                     <option value="silas">Silas</option>
                     <option value="kara">Kara</option>
                 </select>
-                <small>Drop any Piper `.onnx` + `.onnx.json` pair into `./piper_models` to add voices.</small>
+                <small id="tts-piper-hint">Drop any Piper `.onnx` + `.onnx.json` pair into `./piper_models` to add built-in voices.</small>
                 <label for="mic-device" style="margin-top: 8px;">Microphone Input (`[ MIC ]`)</label>
                 <div style="display: flex; gap: 6px; align-items: center;">
                     <select id="mic-device" style="flex: 1;">
@@ -1948,7 +1965,11 @@
             system_prompt: document.getElementById("system-prompt").value,
             pcp_enabled: document.getElementById("pcp-enabled").checked,
             pcp_top_k: Math.trunc(Number(document.getElementById("pcp-top-k").value)) || 4,
+            tts_engine: document.getElementById("tts-engine")?.value || "piper",
             tts_voice: document.getElementById("tts-voice").value || "silas",
+            tts_api_url: document.getElementById("tts-api-url")?.value || "http://127.0.0.1:3900",
+            tts_api_model: document.getElementById("tts-api-model")?.value || "tts-1",
+            tts_api_key: document.getElementById("tts-api-key")?.value || "",
             mic_device: document.getElementById("mic-device")?.value || "auto",
             blocked_phrases: document.getElementById("blocked-phrases").value,
             protected_words: document.getElementById("protected-words").value,
@@ -1982,6 +2003,19 @@
         document.getElementById("chat-format").value = settings.chat_format || "auto";
         document.getElementById("pcp-enabled").checked = settings.pcp_enabled !== false;
         document.getElementById("pcp-top-k").value = settings.pcp_top_k || 4;
+        if (document.getElementById("tts-engine")) {
+            document.getElementById("tts-engine").value = settings.tts_engine || "piper";
+        }
+        if (document.getElementById("tts-api-url")) {
+            document.getElementById("tts-api-url").value = settings.tts_api_url || "http://127.0.0.1:3900";
+        }
+        if (document.getElementById("tts-api-model")) {
+            document.getElementById("tts-api-model").value = settings.tts_api_model || "tts-1";
+        }
+        if (document.getElementById("tts-api-key")) {
+            document.getElementById("tts-api-key").value = settings.tts_api_key || "";
+        }
+        updateTtsEngineFields();
         if (settings.tts_voice) {
             const voiceSel = document.getElementById("tts-voice");
             if (voiceSel && Array.from(voiceSel.options).some(o => o.value === settings.tts_voice)) {
@@ -2064,16 +2098,54 @@
         return settings;
     }
 
-    async function fetchVoices() {
+    function updateTtsEngineFields() {
+        const eng = document.getElementById("tts-engine")?.value || "piper";
+        const box = document.getElementById("tts-api-fields");
+        const hint = document.getElementById("tts-piper-hint");
+        const isApi = eng === "openai_api";
+        if (box) box.style.display = isApi ? "flex" : "none";
+        if (hint) hint.style.display = isApi ? "none" : "block";
+    }
+
+    async function fetchVoices(useFormOverrides = false) {
         try {
-            const data = await api("/tts/voices");
+            const eng = useFormOverrides
+                ? (document.getElementById("tts-engine")?.value || "piper")
+                : (lastSettings?.tts_engine || document.getElementById("tts-engine")?.value || "piper");
+            const apiUrl = useFormOverrides
+                ? (document.getElementById("tts-api-url")?.value || "")
+                : (lastSettings?.tts_api_url || document.getElementById("tts-api-url")?.value || "");
+            const apiKey = useFormOverrides
+                ? (document.getElementById("tts-api-key")?.value || "")
+                : "";
+            const qs = new URLSearchParams();
+            qs.set("engine", eng);
+            if (eng === "openai_api" && apiUrl) qs.set("api_url", apiUrl);
+            const opts = (eng === "openai_api" && apiKey)
+                ? { headers: { "X-TTS-Api-Key": apiKey } }
+                : {};
+            const data = await api(`/tts/voices?${qs.toString()}`, opts);
             const voices = data.voices || [];
+            const apiStatus = document.getElementById("tts-api-status");
+            if (apiStatus && eng === "openai_api") {
+                if (data.error) {
+                    apiStatus.style.color = "var(--danger)";
+                    apiStatus.innerText = data.error;
+                } else {
+                    const clonedCount = voices.filter(v => String(v.label || "").includes("Cloned")).length;
+                    apiStatus.style.color = "var(--ok)";
+                    apiStatus.innerText = clonedCount
+                        ? `Connected! Found ${clonedCount} cloned voice profile(s) (${voices.length} total). Click SAVE & APPLY to use it.`
+                        : `Connected (${voices.length} voice(s) available). Click SAVE & APPLY to use.`;
+                }
+            }
+            const optsList = voices.length ? voices : [{ id: "default", label: "Default Voice" }];
             for (const selectId of ["tts-voice", "edit-persona-voice", "ingest-tts-voice"]) {
                 const select = document.getElementById(selectId);
                 if (!select) continue;
                 const currentVal = select.value || (activePersona?.tts_voice) || lastSettings?.tts_voice || "silas";
                 select.innerHTML = "";
-                voices.forEach(v => {
+                optsList.forEach(v => {
                     const opt = document.createElement("option");
                     opt.value = v.id;
                     opt.innerText = v.label;
@@ -2081,6 +2153,8 @@
                 });
                 if (Array.from(select.options).some(o => o.value === currentVal)) {
                     select.value = currentVal;
+                } else if (select.options.length > 0) {
+                    select.selectedIndex = 0;
                 }
             }
         } catch (e) {}
@@ -3280,7 +3354,15 @@
                 };
                 await clientAudio.play();
             } else {
-                const durationMs = Math.max(1200, Math.round((wavBlob.size / 44100) * 1000));
+                let byteRate = 44100;
+                try {
+                    const hdr = await wavBlob.slice(0, 32).arrayBuffer();
+                    if (hdr.byteLength >= 32) {
+                        const rate = new DataView(hdr).getUint32(28, true);
+                        if (rate >= 8000 && rate <= 384000) byteRate = rate;
+                    }
+                } catch (_) {}
+                const durationMs = Math.max(800, Math.round((wavBlob.size / byteRate) * 1000) + 250);
                 setTimeout(() => {
                     if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
                 }, durationMs);
