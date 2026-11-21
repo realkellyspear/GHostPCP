@@ -10,13 +10,15 @@ Uses BAAI/bge-small-en-v1.5 (384-D) with dual execution support:
 """
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from datetime import datetime
 import hashlib
 import math
 import os
 import re
+import shutil
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -322,8 +324,45 @@ def _chunks_prefix_hash(chunks: Sequence[str]) -> str:
     return h.hexdigest()
 
 
+_BM25_STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "you", "your", "are", "was",
+    "were", "have", "has", "had", "not", "but", "from", "they", "their",
+    "what", "when", "where", "which", "who", "why", "how", "can", "could",
+    "would", "should", "will", "just", "like", "about", "into", "out", "user",
+}
+_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+_VOLUME_NAME_RE = re.compile(r"^ghost_pcp_\d+\.md$", re.IGNORECASE)
+
+
+def _tokenize_bm25(text: str) -> List[str]:
+    return [tok for tok in _TOKEN_RE.findall(str(text or "").lower()) if tok not in _BM25_STOPWORDS]
+
+
+def _extract_message_plain_text(content: object) -> str:
+    """Convert string or OpenAI multimodal content list into plain Markdown-safe text."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        image_count = 0
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                ptype = str(item.get("type") or "").lower()
+                if ptype == "text" and isinstance(item.get("text"), str) and item["text"].strip():
+                    parts.append(item["text"].strip())
+                elif ptype == "image_url":
+                    image_count += 1
+        if image_count:
+            img_tag = "[Attached Image]" if image_count == 1 else f"[{image_count} Attached Images]"
+            parts.insert(0, img_tag)
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
+
+
 class PCPIndex:
-    """In-memory semantic vector index backed by cached embeddings.npz."""
+    """In-memory hybrid (BGE semantic + BM25 lexical) index backed by cached embeddings.npz."""
 
     def __init__(
         self,
@@ -342,7 +381,64 @@ class PCPIndex:
         self.vectors: Optional[np.ndarray] = None
         self.file_count: int = 0
         self.fingerprint: str = ""
+        self._postings: Dict[str, List[Tuple[int, int]]] = {}
+        self._doc_lens: Optional[np.ndarray] = None
+        self._avg_dl: float = 1.0
+        self._bm25_count: int = 0
         self.reload(progress_callback=progress_callback, cache_only=cache_only)
+
+    def _invalidate_lexical_index(self) -> None:
+        self._postings = {}
+        self._doc_lens = None
+        self._avg_dl = 1.0
+        self._bm25_count = 0
+
+    def _ensure_lexical_index(self) -> None:
+        n_docs = len(self.chunks)
+        if n_docs == 0:
+            self._invalidate_lexical_index()
+            return
+        if self._bm25_count == n_docs and self._doc_lens is not None:
+            return
+        postings: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        doc_lens = np.zeros(n_docs, dtype=np.float32)
+        for idx, chunk in enumerate(self.chunks):
+            toks = _tokenize_bm25(chunk)
+            doc_lens[idx] = float(len(toks))
+            if toks:
+                for tok, tf in Counter(toks).items():
+                    postings[tok].append((idx, tf))
+        self._postings = dict(postings)
+        self._doc_lens = doc_lens
+        self._avg_dl = max(1.0, float(doc_lens.mean()))
+        self._bm25_count = n_docs
+
+    def _bm25_scores(self, query: str) -> np.ndarray:
+        n_docs = len(self.chunks)
+        scores = np.zeros(n_docs, dtype=np.float32)
+        if n_docs == 0:
+            return scores
+        self._ensure_lexical_index()
+        assert self._doc_lens is not None
+        q_toks = _tokenize_bm25(query)
+        if not q_toks:
+            return scores
+        k1 = 1.5
+        b = 0.75
+        avg_dl = self._avg_dl
+        for tok in set(q_toks):
+            plist = self._postings.get(tok)
+            if not plist:
+                continue
+            df = len(plist)
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            if idf <= 0.0:
+                continue
+            for doc_idx, tf in plist:
+                dl = float(self._doc_lens[doc_idx])
+                denom = tf + k1 * (1.0 - b + b * (dl / avg_dl))
+                scores[doc_idx] += np.float32(idf * ((tf * (k1 + 1.0)) / max(1e-6, denom)))
+        return scores
 
     @property
     def ready(self) -> bool:
@@ -386,9 +482,11 @@ class PCPIndex:
             self.vectors = None
             self.file_count = 0
             self.fingerprint = ""
+            self._invalidate_lexical_index()
             return False
 
         self.chunks, self.fingerprint, self.file_count = load_pcp_chunks(self.data_dir)
+        self._invalidate_lexical_index()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = self.cache_dir / "embeddings.npz"
         part_path = self.cache_dir / "embeddings.part.npz"
@@ -595,6 +693,7 @@ class PCPIndex:
         all_files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
         self.file_count = len(all_files)
         self.fingerprint = _compute_files_fingerprint(all_files)
+        self._invalidate_lexical_index()
         self._save_cache()
 
         return {
@@ -605,14 +704,19 @@ class PCPIndex:
             "total_passages": len(self.chunks),
         }
 
-    def append_session(self, messages: Sequence[dict], timestamp_str: Optional[str] = None) -> dict:
+    def append_session(
+        self,
+        messages: Sequence[dict],
+        timestamp_str: Optional[str] = None,
+        continuity_note: Optional[str] = None,
+    ) -> dict:
         """Save a live conversation thread into ghost_pcp_*.md with a timestamp and index it immediately."""
         ts = timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines = [f"## **[SESSION LOG: {ts}]**", ""]
         turn_count = 0
         for m in messages:
             role = str(m.get("role") or "").lower().strip()
-            content = str(m.get("content") or "").strip()
+            content = _extract_message_plain_text(m.get("content"))
             content = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", content, flags=re.IGNORECASE).strip()
             if not content or role not in ("user", "assistant"):
                 continue
@@ -623,6 +727,9 @@ class PCPIndex:
 
         if turn_count == 0:
             raise ValueError("No conversation messages to save.")
+        if continuity_note and str(continuity_note).strip():
+            lines.append(f"**CONTINUITY NOTE [{ts}]:** {str(continuity_note).strip()}")
+            lines.append("")
 
         result = self._append_text_block("\n".join(lines).strip(), ts)
         result["turns_saved"] = turn_count
@@ -656,15 +763,19 @@ class PCPIndex:
         result["filename"] = safe_name
         return result
 
-    def search(self, query: str, limit: int = 4) -> List[str]:
-        """Return top-k matching archive excerpts, prioritizing newer timestamped sessions."""
+    def search_detailed(self, query: str, limit: int = 4) -> List[Dict[str, object]]:
+        """Return top-k matching archive passages using hybrid semantic (BGE) + lexical (BM25) ranking."""
         if not self.ready or self.vectors is None:
             return []
         model = self._get_model()
         prompted = "Represent this sentence for searching relevant passages: " + query
         q_vec = model.encode([prompted], normalize_embeddings=True)[0]
         raw_scores = (self.vectors @ q_vec).astype(np.float32, copy=True)
-        scores = raw_scores.copy()
+
+        # Blend normalized BM25 lexical matching so exact names, dates, and nicknames rank sharply
+        bm25 = self._bm25_scores(query)
+        bm25_norm = bm25 / (bm25 + np.float32(2.5))
+        scores = raw_scores + np.float32(0.14) * bm25_norm
 
         n_total = len(self.chunks)
         # Exported archive volumes place newest conversations first (index 0) and oldest last;
@@ -685,4 +796,93 @@ class PCPIndex:
 
         k = max(1, int(limit))
         best_indices = [int(i) for i in np.argsort(-scores)[:k]]
-        return [self.chunks[i] for i in best_indices]
+        out: List[Dict[str, object]] = []
+        for i in best_indices:
+            text = self.chunks[i]
+            kind = "document" if ("[Document:" in text or "# **DOCUMENT:" in text) else (
+                "session" if "[SESSION LOG:" in text else "archive"
+            )
+            out.append({
+                "index": i,
+                "score": round(float(scores[i]), 4),
+                "semantic": round(float(raw_scores[i]), 4),
+                "lexical": round(float(bm25_norm[i]), 4),
+                "kind": kind,
+                "text": text,
+            })
+        return out
+
+    def search(self, query: str, limit: int = 4) -> List[str]:
+        """Return top-k matching archive excerpts, prioritizing newer timestamped sessions."""
+        return [str(item["text"]) for item in self.search_detailed(query, limit=limit)]
+
+    def _safe_volume_path(self, filename: str) -> Path:
+        safe = Path(str(filename or "")).name
+        if not _VOLUME_NAME_RE.match(safe):
+            raise ValueError(f"Invalid volume filename '{filename}'. Expected ghost_pcp_NN.md.")
+        return self.data_dir / safe
+
+    def list_volumes(self) -> List[Dict[str, object]]:
+        if not self.data_dir.is_dir():
+            return []
+        out: List[Dict[str, object]] = []
+        for path in sorted(self.data_dir.glob("ghost_pcp_*.md")):
+            try:
+                st = path.stat()
+                out.append({
+                    "filename": path.name,
+                    "bytes": int(st.st_size),
+                    "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                })
+            except OSError:
+                continue
+        return out
+
+    def read_volume(self, filename: str) -> str:
+        path = self._safe_volume_path(filename)
+        if not path.is_file():
+            raise FileNotFoundError(f"Volume '{path.name}' not found.")
+        return path.read_text(encoding="utf-8-sig", errors="replace")
+
+    def save_volume(
+        self,
+        filename: str,
+        content: str,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> dict:
+        path = self._safe_volume_path(filename)
+        clean = str(content or "").strip()
+        if not clean:
+            raise ValueError("Volume content cannot be empty (use delete if you want to remove a volume).")
+        if path.is_file():
+            backup_dir = self.data_dir / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(path, backup_dir / f"{path.stem}_{stamp}.md")
+        path.write_text(clean + "\n", encoding="utf-8", newline="\n")
+        self.reload(progress_callback=progress_callback)
+        return {
+            "filename": path.name,
+            "total_volumes": self.file_count,
+            "total_passages": self.passage_count,
+        }
+
+    def delete_volume(
+        self,
+        filename: str,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> dict:
+        path = self._safe_volume_path(filename)
+        if not path.is_file():
+            raise FileNotFoundError(f"Volume '{path.name}' not found.")
+        backup_dir = self.data_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(path, backup_dir / f"{path.stem}_deleted_{stamp}.md")
+        path.unlink()
+        self.reload(progress_callback=progress_callback)
+        return {
+            "deleted": path.name,
+            "total_volumes": self.file_count,
+            "total_passages": self.passage_count,
+        }

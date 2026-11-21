@@ -214,6 +214,7 @@ def stage_clean_sandbox(sandbox_dir: Path, link_sample_gguf: bool = True) -> Non
         "ghost_pcp.py",
         "pcp_ingest.py",
         "pcp_retrieval.py",
+        "pcp_web.py",
         "persona.py",
         "ghost_pcp.html",
         "build_pcp.py",
@@ -295,7 +296,7 @@ if __name__ == "__main__":
     print(f"Staging clean first-time-user test folder at: {sandbox}")
     stage_clean_sandbox(sandbox, link_sample_gguf=True)
 
-    release_zip = ROOT.parent / "GHostPCP-v1.2.0-win64.zip"
+    release_zip = ROOT.parent / "GHostPCP-v1.3.0-win64.zip"
     print(f"Packaging distributable GitHub Release archive: {release_zip} ...")
     build_release_zip(sandbox, release_zip)
     print(f"Done! Release zip size: {release_zip.stat().st_size / (1024**2):.1f} MB")

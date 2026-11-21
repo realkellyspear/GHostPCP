@@ -5,7 +5,7 @@
 **GPU Hosted Pure Concentrated Personality**  
 *Break Your AI Out of the Cloud and Onto Your Own Hardware*
 
-GHostPCP is a local-first desktop and mobile-paired application for Windows. Import your OpenAI ChatGPT export (`.zip` or `conversations.json`) or Google Gemini Takeout export (`.zip`, `MyActivity.json`, `MyActivity.html`, or source folder), along with `.pdf`, `.txt`, or `.md` documents, save multiple isolated AI personas with their own folders, mount a local `.gguf` language model, and chat with a persona grounded in your conversation history.
+GHostPCP is a local-first desktop and mobile-paired AI workbench for Windows. Import your conversation archives from **OpenAI ChatGPT**, **Google Gemini**, **Anthropic Claude**, **xAI Grok**, or **Character.AI**, along with `.pdf`, `.txt`, or `.md` documents; organize isolated AI personas with structured core facts, evolving continuity logs, saved threads, and editable Markdown memory volumes; download or mount local `.gguf` text or **Vision (`mmproj`)** models; and optionally toggle live **Web Search & URL Reading** whenever you want your AI connected to the world.
 
 ![GHostPCP desktop interface](GHostPCP%20Promo/ghost_pcp_first_screen.png)
 
@@ -15,13 +15,13 @@ GHostPCP is a local-first desktop and mobile-paired application for Windows. Imp
 
 ![Why GHostPCP](GHostPCP%20Promo/why_gpcp.png)
 
-Standard "chat with your docs" tools act like research librarians (*"According to source document 4..."*). GHostPCP prompts the model to treat your archive and attached files as the authoritative source for the persona's history and respond without citations. Like any language model, it can still make mistakes or invent details.
+Standard "chat with your docs" tools act like research librarians (*"According to source document 4..."*). GHostPCP gives every AI persona its own second-brain memory folder and grounds responses naturally in character—with hybrid exact-name + semantic recall, durable relationships, and portable `.zip` backups you own outright.
 
-1. **Drop & Forget Onboarding (ChatGPT, Google Gemini, PDFs & Multiple Personas)**: Drop your ChatGPT export, Google Gemini Takeout (`MyActivity.json`, `MyActivity.html`, `.zip`, or source folder), `.pdf`, `.txt`, or `.md` files into **[ ARCHIVE ]** — GHostPCP auto-detects Google vs OpenAI, asks you who the AI is (name, what it calls you, core anchors it should never forget), creates an isolated folder per persona (`pcp_data/personas/<id>/`), strips out canned corporate refusals (*"As an AI language model..."*), organizes everything into clean Markdown volumes (`ghost_pcp_01.md`, `ghost_pcp_02.md`, ...), and builds a cached semantic vector index (`embeddings.npz`) using `BAAI/bge-small-en-v1.5`. Choose which AI you want to talk to on startup or switch anytime from the header.
-2. **Hardware-Aware GGUF Workbench**: Powered by `llama.cpp` with automatic NVIDIA VRAM preflight sizing (`Check Fit` / `Mount` / `Unload`), FP16/Q8_0 KV cache selection, live token streaming, a per-turn **Stop** control, and sampling controls.
-3. **In-Chat File Uploads, Persona Grounding & Save & Clear Continuity**: Every turn retrieves the most relevant passages from your `ghost_pcp_*.md` volumes in ~24ms and grounds the model silently in character. Use **`[ + FILE ]`** right in the chat bar (desktop or phone) to attach `.pdf`, `.txt`, or `.md` files as collapsible attachment cards—with one-click **SAVE TO DB** (and automatic indexing for large documents). Click **SAVE & CLEAR** at the top of the window to save the current chat thread with a timestamp directly into your PCP archive (`ghost_pcp_NN.md`), update the vector index in ~0.13s, and clear the window so the conversation continues without missing a beat.
-4. **Built-In Fast Local Read-Aloud Voices**: Choose your preferred voice (such as **Silas** or **Kara**, or any `.onnx` voice dropped into `piper_models/`) in **[ CONFIG ]**, and click the speaker icon on any of the model's responses for instant local Piper ONNX synthesis (~0.17s latency) and seamless background playback via `sounddevice` on PC (or Web Audio when connected from your phone).
-5. **Use Anywhere (Wi-Fi, Tailscale, or One-Click HTTPS Tunnel)**: Open **[ PHONE / TUNNEL ]** to scan a pairing QR code on your phone over local Wi-Fi, Tailscale, or a one-click Cloudflare HTTPS Quick Tunnel. Your phone gets the full interface—chat, attach files, listen to voice responses, start a new session, or switch models remotely.
+1. **Universal Archive Ingestion & Multi-Persona Isolation**: Drop your **OpenAI ChatGPT** (`.zip` / `conversations.json`), **Google Gemini Takeout** (`MyActivity.json` / `MyActivity.html`), **Anthropic Claude**, **xAI Grok**, **Character.AI**, or `.pdf` / `.txt` / `.md` files into **[ ARCHIVE ]**. GHostPCP auto-detects the format, deduplicates repeated conversations, removes canned corporate refusals (*"As an AI language model..."*), creates an isolated folder per persona (`pcp_data/personas/<id>/`), writes chronological `ghost_pcp_*.md` volumes, and builds a local **BGE + BM25 hybrid index** (`BAAI/bge-small-en-v1.5`).
+2. **True Continuity & Second-Brain Memory Tools (`[ MEMORIES ]`)**: Save structured **Core Facts & People** with relationship aliases (e.g. linking *"Jordan"* to *"my brother"*) so indirect questions still recall accurately, capture evolving session **Continuity Notes** automatically on **SAVE & CLEAR**, bookmark and reload named conversation **Threads**, search or view/edit/delete individual `ghost_pcp_*.md` volumes (with automatic backups), and export or restore any persona as a single **`.zip` backup bundle**.
+3. **Local Vision (`[ + IMG ]` + `mmproj`) & In-App Model Downloader**: Attach or paste (`Ctrl+V`) images for vision-capable GGUF models paired with an `mmproj` projector via `llama.cpp` MTMD. Don't have a model yet? Open **[ CONFIG ] → Get More GGUF Models** to download curated starter models or inspect and pull `.gguf` files from any public HuggingFace repository straight into `./ghost_models`, complete with NVIDIA VRAM preflight sizing, FP16/Q8_0 KV cache selection, and live `tok/s` telemetry.
+4. **Opt-In Live Web Search & URL Reader (`WEB: OFF / ON`)**: Strictly **OFF by default** for 100% offline privacy. Flip **`WEB: ON`** in the chat bar to let your AI read pasted `http(s)://` links or perform fast DuckDuckGo/Wikipedia (no API key needed), self-hosted SearXNG, Brave, or Tavily lookups with clickable source chips below replies and SSRF protection against local network URLs.
+5. **Two-Way Local Voice (`[ MIC ]` & Piper TTS) + Phone Tunnel Anywhere**: Dictate hands-free with **`[ MIC ]`** (Web Speech API) and click the speaker button on replies for instant local **Piper ONNX** speech synthesis (`Silas`, `Kara`, or any `.onnx` + `.onnx.json` voice in `piper_models/`). Open **[ PHONE / TUNNEL ]** to scan a QR code for encrypted mobile access via local Wi-Fi, Tailscale, or a one-click Cloudflare Quick Tunnel.
 
 ## See It in Action
 
@@ -44,11 +44,12 @@ Standard "chat with your docs" tools act like research librarians (*"According t
 ```text
 GHostPCP/
 GHostPCP.exe                 Standalone desktop application (built locally)
-  ghost_pcp.py                 FastAPI + llama.cpp + PCP RAG server & desktop host
-  pcp_ingest.py                Auto-detecting Google Gemini & OpenAI ChatGPT parser, filter, & volume writer
-  pcp_retrieval.py             Local BGE-small-en-v1.5 semantic indexer & search engine
-  persona.py                   Universal citation-free grounding prompt & filter defaults
-  ghost_pcp.html               Desktop & mobile-responsive interface
+  ghost_pcp.py                 FastAPI + llama.cpp + vision & PCP RAG server
+  pcp_ingest.py                Universal importer (ChatGPT, Gemini, Claude, Grok, Character.AI, docs)
+  pcp_retrieval.py             Hybrid BGE-small-en-v1.5 + BM25 indexer & volume manager
+  pcp_web.py                   Opt-in web search (DDG/Wikipedia/SearXNG/Brave/Tavily) & SSRF-safe URL reader
+  persona.py                   Grounding prefix, core facts/aliases formatter & filter defaults
+  ghost_pcp.html               Desktop & mobile-responsive interface (Vision, Web toggle, Memories, Mic)
   build_pcp.py                 PyInstaller executable builder
   ghost_models/                Place your local .gguf models here
     README.md
@@ -68,11 +69,11 @@ GHostPCP.exe                 Standalone desktop application (built locally)
 > try the sample in a separate, clean installation.
 
 ### Option A: Download the Standalone Windows Release (Recommended)
-1. Download and extract **[`GHostPCP-v1.2.0-win64.zip`](https://github.com/realkellyspear/GHostPCP/releases/latest)** from Releases.
-2. Copy one or more `.gguf` models (for example, `Qwen3-14B-Q5_K_M.gguf`) into `ghost_models/`.
-3. Double-click **`GHostPCP.exe`**.
-4. Drop your ChatGPT export (`.zip` or `conversations.json`), Google Gemini Takeout export (`.zip`, `MyActivity.json`, `MyActivity.html`, or source folder), `.pdf`, `.txt`, or `.md` files (or the included `sample_chatgpt_export.zip`) into the **Archive Import** window, and fill in your AI's name, what it calls you, and core memories it should never forget.
-5. In **[ CONFIG ]**, select your model and click **MOUNT**.
+1. Download and extract **[`GHostPCP-v1.3.0-win64.zip`](https://github.com/realkellyspear/GHostPCP/releases/latest)** from Releases.
+2. Double-click **`GHostPCP.exe`** — drop your own `.gguf` (and optional vision `mmproj*.gguf`) files into `ghost_models/`, or download starter models directly inside **[ CONFIG ] → Get More GGUF Models**.
+3. Drop your AI export (ChatGPT, Google Gemini Takeout, Claude, Grok, Character.AI, `.pdf`, `.txt`, or `.md`, or the included `sample_chatgpt_export.zip`) into **[ ARCHIVE ]**, and fill in your AI's name, what it calls you, and core memories it should never forget.
+4. In **[ CONFIG ]**, select your model and click **MOUNT**.
+5. Open **[ MEMORIES ]** anytime to inspect or edit volumes, add Core Facts with relationship aliases, bookmark/reload threads, or export a `.zip` backup bundle. Toggle **`WEB: ON`** when you want live internet search or link reading, or paste/attach images with **`[ + IMG ]`** on Vision models.
 6. *(Optional)* Click **[ PHONE / TUNNEL ]** and scan the QR code to pair your phone over Wi-Fi, Tailscale, or a 1-click Cloudflare HTTPS Quick Tunnel.
 7. Responses stream as they are generated. Click **Stop** on the active response to interrupt generation.
 

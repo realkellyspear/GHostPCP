@@ -36,6 +36,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import wave
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
@@ -60,12 +61,15 @@ from pcp_ingest import (
     extract_text_from_document,
     ingest_files,
 )
-from pcp_retrieval import IngestCancelledError, PCPIndex
+from pcp_retrieval import IngestCancelledError, PCPIndex, _extract_message_plain_text
+from pcp_web import gather_web_context
 from persona import (
     DEFAULT_BLOCKED_PHRASES,
     DEFAULT_PROTECTED_WORDS,
     SYSTEM_PROMPT,
     build_persona_prompt_prefix,
+    build_web_grounding_note,
+    format_core_facts_block,
     strip_builtin_system_prompt,
 )
 
@@ -120,6 +124,11 @@ def _configure_runtime_backend() -> tuple[str, Path]:
     if package_spec is None or package_spec.origin is None:
         raise RuntimeError("llama_cpp Python package is unavailable.")
     package_lib = Path(package_spec.origin).parent / "lib"
+
+    if os.name != "nt":
+        # Non-Windows (macOS Metal / Linux CUDA/Vulkan/CPU): use llama_cpp's packaged shared libraries
+        selected = "gpu" if sys.platform == "darwin" else ("cuda" if _probe_nvidia_runtime() else "cpu")
+        return selected, package_lib
 
     candidates = {
         backend: BACKEND_ROOT / backend
@@ -206,6 +215,7 @@ def _configure_runtime_backend() -> tuple[str, Path]:
 BACKEND_NAME, RUNTIME_LLAMA_LIB_DIR = _configure_runtime_backend()
 
 from llama_cpp import Llama, llama_cpp
+from llama_cpp.llama_chat_format import MTMDChatHandler
 
 # =====================================================================
 # CONFIGURATION
@@ -268,6 +278,7 @@ N_BATCH = 512
 
 DEFAULT_SETTINGS = {
     "model": "Qwen3-14B-Q5_K_M.gguf",
+    "mmproj_model": "auto",
     "chat_format": "auto",
     "system_prompt": "",
     "pcp_enabled": True,
@@ -276,6 +287,13 @@ DEFAULT_SETTINGS = {
     "blocked_phrases": "\n".join(DEFAULT_BLOCKED_PHRASES),
     "protected_words": "\n".join(DEFAULT_PROTECTED_WORDS),
     "show_reasoning": False,
+    "web_enabled": False,
+    "web_provider": "auto",
+    "web_searxng_url": "",
+    "web_api_key": "",
+    "web_search_mode": "smart",
+    "web_cite_sources": True,
+    "auto_continuity_summary": True,
     "temperature": 0.7,
     "top_p": 0.95,
     "min_p": 0.05,
@@ -330,15 +348,18 @@ class EngineState:
         self.loaded_context_size: Optional[int] = None
         self.loaded_kv_cache_type: Optional[str] = None
         self.loaded_chat_format: Optional[str] = None
+        self.loaded_mmproj: Optional[str] = None
+        self.loaded_vision_capable: bool = False
         self.locked = False
         self.busy = False
         self.streaming = False
         self.generation_id = 0
         self.abort_event = threading.Event()
         self._lease = threading.Lock()
-        self.conversation: List[Dict[str, str]] = []
+        self.conversation: List[Dict[str, Any]] = []
         self._history_lock = threading.Lock()
         self.prior_assistant_tokens: List[int] = []
+        self.last_turn_meta: Dict[str, Any] = {}
 
     def begin_generation(self, streaming: bool) -> int:
         with self._lease:
@@ -401,9 +422,41 @@ class TunnelState:
         self.error: Optional[str] = None
 
 
+class ModelDownloadState:
+    def __init__(self):
+        self.running = False
+        self.stage = "Idle"
+        self.repo_id = ""
+        self.filename = ""
+        self.mmproj_filename = ""
+        self.downloaded_bytes = 0
+        self.total_bytes = 0
+        self.progress_pct = 0.0
+        self.speed_mbps = 0.0
+        self.error: Optional[str] = None
+        self.cancel_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "running": self.running,
+                "stage": self.stage,
+                "repo_id": self.repo_id,
+                "filename": self.filename,
+                "mmproj_filename": self.mmproj_filename,
+                "downloaded_bytes": self.downloaded_bytes,
+                "total_bytes": self.total_bytes,
+                "progress_pct": round(self.progress_pct, 1),
+                "speed_mbps": round(self.speed_mbps, 2),
+                "error": self.error,
+            }
+
+
 STATE = EngineState()
 INGEST_STATE = IngestState()
 TUNNEL_STATE = TunnelState()
+MODEL_DOWNLOAD_STATE = ModelDownloadState()
 PCP_INDEX: Optional[PCPIndex] = None
 PAIRING_TOKEN: str = ""
 _PIPER_VOICES: Dict[str, Any] = {}
@@ -622,6 +675,7 @@ def _normalize_persona_record(raw: dict) -> Optional[dict]:
         "user_name": str(raw.get("user_name") or "").strip(),
         "never_forget": str(raw.get("never_forget") or "").strip(),
         "notes": strip_builtin_system_prompt(str(raw.get("notes") or "")),
+        "continuity_notes": str(raw.get("continuity_notes") or "").strip(),
         "tts_voice": str(raw.get("tts_voice") or "silas").strip() or "silas",
         "preferred_model": str(raw.get("preferred_model") or "").strip(),
         "protected_words": str(raw.get("protected_words") or "").strip(),
@@ -645,6 +699,7 @@ def _legacy_default_persona() -> dict:
         "user_name": "",
         "never_forget": "",
         "notes": strip_builtin_system_prompt(settings.get("system_prompt", "")),
+        "continuity_notes": "",
         "tts_voice": str(settings.get("tts_voice") or "silas"),
         "preferred_model": "",
         "protected_words": str(settings.get("protected_words") or ""),
@@ -735,27 +790,329 @@ def _get_active_pcp_dir() -> Path:
     return _resolve_persona_folder(persona.get("folder", "."))
 
 
-def _save_persona_chat_history(persona_dir: Path, messages: List[Dict[str, str]]) -> None:
+_SAFE_DATA_IMAGE_URL_RE = re.compile(
+    r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$",
+    re.IGNORECASE,
+)
+_MAX_IMAGE_DATA_URL_CHARS = 12 * 1024 * 1024
+_MAX_IMAGES_PER_MESSAGE = 6
+
+
+def _sanitize_message_content(
+    content: Any,
+    max_text_chars: int = 200000,
+    keep_images: bool = True,
+) -> Union[str, List[Dict[str, Any]]]:
+    """Validate text and safe base64 raster data-URL image parts; never allow remote/file image URLs."""
+    if isinstance(content, str):
+        return content[:max_text_chars]
+    if not isinstance(content, list):
+        return str(content or "")[:max_text_chars]
+
+    cleaned_parts: List[Dict[str, Any]] = []
+    remaining_chars = max_text_chars
+    image_count = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = str(part.get("type") or "").strip().lower()
+        if ptype == "text":
+            txt = str(part.get("text") or "")
+            if txt and remaining_chars > 0:
+                piece = txt[:remaining_chars]
+                remaining_chars -= len(piece)
+                cleaned_parts.append({"type": "text", "text": piece})
+        elif ptype == "image_url" and keep_images and image_count < _MAX_IMAGES_PER_MESSAGE:
+            img_obj = part.get("image_url")
+            url = str(img_obj.get("url") or "").strip() if isinstance(img_obj, dict) else ""
+            if url and len(url) <= _MAX_IMAGE_DATA_URL_CHARS and _SAFE_DATA_IMAGE_URL_RE.match(url):
+                image_count += 1
+                cleaned_parts.append({"type": "image_url", "image_url": {"url": url}})
+
+    if not cleaned_parts:
+        return ""
+    if all(p.get("type") == "text" for p in cleaned_parts):
+        return "".join(str(p.get("text") or "") for p in cleaned_parts)
+    return cleaned_parts
+
+
+def _save_persona_chat_history(persona_dir: Path, messages: List[Dict[str, Any]]) -> None:
     persona_dir.mkdir(parents=True, exist_ok=True)
+    cleaned: List[Dict[str, Any]] = []
+    for item in messages or []:
+        if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+            continue
+        sanitized = _sanitize_message_content(item.get("content"), keep_images=True)
+        if sanitized or isinstance(sanitized, list):
+            cleaned.append({"role": item["role"], "content": sanitized})
     hist_path = persona_dir / "chat_history.json"
     tmp_path = persona_dir / "chat_history.json.tmp"
-    tmp_path.write_text(json.dumps({"messages": messages}, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.write_text(json.dumps({"messages": cleaned}, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp_path, hist_path)
 
 
-def _load_persona_chat_history(persona_dir: Path) -> List[Dict[str, str]]:
+def _load_persona_chat_history(persona_dir: Path) -> List[Dict[str, Any]]:
     hist_path = persona_dir / "chat_history.json"
     if not hist_path.is_file():
         return []
     try:
         raw = json.loads(hist_path.read_text(encoding="utf-8"))
-        cleaned: List[Dict[str, str]] = []
+        cleaned: List[Dict[str, Any]] = []
         for item in raw.get("messages") or []:
-            if isinstance(item, dict) and item.get("role") in ("user", "assistant") and isinstance(item.get("content"), str):
-                cleaned.append({"role": item["role"], "content": item["content"]})
+            if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+                continue
+            sanitized = _sanitize_message_content(item.get("content"), keep_images=True)
+            if sanitized or isinstance(sanitized, list):
+                cleaned.append({"role": item["role"], "content": sanitized})
         return cleaned
     except Exception:
         return []
+
+
+def _facts_path(persona_dir: Path) -> Path:
+    return persona_dir / "facts.json"
+
+
+def _load_persona_facts(persona_dir: Path) -> List[Dict[str, Any]]:
+    fpath = _facts_path(persona_dir)
+    if not fpath.is_file():
+        return []
+    try:
+        raw = json.loads(fpath.read_text(encoding="utf-8"))
+        items = raw.get("facts") if isinstance(raw, dict) else raw
+        cleaned: List[Dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            subj = str(item.get("subject") or "").strip()
+            fact = str(item.get("fact") or "").strip()
+            if not subj or not fact:
+                continue
+            aliases = [
+                str(a).strip() for a in (item.get("aliases") or []) if str(a).strip()
+            ]
+            cleaned.append({
+                "id": str(item.get("id") or "").strip() or re.sub(r"[^a-z0-9]+", "-", subj.lower()).strip("-") or "fact",
+                "subject": subj[:120],
+                "aliases": aliases[:12],
+                "category": str(item.get("category") or "general").strip()[:40] or "general",
+                "fact": fact[:1200],
+                "pinned": bool(item.get("pinned", True)),
+                "updated_at": str(item.get("updated_at") or "").strip(),
+            })
+        return cleaned
+    except Exception as exc:
+        log.warning(f"Could not read facts.json: {exc}")
+        return []
+
+
+def _save_persona_facts(persona_dir: Path, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    fpath = _facts_path(persona_dir)
+    tmp_path = fpath.with_name("facts.json.tmp")
+    tmp_path.write_text(json.dumps({"version": 1, "facts": facts}, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, fpath)
+    return facts
+
+
+def _add_or_update_persona_fact(
+    persona_dir: Path,
+    subject: str,
+    fact: str,
+    aliases: Optional[List[str]] = None,
+    category: str = "general",
+    pinned: bool = True,
+    fact_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    with _PERSONA_LOCK:
+        facts = _load_persona_facts(persona_dir)
+        clean_subj = str(subject or "").strip()[:120]
+        clean_fact = str(fact or "").strip()[:1200]
+        if not clean_subj or not clean_fact:
+            raise HTTPException(status_code=400, detail="Subject and fact text are required.")
+        clean_aliases = [str(a).strip()[:80] for a in (aliases or []) if str(a).strip()][:12]
+        clean_cat = str(category or "general").strip()[:40] or "general"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+
+        target_id = str(fact_id or "").strip()
+        if not target_id:
+            base = re.sub(r"[^a-z0-9]+", "-", clean_subj.lower()).strip("-") or "fact"
+            existing_ids = {f["id"] for f in facts}
+            target_id = base
+            idx = 2
+            while target_id in existing_ids:
+                target_id = f"{base}-{idx}"
+                idx += 1
+
+        record = {
+            "id": target_id,
+            "subject": clean_subj,
+            "aliases": clean_aliases,
+            "category": clean_cat,
+            "fact": clean_fact,
+            "pinned": bool(pinned),
+            "updated_at": now_iso,
+        }
+        replaced = False
+        for i, item in enumerate(facts):
+            if item["id"] == target_id:
+                facts[i] = record
+                replaced = True
+                break
+        if not replaced:
+            facts.append(record)
+        _save_persona_facts(persona_dir, facts)
+        return record
+
+
+def _delete_persona_fact(persona_dir: Path, fact_id: str) -> bool:
+    with _PERSONA_LOCK:
+        facts = _load_persona_facts(persona_dir)
+        kept = [f for f in facts if f.get("id") != fact_id]
+        if len(kept) == len(facts):
+            return False
+        _save_persona_facts(persona_dir, kept)
+        return True
+
+
+def _threads_dir(persona_dir: Path) -> Path:
+    return persona_dir / "threads"
+
+
+def _resolve_thread_path(persona_dir: Path, thread_id: str) -> Path:
+    clean_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(thread_id or "").strip()).strip(".-")
+    if not clean_id or len(clean_id) > 120:
+        raise HTTPException(status_code=400, detail="Invalid thread id.")
+    tdir = _threads_dir(persona_dir).resolve()
+    target = (tdir / f"{clean_id}.json").resolve()
+    if target.parent != tdir:
+        raise HTTPException(status_code=400, detail="Invalid thread path.")
+    return target
+
+
+def _list_persona_threads(persona_dir: Path) -> List[Dict[str, Any]]:
+    tdir = _threads_dir(persona_dir)
+    if not tdir.is_dir():
+        return []
+    threads: List[Dict[str, Any]] = []
+    for fpath in sorted(tdir.glob("*.json"), reverse=True):
+        try:
+            raw = json.loads(fpath.read_text(encoding="utf-8"))
+            msgs = raw.get("messages") or []
+            threads.append({
+                "id": fpath.stem,
+                "title": str(raw.get("title") or fpath.stem),
+                "message_count": len(msgs),
+                "preview": str(raw.get("preview") or ""),
+                "created_at": str(raw.get("created_at") or ""),
+                "updated_at": str(raw.get("updated_at") or ""),
+            })
+        except Exception:
+            continue
+    return threads
+
+
+def _save_persona_thread(
+    persona_dir: Path,
+    messages: List[Dict[str, Any]],
+    title: str = "",
+    thread_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    cleaned: List[Dict[str, Any]] = []
+    for item in messages or []:
+        if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+            continue
+        sanitized = _sanitize_message_content(item.get("content"), keep_images=True)
+        if sanitized or isinstance(sanitized, list):
+            cleaned.append({"role": item["role"], "content": sanitized})
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Cannot save an empty thread.")
+
+    tdir = _threads_dir(persona_dir)
+    tdir.mkdir(parents=True, exist_ok=True)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    clean_title = str(title or "").strip()[:120]
+    first_user = next(
+        (_extract_message_plain_text(m["content"]) for m in cleaned if m["role"] == "user"),
+        "",
+    )
+    if not clean_title:
+        clean_title = (first_user.splitlines()[0][:64].strip() if first_user else "") or f"Thread {now_iso}"
+    preview = first_user[:160].replace("\n", " ").strip()
+
+    if thread_id:
+        tpath = _resolve_thread_path(persona_dir, thread_id)
+        tid = tpath.stem
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = re.sub(r"[^a-z0-9]+", "-", clean_title.lower()).strip("-")[:32] or "chat"
+        tid = f"{stamp}_{slug}"
+        tpath = _resolve_thread_path(persona_dir, tid)
+        suffix = 2
+        while tpath.exists():
+            tid = f"{stamp}_{slug}_{suffix}"
+            tpath = _resolve_thread_path(persona_dir, tid)
+            suffix += 1
+
+    created_at = now_iso
+    if tpath.is_file():
+        try:
+            prev = json.loads(tpath.read_text(encoding="utf-8"))
+            created_at = str(prev.get("created_at") or now_iso)
+        except Exception:
+            pass
+
+    payload = {
+        "id": tid,
+        "title": clean_title,
+        "preview": preview,
+        "created_at": created_at,
+        "updated_at": now_iso,
+        "messages": cleaned,
+    }
+    tmp_path = tpath.with_name(f"{tid}.json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, tpath)
+    return {
+        "id": tid,
+        "title": clean_title,
+        "message_count": len(cleaned),
+        "preview": preview,
+        "created_at": created_at,
+        "updated_at": now_iso,
+    }
+
+
+def _load_persona_thread(persona_dir: Path, thread_id: str) -> Dict[str, Any]:
+    tpath = _resolve_thread_path(persona_dir, thread_id)
+    if not tpath.is_file():
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
+    try:
+        raw = json.loads(tpath.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read thread: {exc}")
+    cleaned: List[Dict[str, Any]] = []
+    for item in raw.get("messages") or []:
+        if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
+            continue
+        sanitized = _sanitize_message_content(item.get("content"), keep_images=True)
+        if sanitized or isinstance(sanitized, list):
+            cleaned.append({"role": item["role"], "content": sanitized})
+    return {
+        "id": str(raw.get("id") or tpath.stem),
+        "title": str(raw.get("title") or tpath.stem),
+        "messages": cleaned,
+        "created_at": str(raw.get("created_at") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+    }
+
+
+def _delete_persona_thread(persona_dir: Path, thread_id: str) -> bool:
+    tpath = _resolve_thread_path(persona_dir, thread_id)
+    if not tpath.is_file():
+        return False
+    tpath.unlink()
+    return True
 
 
 def _create_persona_entry(
@@ -763,6 +1120,7 @@ def _create_persona_entry(
     user_name: str = "",
     never_forget: str = "",
     notes: str = "",
+    continuity_notes: str = "",
     tts_voice: str = "silas",
     preferred_model: str = "",
     protected_words: str = "",
@@ -787,6 +1145,7 @@ def _create_persona_entry(
             "user_name": str(user_name or "").strip(),
             "never_forget": str(never_forget or "").strip(),
             "notes": strip_builtin_system_prompt(str(notes or "")),
+            "continuity_notes": str(continuity_notes or "").strip(),
             "tts_voice": str(tts_voice or "silas").strip() or "silas",
             "preferred_model": str(preferred_model or "").strip(),
             "protected_words": str(protected_words or "").strip(),
@@ -817,6 +1176,7 @@ def _update_persona_entry(persona_id: str, updates: Dict[str, Any]) -> dict:
             "user_name",
             "never_forget",
             "notes",
+            "continuity_notes",
             "tts_voice",
             "preferred_model",
             "protected_words",
@@ -852,6 +1212,8 @@ def _persona_summary(persona: dict, active_id: Optional[str]) -> dict:
         passages = PCP_INDEX.passage_count
     else:
         ready = bool(vol_files) and (folder_path / "embeddings.npz").is_file()
+    facts_count = len(_load_persona_facts(folder_path)) if folder_path.is_dir() else 0
+    threads_count = len(list((_threads_dir(folder_path)).glob("*.json"))) if _threads_dir(folder_path).is_dir() else 0
     return {
         **persona,
         "active": is_active,
@@ -859,6 +1221,8 @@ def _persona_summary(persona: dict, active_id: Optional[str]) -> dict:
         "volumes": len(vol_files),
         "passages": passages,
         "ready": ready,
+        "facts_count": facts_count,
+        "threads_count": threads_count,
     }
 
 
@@ -1137,15 +1501,122 @@ def stop_cloudflare_tunnel() -> None:
 # DIRECTORY SCAN & PREFLIGHT VRAM SCHEDULER
 # =====================================================================
 
+_VISION_MODEL_RE = re.compile(
+    r"(?:^|[-_.])(?:vl|vision|multimodal|llava|pixtral|internvl|minicpm[-_]?v|gemma[-_]?3|gemma[-_]?4|qwen2\.5[-_]?vl|qwen3[-_]?vl)(?:$|[-_.0-9])",
+    re.IGNORECASE,
+)
+_MMPROJ_IGNORE_TOKENS = {
+    "mmproj", "model", "gguf", "f16", "fp16", "bf16", "f32", "fp32",
+    "q8", "q8_0", "q4", "q4_k_m", "q4_k_s", "q5_k_m", "q6_k",
+    "instruct", "chat", "it",
+}
+_QUANT_SUFFIX_RE = re.compile(
+    r"(?:[-_.](?:i?q\d(?:_[a-z0-9_]+)?|[bf]?f(?:p)?(?:16|32)))(?:\.gguf)?$",
+    re.IGNORECASE,
+)
+
+
+def _is_mmproj_filename(filename: str) -> bool:
+    return "mmproj" in str(filename or "").lower()
+
+
+def _looks_like_vision_model(filename: str) -> bool:
+    return bool(_VISION_MODEL_RE.search(str(filename or "")))
+
+
+def _family_tokens(filename: str) -> Set[str]:
+    stem = _QUANT_SUFFIX_RE.sub("", str(filename or ""))
+    if stem.lower().endswith(".gguf"):
+        stem = stem[:-5]
+    raw_tokens = re.split(r"[^a-z0-9.]+", stem.lower())
+    tokens: Set[str] = set()
+    for tok in raw_tokens:
+        tok = tok.strip(".")
+        if not tok or tok in _MMPROJ_IGNORE_TOKENS:
+            continue
+        tokens.add(tok)
+    return tokens
+
+
+def scan_mmproj_files() -> List[Dict[str, Any]]:
+    if not MODEL_DIR.exists():
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    items: List[Dict[str, Any]] = []
+    for f in sorted(MODEL_DIR.glob("*.gguf")):
+        if not _is_mmproj_filename(f.name):
+            continue
+        try:
+            file_size_bytes = f.stat().st_size
+        except OSError:
+            file_size_bytes = 0
+        items.append({
+            "id": f.name,
+            "size_gb": round(file_size_bytes / (1024 ** 3), 2),
+            "file_size_bytes": file_size_bytes,
+            "file_size_gib": round(file_size_bytes / GIB, 3),
+        })
+    return items
+
+
+def _find_paired_mmproj(
+    model_filename: str,
+    requested_mmproj: str = "",
+    strict: bool = False,
+) -> Optional[str]:
+    req = str(requested_mmproj or "").strip()
+    if req.lower() in ("none", "off", "disabled"):
+        return None
+    if req and req.lower() != "auto":
+        if "/" in req or "\\" in req or ".." in req:
+            if strict:
+                raise HTTPException(status_code=400, detail="Invalid mmproj filename.")
+            return None
+        candidate = MODEL_DIR / req
+        if not candidate.is_file() or not _is_mmproj_filename(req):
+            if strict:
+                raise HTTPException(status_code=404, detail=f"Vision projector '{req}' not found in ./ghost_models.")
+            return None
+        return req
+
+    mmproj_files = [m["id"] for m in scan_mmproj_files()]
+    if not mmproj_files:
+        return None
+
+    model_tokens = _family_tokens(model_filename)
+    is_vision = _looks_like_vision_model(model_filename)
+    best_name: Optional[str] = None
+    best_score = 0
+
+    for cand in mmproj_files:
+        cand_tokens = _family_tokens(cand)
+        shared = model_tokens & cand_tokens
+        if not shared:
+            continue
+        # Require either >=2 meaningful shared family/size tokens or strong vision signal + distinctive family match
+        distinctive = [t for t in shared if not t.isdigit() and len(t) >= 3]
+        score = len(shared) * 10 + (8 if distinctive else 0)
+        if is_vision and _looks_like_vision_model(cand) and distinctive:
+            score += 10
+        if len(shared) >= 2 or (is_vision and distinctive):
+            if score > best_score:
+                best_score = score
+                best_name = cand
+
+    return best_name
+
+
 def scan_models() -> List[Dict[str, Any]]:
     if not MODEL_DIR.exists():
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
     models = []
     for f in sorted(MODEL_DIR.glob("*.gguf")):
+        if _is_mmproj_filename(f.name):
+            continue
         try:
             file_size_bytes = f.stat().st_size
         except OSError:
             file_size_bytes = 0
+        auto_mmproj = _find_paired_mmproj(f.name, "auto", strict=False)
         models.append({
             "id": f.name,
             "object": "model",
@@ -1154,6 +1625,8 @@ def scan_models() -> List[Dict[str, Any]]:
             "size_gb": round(file_size_bytes / (1024 ** 3), 2),
             "file_size_bytes": file_size_bytes,
             "file_size_gib": round(file_size_bytes / GIB, 3),
+            "auto_mmproj": auto_mmproj,
+            "vision_likely": bool(auto_mmproj) or _looks_like_vision_model(f.name),
         })
     return models
 
@@ -1213,7 +1686,7 @@ def _probe_nvidia_gpus() -> List[Dict[str, Any]]:
     return devices
 
 
-def preflight_model(filename: str, context_size: int) -> dict:
+def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto") -> dict:
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")
     path = MODEL_DIR / filename
@@ -1221,6 +1694,15 @@ def preflight_model(filename: str, context_size: int) -> dict:
         raise HTTPException(status_code=404, detail=f"Model '{filename}' not found in ./ghost_models.")
     if STATE.loaded_model is None:
         _release_peer_ghost_anchor_vram()
+
+    strict_mmproj = bool(mmproj_model and str(mmproj_model).strip().lower() not in ("auto", "none", "off", "disabled"))
+    paired_mmproj = _find_paired_mmproj(filename, mmproj_model, strict=strict_mmproj)
+    mmproj_bytes = 0
+    if paired_mmproj:
+        try:
+            mmproj_bytes = (MODEL_DIR / paired_mmproj).stat().st_size
+        except OSError:
+            mmproj_bytes = 0
 
     try:
         reader = GGUFReader(path)
@@ -1312,9 +1794,12 @@ def preflight_model(filename: str, context_size: int) -> dict:
         )
         kv_q8_bytes = (kv_f16_bytes * 34 + 63) // 64
         kv_method = "dense_gqa_fp16"
-    compute_reserve_bytes = int(0.5 * GIB + 0.04 * weight_bytes)
+    mmproj_reserve_bytes = int(mmproj_bytes * 1.15) if paired_mmproj else 0
+    compute_reserve_bytes = int(0.5 * GIB + 0.04 * weight_bytes) + mmproj_reserve_bytes
     devices = _probe_nvidia_gpus() if BACKEND_NAME == "cuda" else []
     warnings = []
+    if paired_mmproj:
+        warnings.append(f"Paired vision projector '{paired_mmproj}' (+{round(mmproj_reserve_bytes / GIB, 2)} GiB VRAM reserve).")
     gpu_layers = 0
     gpu_weight_bytes = 0
     kv_cache_bytes = kv_f16_bytes
@@ -1402,6 +1887,9 @@ def preflight_model(filename: str, context_size: int) -> dict:
         "non_layer_weight_bytes": non_layer_bytes,
         "gpu_layer_weight_bytes": gpu_weight_bytes,
         "predicted_gpu_bytes": predicted_gpu_bytes,
+        "mmproj_model": paired_mmproj,
+        "mmproj_bytes": mmproj_bytes,
+        "vision_capable": bool(paired_mmproj),
         "warnings": warnings,
         "estimate_note": "Tensor bytes are read from the GGUF index. Dense KV is an FP16 upper-bound estimate.",
     }
@@ -1415,6 +1903,10 @@ def unload_current_model() -> None:
     if STATE.llm is not None:
         log.info(f"Unloading resident model '{STATE.loaded_model}' ...")
         try:
+            chat_handler = getattr(STATE.llm, "chat_handler", None)
+            if chat_handler is not None:
+                STATE.llm.chat_handler = None
+                del chat_handler
             del STATE.llm
         except Exception as e:
             log.warning(f"Exception during model deletion: {e}")
@@ -1425,6 +1917,8 @@ def unload_current_model() -> None:
         STATE.loaded_context_size = None
         STATE.loaded_kv_cache_type = None
         STATE.loaded_chat_format = None
+        STATE.loaded_mmproj = None
+        STATE.loaded_vision_capable = False
 
         for _ in range(3):
             gc.collect()
@@ -1436,6 +1930,7 @@ def load_model(
     filename: str,
     context_size: int,
     chat_format: str = "auto",
+    mmproj_model: str = "auto",
 ) -> dict:
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")
@@ -1448,25 +1943,51 @@ def load_model(
         STATE.locked = True
     try:
         unload_current_model()
-        preflight = preflight_model(filename, context_size)
+        preflight = preflight_model(filename, context_size, mmproj_model=mmproj_model)
         gpu_layers = int(preflight["n_gpu_layers"])
-        log.info(f"Loading '{filename}' (preflight n_gpu_layers={gpu_layers}, n_ctx={context_size}) ...")
+        paired_mmproj = preflight.get("mmproj_model")
+        log.info(
+            f"Loading '{filename}' (preflight n_gpu_layers={gpu_layers}, n_ctx={context_size}, mmproj={paired_mmproj or 'none'}) ..."
+        )
         t0 = time.perf_counter()
         try:
-            STATE.llm = Llama(
-                model_path=str(path),
-                n_gpu_layers=gpu_layers,
-                n_ctx=context_size,
-                n_threads=N_THREADS,
-                n_batch=N_BATCH,
-                last_n_tokens_size=1024,
-                type_k=int(preflight["kv_type"]),
-                type_v=int(preflight["kv_type"]),
-                offload_kqv=gpu_layers > 0,
-                flash_attn=FLASH_ATTN if gpu_layers > 0 else False,
-                chat_format=None if chat_format == "auto" else chat_format,
-                verbose=False,
-            )
+            chat_handler = None
+            effective_chat_format = None if chat_format == "auto" else chat_format
+            if paired_mmproj:
+                if MTMDChatHandler is None:
+                    msg = f"Vision projector '{paired_mmproj}' found, but MTMDChatHandler is unavailable in llama-cpp-python."
+                    log.warning(msg)
+                    preflight.setdefault("warnings", []).append(msg)
+                    preflight["mmproj_model"] = None
+                    preflight["vision_capable"] = False
+                    paired_mmproj = None
+                else:
+                    clip_path = MODEL_DIR / paired_mmproj
+                    chat_handler = MTMDChatHandler(
+                        clip_model_path=str(clip_path),
+                        use_gpu=gpu_layers > 0,
+                        verbose=False,
+                    )
+                    effective_chat_format = None
+
+            llama_kwargs: Dict[str, Any] = {
+                "model_path": str(path),
+                "n_gpu_layers": gpu_layers,
+                "n_ctx": context_size,
+                "n_threads": N_THREADS,
+                "n_batch": N_BATCH,
+                "last_n_tokens_size": 1024,
+                "type_k": int(preflight["kv_type"]),
+                "type_v": int(preflight["kv_type"]),
+                "offload_kqv": gpu_layers > 0,
+                "flash_attn": FLASH_ATTN if gpu_layers > 0 else False,
+                "chat_format": effective_chat_format,
+                "verbose": False,
+            }
+            if chat_handler is not None:
+                llama_kwargs["chat_handler"] = chat_handler
+
+            STATE.llm = Llama(**llama_kwargs)
             orig_init_sampler = STATE.llm._init_sampler
 
             def _patched_init_sampler(*s_args, **s_kwargs):
@@ -1493,11 +2014,279 @@ def load_model(
         STATE.loaded_context_size = context_size
         STATE.loaded_kv_cache_type = preflight["kv_cache_type"]
         STATE.loaded_chat_format = chat_format
-        log.info(f"Model '{filename}' resident in VRAM. Load time: {dt:.2f}s")
+        STATE.loaded_mmproj = paired_mmproj
+        STATE.loaded_vision_capable = bool(paired_mmproj)
+        log.info(
+            f"Model '{filename}' resident in VRAM (vision={STATE.loaded_vision_capable}). Load time: {dt:.2f}s"
+        )
         return preflight
     finally:
         with STATE._lease:
             STATE.locked = False
+
+
+# =====================================================================
+# CURATED MODEL CATALOG & HUGGINGFACE DOWNLOADER
+# =====================================================================
+
+_MODEL_CATALOG: List[Dict[str, Any]] = [
+    {
+        "id": "qwen3-8b-q4km",
+        "title": "Qwen3 8B Instruct (Q4_K_M)",
+        "category": "Fast General + Reasoning",
+        "repo_id": "Qwen/Qwen3-8B-GGUF",
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "save_as": "Qwen3-8B-Q4_K_M.gguf",
+        "mmproj_filename": None,
+        "mmproj_save_as": None,
+        "size_gb": 4.68,
+        "vram_note": "Fits smoothly in 8 GB VRAM",
+        "vision": False,
+        "description": "Sharp everyday chat, coding, and toggleable reasoning at high speed.",
+    },
+    {
+        "id": "llama-3.1-8b-q4km",
+        "title": "Meta Llama 3.1 8B Instruct (Q4_K_M)",
+        "category": "Balanced Companion",
+        "repo_id": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "save_as": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "mmproj_filename": None,
+        "mmproj_save_as": None,
+        "size_gb": 4.58,
+        "vram_note": "Fits smoothly in 8 GB VRAM",
+        "vision": False,
+        "description": "Classic, warm conversational baseline with reliable instruction following.",
+    },
+    {
+        "id": "qwen2.5-vl-7b-q4km",
+        "title": "Qwen 2.5 VL 7B Instruct + Vision (Q4_K_M)",
+        "category": "Vision + OCR + Chat",
+        "repo_id": "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF",
+        "filename": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+        "save_as": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf",
+        "mmproj_save_as": "mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf",
+        "size_gb": 5.15,
+        "vram_note": "Recommended 8–12 GB VRAM (includes mmproj)",
+        "vision": True,
+        "description": "Understands screenshots, documents, handwriting, photos, and UI mockups.",
+    },
+    {
+        "id": "gemma-3-4b-vision-q4km",
+        "title": "Gemma 3 4B IT + Vision (Q4_K_M)",
+        "category": "Compact Vision",
+        "repo_id": "ggml-org/gemma-3-4b-it-GGUF",
+        "filename": "gemma-3-4b-it-Q4_K_M.gguf",
+        "save_as": "gemma-3-4b-it-Q4_K_M.gguf",
+        "mmproj_filename": "mmproj-model-f16.gguf",
+        "mmproj_save_as": "gemma-3-4b-it-mmproj-f16.gguf",
+        "size_gb": 3.11,
+        "vram_note": "Fits in 6 GB VRAM (includes mmproj)",
+        "vision": True,
+        "description": "Lightweight Google Gemma 3 model paired with its vision projector.",
+    },
+    {
+        "id": "qwen2.5-3b-q4km",
+        "title": "Qwen 2.5 3B Instruct (Q4_K_M)",
+        "category": "Ultra-Light / Laptop",
+        "repo_id": "bartowski/Qwen2.5-3B-Instruct-GGUF",
+        "filename": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        "save_as": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        "mmproj_filename": None,
+        "mmproj_save_as": None,
+        "size_gb": 1.80,
+        "vram_note": "Fits in 4 GB VRAM or CPU RAM",
+        "vision": False,
+        "description": "Fast starter model for laptops, low-VRAM GPUs, or quick testing.",
+    },
+    {
+        "id": "mistral-nemo-12b-q4km",
+        "title": "Mistral Nemo 12B Instruct (Q4_K_M)",
+        "category": "Creative / 12B Tier",
+        "repo_id": "bartowski/Mistral-Nemo-Instruct-2407-GGUF",
+        "filename": "Mistral-Nemo-Instruct-2407-Q4_K_M.gguf",
+        "save_as": "Mistral-Nemo-Instruct-2407-Q4_K_M.gguf",
+        "mmproj_filename": None,
+        "mmproj_save_as": None,
+        "size_gb": 6.96,
+        "vram_note": "Best on 12–16 GB VRAM",
+        "vision": False,
+        "description": "Nuanced natural dialogue and long-context storytelling.",
+    },
+]
+
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def _validate_hf_repo_id(repo_id: str) -> str:
+    clean = str(repo_id or "").strip()
+    if clean.startswith("https://huggingface.co/"):
+        clean = clean[len("https://huggingface.co/"):].strip("/")
+    elif clean.startswith("http://huggingface.co/"):
+        clean = clean[len("http://huggingface.co/"):].strip("/")
+    parts = [p for p in clean.split("/") if p]
+    if len(parts) >= 2:
+        clean = f"{parts[0]}/{parts[1]}"
+    if not _HF_REPO_ID_RE.match(clean):
+        raise HTTPException(status_code=400, detail="Invalid HuggingFace repo ID. Expected 'owner/repo'.")
+    return clean
+
+
+def _safe_local_model_name(name: str, fallback: str = "") -> str:
+    raw = Path(str(name or fallback or "").strip()).name
+    if not raw or "/" in raw or "\\" in raw or ".." in raw or not raw.lower().endswith(".gguf"):
+        raise HTTPException(status_code=400, detail="Model filename must end in .gguf without path separators.")
+    return raw
+
+
+def _list_hf_repo_ggufs(repo_id: str) -> Dict[str, Any]:
+    clean_repo = _validate_hf_repo_id(repo_id)
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise HTTPException(status_code=501, detail="huggingface_hub is not installed in this environment.") from exc
+    try:
+        info = HfApi().model_info(clean_repo, files_metadata=True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not inspect HuggingFace repo '{clean_repo}': {exc}") from exc
+
+    models: List[Dict[str, Any]] = []
+    mmprojs: List[Dict[str, Any]] = []
+    for sib in getattr(info, "siblings", None) or []:
+        rfilename = str(getattr(sib, "rfilename", "") or "")
+        if not rfilename.lower().endswith(".gguf"):
+            continue
+        size_bytes = int(getattr(sib, "size", 0) or 0)
+        entry = {
+            "filename": rfilename,
+            "local_name": Path(rfilename).name,
+            "size_bytes": size_bytes,
+            "size_gb": round(size_bytes / (1024 ** 3), 2),
+        }
+        if _is_mmproj_filename(rfilename):
+            mmprojs.append(entry)
+        else:
+            models.append(entry)
+    return {"repo_id": clean_repo, "models": models, "mmprojs": mmprojs}
+
+
+def _stream_hf_file(
+    repo_id: str,
+    remote_filename: str,
+    local_filename: str,
+    stage_label: str,
+    cancel_event: threading.Event,
+) -> Path:
+    import requests as req_lib
+    from urllib.parse import quote
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    target = (MODEL_DIR / local_filename).resolve()
+    if target.parent != MODEL_DIR.resolve():
+        raise ValueError("Invalid target path.")
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+
+    part_path = target.with_name(f"{target.name}.part")
+    encoded_file = quote(str(remote_filename).lstrip("/"), safe="/")
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{encoded_file}"
+
+    existing = part_path.stat().st_size if part_path.is_file() else 0
+    headers: Dict[str, str] = {"User-Agent": "GHostPCP/1.3.0"}
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+
+    t_start = time.perf_counter()
+    bytes_this_session = 0
+    with req_lib.get(url, headers=headers, stream=True, timeout=(20, 90), allow_redirects=True) as resp:
+        if resp.status_code == 416 and existing > 0:
+            part_path.unlink(missing_ok=True)
+            existing = 0
+            headers.pop("Range", None)
+            resp2 = req_lib.get(url, headers=headers, stream=True, timeout=(20, 90), allow_redirects=True)
+            resp2.raise_for_status()
+            return _write_hf_stream(resp2, part_path, target, stage_label, existing, t_start, cancel_event)
+        resp.raise_for_status()
+        if resp.status_code == 200 and existing > 0:
+            # Server ignored Range header; restart cleanly from 0
+            existing = 0
+        return _write_hf_stream(resp, part_path, target, stage_label, existing, t_start, cancel_event)
+
+
+def _write_hf_stream(
+    resp: Any,
+    part_path: Path,
+    target: Path,
+    stage_label: str,
+    resume_offset: int,
+    t_start: float,
+    cancel_event: threading.Event,
+) -> Path:
+    content_len = int(resp.headers.get("Content-Length") or 0)
+    total_bytes = (resume_offset + content_len) if content_len > 0 else 0
+    downloaded = resume_offset
+    mode = "ab" if resume_offset > 0 else "wb"
+    session_bytes = 0
+
+    with open(part_path, mode) as out_f:
+        for chunk in resp.iter_content(chunk_size=512 * 1024):
+            if cancel_event.is_set():
+                raise RuntimeError("Download cancelled by user.")
+            if not chunk:
+                continue
+            out_f.write(chunk)
+            chunk_len = len(chunk)
+            downloaded += chunk_len
+            session_bytes += chunk_len
+            elapsed = max(0.05, time.perf_counter() - t_start)
+            speed_mbps = (session_bytes / (1024 * 1024)) / elapsed
+            pct = (downloaded / total_bytes * 100.0) if total_bytes > 0 else 0.0
+            with MODEL_DOWNLOAD_STATE._lock:
+                MODEL_DOWNLOAD_STATE.stage = stage_label
+                MODEL_DOWNLOAD_STATE.downloaded_bytes = downloaded
+                MODEL_DOWNLOAD_STATE.total_bytes = total_bytes
+                MODEL_DOWNLOAD_STATE.progress_pct = pct
+                MODEL_DOWNLOAD_STATE.speed_mbps = speed_mbps
+
+    os.replace(part_path, target)
+    return target
+
+
+def _run_model_download_worker(
+    repo_id: str,
+    filename: str,
+    save_as: str,
+    mmproj_filename: str,
+    mmproj_save_as: str,
+) -> None:
+    try:
+        _stream_hf_file(
+            repo_id=repo_id,
+            remote_filename=filename,
+            local_filename=save_as,
+            stage_label=f"Downloading {save_as}",
+            cancel_event=MODEL_DOWNLOAD_STATE.cancel_event,
+        )
+        if mmproj_filename and mmproj_save_as:
+            _stream_hf_file(
+                repo_id=repo_id,
+                remote_filename=mmproj_filename,
+                local_filename=mmproj_save_as,
+                stage_label=f"Downloading vision projector {mmproj_save_as}",
+                cancel_event=MODEL_DOWNLOAD_STATE.cancel_event,
+            )
+        with MODEL_DOWNLOAD_STATE._lock:
+            MODEL_DOWNLOAD_STATE.running = False
+            MODEL_DOWNLOAD_STATE.stage = "Complete"
+            MODEL_DOWNLOAD_STATE.progress_pct = 100.0
+            MODEL_DOWNLOAD_STATE.error = None
+    except Exception as exc:
+        log.warning(f"Model download stopped: {exc}")
+        with MODEL_DOWNLOAD_STATE._lock:
+            MODEL_DOWNLOAD_STATE.running = False
+            MODEL_DOWNLOAD_STATE.stage = "Cancelled" if MODEL_DOWNLOAD_STATE.cancel_event.is_set() else "Error"
+            MODEL_DOWNLOAD_STATE.error = str(exc)
 
 
 # =====================================================================
@@ -1579,6 +2368,8 @@ class ChatRequest(BaseModel):
     use_pcp: Optional[bool] = None
     pcp_top_k: Optional[int] = Field(default=None, ge=1, le=12)
     show_reasoning: Optional[bool] = None
+    use_web: Optional[bool] = None
+    web_cite_sources: Optional[bool] = None
     response_format: Optional[ResponseFormat] = None
     tools: Optional[List[ToolSpec]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"], Dict[str, Any]]] = None
@@ -1589,15 +2380,18 @@ class LoadRequest(BaseModel):
     model: StrictStr = Field(min_length=1, max_length=255)
     n_ctx: StrictInt = Field(default=DEFAULT_N_CTX, ge=512, le=32768)
     chat_format: ChatFormat = "auto"
+    mmproj_model: StrictStr = Field(default="auto", max_length=255)
 
 
 class PreflightRequest(BaseModel):
     model: StrictStr = Field(min_length=1, max_length=255)
     n_ctx: StrictInt = Field(default=DEFAULT_N_CTX, ge=512, le=32768)
+    mmproj_model: StrictStr = Field(default="auto", max_length=255)
 
 
 class LoaderSettings(BaseModel):
     model: StrictStr = Field(default=DEFAULT_SETTINGS["model"], min_length=1, max_length=255)
+    mmproj_model: StrictStr = Field(default="auto", max_length=255)
     chat_format: ChatFormat = "auto"
     system_prompt: StrictStr = Field(default=DEFAULT_SETTINGS["system_prompt"], max_length=12000)
     pcp_enabled: bool = True
@@ -1606,6 +2400,13 @@ class LoaderSettings(BaseModel):
     blocked_phrases: StrictStr = Field(default=DEFAULT_SETTINGS["blocked_phrases"], max_length=8000)
     protected_words: StrictStr = Field(default=DEFAULT_SETTINGS["protected_words"], max_length=8000)
     show_reasoning: bool = False
+    web_enabled: bool = False
+    web_provider: Literal["auto", "searxng", "brave", "tavily"] = "auto"
+    web_searxng_url: StrictStr = Field(default="", max_length=500)
+    web_api_key: StrictStr = Field(default="", max_length=500)
+    web_search_mode: Literal["always", "smart", "url_only"] = "smart"
+    web_cite_sources: bool = True
+    auto_continuity_summary: bool = True
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.95, ge=0.0, le=1.0)
     min_p: float = Field(default=0.05, ge=0.0, le=1.0)
@@ -1636,6 +2437,7 @@ class PersonaCreateRequest(BaseModel):
     user_name: StrictStr = Field(default="", max_length=120)
     never_forget: StrictStr = Field(default="", max_length=8000)
     notes: StrictStr = Field(default="", max_length=8000)
+    continuity_notes: StrictStr = Field(default="", max_length=8000)
     tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=64)
     preferred_model: StrictStr = Field(default="", max_length=255)
     protected_words: StrictStr = Field(default="", max_length=8000)
@@ -1648,6 +2450,7 @@ class PersonaUpdateRequest(BaseModel):
     user_name: Optional[StrictStr] = Field(default=None, max_length=120)
     never_forget: Optional[StrictStr] = Field(default=None, max_length=8000)
     notes: Optional[StrictStr] = Field(default=None, max_length=8000)
+    continuity_notes: Optional[StrictStr] = Field(default=None, max_length=8000)
     tts_voice: Optional[StrictStr] = Field(default=None, min_length=1, max_length=64)
     preferred_model: Optional[StrictStr] = Field(default=None, max_length=255)
     protected_words: Optional[StrictStr] = Field(default=None, max_length=8000)
@@ -1656,15 +2459,44 @@ class PersonaUpdateRequest(BaseModel):
 
 class SaveSessionRequest(BaseModel):
     messages: List[Message] = Field(min_length=1)
+    capture_continuity: Optional[bool] = None
 
 
 class HistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
-    content: StrictStr = Field(max_length=200000)
+    content: Union[StrictStr, List[Dict[str, Any]]]
 
 
 class ChatHistoryRequest(BaseModel):
     messages: List[HistoryTurn]
+
+
+class FactCreateRequest(BaseModel):
+    id: Optional[StrictStr] = Field(default=None, max_length=120)
+    subject: StrictStr = Field(min_length=1, max_length=120)
+    aliases: List[StrictStr] = Field(default_factory=list)
+    category: StrictStr = Field(default="general", max_length=40)
+    fact: StrictStr = Field(min_length=1, max_length=1200)
+    pinned: bool = True
+
+
+class ThreadSaveRequest(BaseModel):
+    thread_id: Optional[StrictStr] = Field(default=None, max_length=120)
+    title: StrictStr = Field(default="", max_length=120)
+    messages: List[HistoryTurn] = Field(min_length=1)
+
+
+class VolumeSaveRequest(BaseModel):
+    content: StrictStr = Field(max_length=5000000)
+
+
+class ModelDownloadRequest(BaseModel):
+    catalog_id: Optional[StrictStr] = Field(default=None, max_length=120)
+    repo_id: Optional[StrictStr] = Field(default=None, max_length=255)
+    filename: Optional[StrictStr] = Field(default=None, max_length=255)
+    save_as: Optional[StrictStr] = Field(default=None, max_length=255)
+    mmproj_filename: Optional[StrictStr] = Field(default=None, max_length=255)
+    mmproj_save_as: Optional[StrictStr] = Field(default=None, max_length=255)
 
 
 class TTSRequest(BaseModel):
@@ -1899,7 +2731,7 @@ def _start_background_ingest(
 # FASTAPI APPLICATION & ROUTES
 # =====================================================================
 
-app = FastAPI(title="GHostPCP", version="1.2.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="GHostPCP", version="1.3.0", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1939,14 +2771,91 @@ def update_settings(settings: LoaderSettings):
 @app.get("/v1/models", dependencies=[Depends(verify_access)])
 def list_models():
     models = scan_models()
-    return {"object": "list", "data": models}
+    mmproj_files = scan_mmproj_files()
+    return {"object": "list", "data": models, "mmproj_files": mmproj_files}
+
+
+@app.get("/v1/models/catalog", dependencies=[Depends(verify_access)])
+def models_catalog():
+    return {
+        "catalog": _MODEL_CATALOG,
+        "local_models": [m["id"] for m in scan_models()],
+        "local_mmprojs": [m["id"] for m in scan_mmproj_files()],
+    }
+
+
+@app.get("/v1/models/hf-files", dependencies=[Depends(verify_access)])
+def models_hf_files(repo_id: str):
+    return _list_hf_repo_ggufs(repo_id)
+
+
+@app.get("/v1/models/download/status", dependencies=[Depends(verify_access)])
+def models_download_status():
+    return MODEL_DOWNLOAD_STATE.snapshot()
+
+
+@app.post("/v1/models/download", dependencies=[Depends(verify_access)])
+def models_download_start(req: ModelDownloadRequest):
+    if req.catalog_id:
+        preset = next((c for c in _MODEL_CATALOG if c["id"] == req.catalog_id), None)
+        if preset is None:
+            raise HTTPException(status_code=404, detail=f"Catalog preset '{req.catalog_id}' not found.")
+        repo_id = preset["repo_id"]
+        filename = preset["filename"]
+        save_as = preset["save_as"]
+        mmproj_filename = preset.get("mmproj_filename") or ""
+        mmproj_save_as = preset.get("mmproj_save_as") or ""
+    else:
+        if not req.repo_id or not req.filename:
+            raise HTTPException(status_code=400, detail="Provide either catalog_id or repo_id + filename.")
+        repo_id = _validate_hf_repo_id(req.repo_id)
+        filename = str(req.filename).strip()
+        if ".." in filename or filename.startswith("/") or filename.startswith("\\"):
+            raise HTTPException(status_code=400, detail="Invalid remote filename.")
+        save_as = _safe_local_model_name(req.save_as or Path(filename).name)
+        mmproj_filename = str(req.mmproj_filename or "").strip()
+        if mmproj_filename and (".." in mmproj_filename or mmproj_filename.startswith("/") or mmproj_filename.startswith("\\")):
+            raise HTTPException(status_code=400, detail="Invalid remote mmproj filename.")
+        mmproj_save_as = (
+            _safe_local_model_name(req.mmproj_save_as or Path(mmproj_filename).name)
+            if mmproj_filename
+            else ""
+        )
+
+    with MODEL_DOWNLOAD_STATE._lock:
+        if MODEL_DOWNLOAD_STATE.running:
+            raise HTTPException(status_code=409, detail="A model download is already in progress.")
+        MODEL_DOWNLOAD_STATE.cancel_event.clear()
+        MODEL_DOWNLOAD_STATE.running = True
+        MODEL_DOWNLOAD_STATE.stage = f"Connecting to {repo_id}..."
+        MODEL_DOWNLOAD_STATE.repo_id = repo_id
+        MODEL_DOWNLOAD_STATE.filename = save_as
+        MODEL_DOWNLOAD_STATE.mmproj_filename = mmproj_save_as
+        MODEL_DOWNLOAD_STATE.downloaded_bytes = 0
+        MODEL_DOWNLOAD_STATE.total_bytes = 0
+        MODEL_DOWNLOAD_STATE.progress_pct = 0.0
+        MODEL_DOWNLOAD_STATE.speed_mbps = 0.0
+        MODEL_DOWNLOAD_STATE.error = None
+
+    threading.Thread(
+        target=_run_model_download_worker,
+        args=(repo_id, filename, save_as, mmproj_filename, mmproj_save_as),
+        daemon=True,
+    ).start()
+    return MODEL_DOWNLOAD_STATE.snapshot()
+
+
+@app.post("/v1/models/download/cancel", dependencies=[Depends(verify_access)])
+def models_download_cancel():
+    MODEL_DOWNLOAD_STATE.cancel_event.set()
+    return {"status": "cancelling" if MODEL_DOWNLOAD_STATE.running else "idle"}
 
 
 @app.post("/v1/preflight", dependencies=[Depends(verify_access)])
 def preflight_endpoint(req: PreflightRequest):
     if STATE.locked:
         raise HTTPException(status_code=409, detail="A model change is in progress.")
-    plan = preflight_model(req.model, req.n_ctx)
+    plan = preflight_model(req.model, req.n_ctx, mmproj_model=req.mmproj_model)
     if STATE.loaded_model:
         plan["warnings"].append(
             "A model is currently resident; this preview uses current free VRAM. "
@@ -1957,7 +2866,7 @@ def preflight_endpoint(req: PreflightRequest):
 
 @app.post("/v1/load", dependencies=[Depends(verify_access)])
 def load_endpoint(req: LoadRequest):
-    preflight = load_model(req.model, req.n_ctx, req.chat_format)
+    preflight = load_model(req.model, req.n_ctx, req.chat_format, mmproj_model=req.mmproj_model)
     return {
         "status": "loaded",
         "model": req.model,
@@ -1966,6 +2875,8 @@ def load_endpoint(req: LoadRequest):
         "context": req.n_ctx,
         "kv_cache_type": preflight["kv_cache_type"],
         "chat_format": req.chat_format,
+        "mmproj_model": preflight.get("mmproj_model"),
+        "vision_capable": bool(preflight.get("vision_capable")),
         "preflight": preflight,
     }
 
@@ -2006,10 +2917,14 @@ def reset_endpoint():
 def status():
     pcp_ready = bool(PCP_INDEX and PCP_INDEX.ready)
     active_persona = _get_active_persona()
+    settings = load_settings()
+    web_enabled = bool(settings.get("web_enabled", False))
     return {
         "engine": "GHostPCP",
         "backend": BACKEND_NAME,
         "resident_model": STATE.loaded_model,
+        "mmproj_model": STATE.loaded_mmproj,
+        "vision_capable": STATE.loaded_vision_capable,
         "n_gpu_layers": STATE.loaded_gpu_layers,
         "n_ctx": STATE.loaded_context_size,
         "kv_cache_type": STATE.loaded_kv_cache_type,
@@ -2024,12 +2939,14 @@ def status():
         "pcp_volumes": PCP_INDEX.file_count if pcp_ready and PCP_INDEX else 0,
         "pcp_passages": PCP_INDEX.passage_count if pcp_ready and PCP_INDEX else 0,
         "ingesting": INGEST_STATE.running,
+        "downloading_model": MODEL_DOWNLOAD_STATE.running,
+        "web_enabled": web_enabled,
         "active_persona": (
             {"id": active_persona["id"], "name": active_persona["name"], "user_name": active_persona.get("user_name", "")}
             if active_persona
             else None
         ),
-        "offline": True,
+        "offline": not web_enabled,
     }
 
 
@@ -2056,6 +2973,7 @@ def create_persona(req: PersonaCreateRequest):
         user_name=req.user_name,
         never_forget=req.never_forget,
         notes=req.notes,
+        continuity_notes=req.continuity_notes,
         tts_voice=req.tts_voice,
         preferred_model=req.preferred_model,
         protected_words=req.protected_words,
@@ -2112,6 +3030,225 @@ def delete_persona(persona_id: str, delete_files: bool = False):
         with STATE._history_lock:
             STATE.conversation.clear()
     return res
+
+
+def _persona_dir_or_404(persona_id: str) -> Tuple[dict, Path]:
+    persona = _get_persona_by_id(persona_id)
+    if persona is None:
+        raise HTTPException(status_code=404, detail=f"Persona '{persona_id}' not found.")
+    return persona, _resolve_persona_folder(persona.get("folder", "."))
+
+
+@app.get("/v1/personas/{persona_id}/facts", dependencies=[Depends(verify_access)])
+def list_persona_facts_endpoint(persona_id: str):
+    persona, p_dir = _persona_dir_or_404(persona_id)
+    return {"persona_id": persona["id"], "facts": _load_persona_facts(p_dir)}
+
+
+@app.post("/v1/personas/{persona_id}/facts", dependencies=[Depends(verify_access)])
+def upsert_persona_fact_endpoint(persona_id: str, req: FactCreateRequest):
+    _, p_dir = _persona_dir_or_404(persona_id)
+    fact = _add_or_update_persona_fact(
+        p_dir,
+        subject=req.subject,
+        fact=req.fact,
+        aliases=req.aliases,
+        category=req.category,
+        pinned=req.pinned,
+        fact_id=req.id,
+    )
+    return {"fact": fact, "facts": _load_persona_facts(p_dir)}
+
+
+@app.delete("/v1/personas/{persona_id}/facts/{fact_id}", dependencies=[Depends(verify_access)])
+def delete_persona_fact_endpoint(persona_id: str, fact_id: str):
+    _, p_dir = _persona_dir_or_404(persona_id)
+    if not _delete_persona_fact(p_dir, fact_id):
+        raise HTTPException(status_code=404, detail=f"Fact '{fact_id}' not found.")
+    return {"status": "deleted", "facts": _load_persona_facts(p_dir)}
+
+
+@app.get("/v1/personas/{persona_id}/threads", dependencies=[Depends(verify_access)])
+def list_persona_threads_endpoint(persona_id: str):
+    persona, p_dir = _persona_dir_or_404(persona_id)
+    return {"persona_id": persona["id"], "threads": _list_persona_threads(p_dir)}
+
+
+@app.post("/v1/personas/{persona_id}/threads/save", dependencies=[Depends(verify_access)])
+def save_persona_thread_endpoint(persona_id: str, req: ThreadSaveRequest):
+    _, p_dir = _persona_dir_or_404(persona_id)
+    msgs = [
+        {"role": m.role, "content": _sanitize_message_content(m.content, keep_images=True)}
+        for m in req.messages
+    ]
+    saved = _save_persona_thread(p_dir, msgs, title=req.title, thread_id=req.thread_id)
+    return {"thread": saved, "threads": _list_persona_threads(p_dir)}
+
+
+@app.post("/v1/personas/{persona_id}/threads/{thread_id}/load", dependencies=[Depends(verify_access)])
+def load_persona_thread_endpoint(persona_id: str, thread_id: str):
+    persona, p_dir = _persona_dir_or_404(persona_id)
+    thread = _load_persona_thread(p_dir, thread_id)
+    _save_persona_chat_history(p_dir, thread["messages"])
+    active = _get_active_persona()
+    if not active or active["id"] != persona_id:
+        activated = _activate_persona(persona_id)
+        return {
+            "persona": activated["persona"],
+            "thread": thread,
+            "messages": activated["messages"],
+        }
+    with STATE._history_lock:
+        STATE.conversation = list(thread["messages"])
+    if STATE.llm is not None:
+        try:
+            STATE.llm.reset()
+        except Exception:
+            pass
+    return {"persona": _persona_summary(persona, persona_id), "thread": thread, "messages": thread["messages"]}
+
+
+@app.delete("/v1/personas/{persona_id}/threads/{thread_id}", dependencies=[Depends(verify_access)])
+def delete_persona_thread_endpoint(persona_id: str, thread_id: str):
+    _, p_dir = _persona_dir_or_404(persona_id)
+    if not _delete_persona_thread(p_dir, thread_id):
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
+    return {"status": "deleted", "threads": _list_persona_threads(p_dir)}
+
+
+@app.get("/v1/personas/{persona_id}/export", dependencies=[Depends(verify_access)])
+def export_persona_bundle(persona_id: str):
+    persona, p_dir = _persona_dir_or_404(persona_id)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        manifest = {
+            "format": "ghostpcp-persona-bundle",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "app_version": "1.3.0",
+            "persona_name": persona.get("name", persona_id),
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        zf.writestr("persona.json", json.dumps(persona, indent=2, ensure_ascii=False))
+        for fname in ("facts.json", "chat_history.json"):
+            fpath = p_dir / fname
+            if fpath.is_file():
+                zf.write(fpath, arcname=fname)
+        for vol in sorted(p_dir.glob("ghost_pcp_*.md")):
+            if vol.is_file():
+                zf.write(vol, arcname=vol.name)
+        tdir = _threads_dir(p_dir)
+        if tdir.is_dir():
+            for tf in sorted(tdir.glob("*.json")):
+                if tf.is_file():
+                    zf.write(tf, arcname=f"threads/{tf.name}")
+
+    safe_slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(persona.get("id") or "persona")).strip("-") or "persona"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="ghostpcp-persona-{safe_slug}.zip"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/v1/personas/import-bundle", dependencies=[Depends(verify_access)])
+async def import_persona_bundle(file: UploadFile = File(...)):
+    global PCP_INDEX
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before importing a backup.")
+    raw_bytes = await file.read()
+    if len(raw_bytes) > 512 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Backup zip exceeds 512 MB limit.")
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw_bytes), "r")
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive.") from exc
+
+    created_pid: Optional[str] = None
+    target_dir: Optional[Path] = None
+    try:
+        with zf:
+            infos = zf.infolist()
+            total_uncompressed = sum(max(0, info.file_size) for info in infos)
+            if total_uncompressed > 512 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Expanded backup exceeds 512 MB safety limit.")
+
+            persona_meta: Dict[str, Any] = {}
+            if any(info.filename == "persona.json" for info in infos):
+                try:
+                    persona_meta = json.loads(zf.read("persona.json").decode("utf-8"))
+                except Exception:
+                    persona_meta = {}
+
+            fallback_name = Path(file.filename or "Imported Persona").stem.replace("ghostpcp-persona-", "")
+            created = _create_persona_entry(
+                name=str(persona_meta.get("name") or fallback_name or "Imported AI"),
+                user_name=str(persona_meta.get("user_name") or ""),
+                never_forget=str(persona_meta.get("never_forget") or ""),
+                notes=str(persona_meta.get("notes") or ""),
+                continuity_notes=str(persona_meta.get("continuity_notes") or ""),
+                tts_voice=str(persona_meta.get("tts_voice") or "silas"),
+                preferred_model=str(persona_meta.get("preferred_model") or ""),
+                protected_words=str(persona_meta.get("protected_words") or ""),
+                blocked_phrases=str(persona_meta.get("blocked_phrases") or ""),
+                source_type=str(persona_meta.get("source_type") or "bundle"),
+                activate=False,
+            )
+            created_pid = created["id"]
+            target_dir = _resolve_persona_folder(created["folder"])
+            resolved_target = target_dir.resolve()
+
+            extracted_volumes = 0
+            for info in infos:
+                if info.is_dir():
+                    continue
+                member = info.filename.replace("\\", "/").lstrip("/")
+                if not member or ".." in member.split("/") or ":" in member:
+                    continue
+                lower = member.lower()
+                is_root_json = member in ("facts.json", "chat_history.json")
+                is_vol = "/" not in member and lower.startswith("ghost_pcp_") and lower.endswith(".md")
+                is_thread = member.startswith("threads/") and member.count("/") == 1 and lower.endswith(".json")
+                if not (is_root_json or is_vol or is_thread):
+                    continue
+                dest = (resolved_target / member).resolve()
+                if resolved_target not in dest.parents:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(info.filename))
+                if is_vol:
+                    extracted_volumes += 1
+
+        if extracted_volumes > 0 and target_dir is not None:
+            bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
+            PCP_INDEX = PCPIndex(target_dir, cache_dir=target_dir, model_dir=bge_dir)
+            _update_persona_entry(created_pid, {"passage_count": PCP_INDEX.passage_count})
+
+        activated = _activate_persona(created_pid)
+        return {
+            "status": "imported",
+            "persona": activated["persona"],
+            "messages": activated["messages"],
+            "volumes_imported": extracted_volumes,
+        }
+    except HTTPException:
+        if created_pid:
+            try:
+                _delete_persona_entry(created_pid, delete_files=True)
+            except Exception:
+                pass
+        raise
+    except Exception as exc:
+        if created_pid:
+            try:
+                _delete_persona_entry(created_pid, delete_files=True)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Persona backup import failed: {exc}") from exc
 
 
 # =====================================================================
@@ -2247,6 +3384,86 @@ def pcp_ingest_local(req: LocalPathIngestRequest):
     return {"status": "started", "files": len(discovered_paths), "persona_id": target_pid}
 
 
+def _ensure_active_pcp_index() -> PCPIndex:
+    global PCP_INDEX
+    active_dir = _get_active_pcp_dir()
+    bge_dir = BUNDLED_BGE_DIR if BUNDLED_BGE_DIR.is_dir() else None
+    if PCP_INDEX is None or PCP_INDEX.data_dir.resolve() != active_dir.resolve():
+        PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir)
+    return PCP_INDEX
+
+
+def _capture_session_continuity_note(raw_msgs: List[Dict[str, Any]]) -> str:
+    """Create a brief continuity note summarizing session progress without failing saves."""
+    lines: List[str] = []
+    user_snippets: List[str] = []
+    for item in raw_msgs:
+        role = str(item.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        plain = _extract_message_plain_text(item.get("content")).strip()
+        if not plain:
+            continue
+        compact = re.sub(r"\s+", " ", plain)
+        if role == "user":
+            user_snippets.append(compact[:140])
+            lines.append(f"User: {compact[:420]}")
+        else:
+            lines.append(f"Assistant: {compact[:420]}")
+
+    if not lines:
+        return ""
+
+    transcript = "\n".join(lines[-14:])[-3400:]
+    if STATE.llm is not None:
+        try:
+            resp = STATE.llm.create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize this conversation into 1-2 short factual continuity sentences "
+                            "(key decisions, personal details shared, ongoing threads, or next steps) "
+                            "for future sessions. Plain text only, no headings."
+                        ),
+                    },
+                    {"role": "user", "content": transcript},
+                ],
+                temperature=0.2,
+                top_p=0.9,
+                max_tokens=160,
+                stream=False,
+            )
+            text = str(((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text[:420]
+        except Exception as exc:
+            log.warning(f"Continuity LLM note skipped cleanly: {exc}")
+
+    if user_snippets:
+        joined = " | ".join(user_snippets[-2:])
+        return f"Discussed: {joined[:260]}"
+    return ""
+
+
+def _merge_continuity_notes(existing: str, new_note: str, max_entries: int = 10, max_chars: int = 2400) -> str:
+    note = re.sub(r"\s+", " ", str(new_note or "")).strip()
+    if not note:
+        return str(existing or "").strip()
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"- [{stamp}] {note}"
+    lines = [line.strip() for line in str(existing or "").splitlines() if line.strip()]
+    lines.append(entry)
+    lines = lines[-max_entries:]
+    joined = "\n".join(lines)
+    while len(joined) > max_chars and len(lines) > 1:
+        lines.pop(0)
+        joined = "\n".join(lines)
+    return joined[:max_chars]
+
+
 @app.post("/v1/pcp/save-session", dependencies=[Depends(verify_access)])
 def pcp_save_session(req: SaveSessionRequest):
     global PCP_INDEX
@@ -2263,21 +3480,36 @@ def pcp_save_session(req: SaveSessionRequest):
             PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir)
 
         raw_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
+        settings = load_settings()
+        capture_cont = (
+            req.capture_continuity
+            if req.capture_continuity is not None
+            else bool(settings.get("auto_continuity_summary", True))
+        )
+        continuity_note = _capture_session_continuity_note(raw_msgs) if capture_cont else ""
+
         try:
-            result = PCP_INDEX.append_session(raw_msgs)
+            result = PCP_INDEX.append_session(raw_msgs, continuity_note=continuity_note or None)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             log.error(f"Save session failed: {exc}")
             raise HTTPException(status_code=500, detail=f"Failed to save session: {exc}") from exc
 
+        result["continuity_note"] = continuity_note
         with STATE._history_lock:
             STATE.conversation.clear()
         if _personas_registry_path().is_file():
             active_persona = _get_active_persona()
             if active_persona:
                 _save_persona_chat_history(active_dir, [])
-                _update_persona_entry(active_persona["id"], {"passage_count": PCP_INDEX.passage_count})
+                updates: Dict[str, Any] = {"passage_count": PCP_INDEX.passage_count}
+                if continuity_note:
+                    updates["continuity_notes"] = _merge_continuity_notes(
+                        active_persona.get("continuity_notes", ""),
+                        continuity_note,
+                    )
+                _update_persona_entry(active_persona["id"], updates)
 
         if STATE.llm is not None:
             try:
@@ -2343,6 +3575,77 @@ def pcp_reindex():
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"status": "started"}
+
+
+@app.get("/v1/pcp/search", dependencies=[Depends(verify_access)])
+def pcp_search_memories(q: str = "", limit: int = 8):
+    query = str(q or "").strip()
+    if not query:
+        return {"query": "", "ready": bool(PCP_INDEX and PCP_INDEX.ready), "results": []}
+    idx = _ensure_active_pcp_index()
+    if not idx.ready:
+        return {"query": query, "ready": False, "results": []}
+    safe_limit = max(1, min(24, int(limit or 8)))
+    results = idx.search_detailed(query, limit=safe_limit)
+    return {"query": query, "ready": idx.ready, "results": results}
+
+
+@app.get("/v1/pcp/volumes", dependencies=[Depends(verify_access)])
+def pcp_list_volumes():
+    idx = _ensure_active_pcp_index()
+    return {
+        "volumes": idx.list_volumes(),
+        "passages": idx.passage_count if idx.ready else 0,
+        "ready": idx.ready,
+    }
+
+
+@app.get("/v1/pcp/volumes/{filename}", dependencies=[Depends(verify_access)])
+def pcp_read_volume(filename: str):
+    idx = _ensure_active_pcp_index()
+    try:
+        safe_name = Path(filename).name
+        return {"filename": safe_name, "content": idx.read_volume(filename)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/v1/pcp/volumes/{filename}", dependencies=[Depends(verify_access)])
+def pcp_update_volume(filename: str, req: VolumeSaveRequest):
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before editing a volume.")
+    idx = _ensure_active_pcp_index()
+    try:
+        res = idx.save_volume(filename, req.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if _personas_registry_path().is_file():
+        active = _get_active_persona()
+        if active:
+            _update_persona_entry(active["id"], {"passage_count": idx.passage_count})
+    return res
+
+
+@app.delete("/v1/pcp/volumes/{filename}", dependencies=[Depends(verify_access)])
+def pcp_delete_volume(filename: str):
+    if INGEST_STATE.running:
+        raise HTTPException(status_code=409, detail="Wait for archive processing to finish before deleting a volume.")
+    idx = _ensure_active_pcp_index()
+    try:
+        res = idx.delete_volume(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if _personas_registry_path().is_file():
+        active = _get_active_persona()
+        if active:
+            _update_persona_entry(active["id"], {"passage_count": idx.passage_count})
+    return res
 
 
 # =====================================================================
@@ -2462,6 +3765,46 @@ def tts_stop_endpoint():
     return {"status": "stopped"}
 
 
+@app.post("/v1/audio/transcribe", dependencies=[Depends(verify_access)])
+async def audio_transcribe_endpoint(file: UploadFile = File(...)):
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Optional offline Whisper backend ('faster-whisper') is not installed. "
+                "Use the built-in browser microphone button or install faster-whisper."
+            ),
+        ) from exc
+
+    raw_bytes = await file.read()
+    if not raw_bytes or len(raw_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio clip is empty or exceeds 25 MB limit.")
+
+    suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+    if suffix.lower() not in (".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac"):
+        suffix = ".webm"
+    tmp_path = None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+            tf.write(raw_bytes)
+            tmp_path = tf.name
+        model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(tmp_path)
+        transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+        return {"text": transcript}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}") from exc
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 # =====================================================================
 # LIVE CONVERSATION SYNC (DESKTOP <-> PHONE)
 # =====================================================================
@@ -2474,7 +3817,10 @@ def get_chat_history():
 
 @app.post("/v1/chat/history", dependencies=[Depends(verify_access)])
 def set_chat_history(req: ChatHistoryRequest):
-    cleaned = [{"role": m.role, "content": m.content} for m in req.messages]
+    cleaned = [
+        {"role": m.role, "content": _sanitize_message_content(m.content, keep_images=True)}
+        for m in req.messages
+    ]
     with STATE._history_lock:
         STATE.conversation = cleaned
     if _personas_registry_path().is_file():
@@ -2611,6 +3957,70 @@ def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) // 3) + 6)
 
 
+def _count_image_parts(content: Any) -> int:
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1 for part in content
+        if isinstance(part, dict) and str(part.get("type") or "").lower() == "image_url"
+    )
+
+
+def _estimate_message_tokens(msg: Dict[str, Any]) -> int:
+    content = msg.get("content")
+    if isinstance(content, list):
+        plain = _extract_message_plain_text(content)
+        img_count = _count_image_parts(content)
+        return _estimate_tokens(plain) + (img_count * 256)
+    return _estimate_tokens(str(content or ""))
+
+
+def _condense_message_content(msg: Dict[str, Any], keep_head: int, keep_tail: int, marker: str) -> None:
+    content = msg.get("content")
+    if isinstance(content, str):
+        if len(content) > keep_head + keep_tail + len(marker) + 20:
+            msg["content"] = _condense_long_text(content, keep_head, keep_tail, marker)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() == "text":
+                txt = str(part.get("text") or "")
+                if len(txt) > keep_head + keep_tail + len(marker) + 20:
+                    part["text"] = _condense_long_text(txt, keep_head, keep_tail, marker)
+
+
+def _append_text_to_message_content(content: Any, addition: str) -> Any:
+    if isinstance(content, list):
+        updated = [dict(p) if isinstance(p, dict) else p for p in content]
+        for idx in range(len(updated) - 1, -1, -1):
+            part = updated[idx]
+            if isinstance(part, dict) and str(part.get("type") or "").lower() == "text":
+                part["text"] = str(part.get("text") or "").rstrip() + addition
+                return updated
+        updated.append({"type": "text", "text": addition.lstrip()})
+        return updated
+    return str(content or "").rstrip() + addition
+
+
+def _strip_images_with_placeholder(content: Any, placeholder: str) -> Tuple[Any, int]:
+    if not isinstance(content, list):
+        return content, 0
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type") or "").lower() == "image_url":
+            removed += 1
+            continue
+        kept.append(dict(part))
+    if not removed:
+        return content, 0
+    text_pieces = [str(p.get("text") or "") for p in kept if str(p.get("type") or "").lower() == "text"]
+    joined = "\n".join(t for t in text_pieces if t.strip()).strip()
+    note = f"{placeholder}" if removed == 1 else f"{placeholder} (x{removed})"
+    return f"{joined}\n\n{note}".strip() if joined else note, removed
+
+
 def _fit_messages_to_context(
     messages: List[Dict[str, Any]],
     n_ctx: int,
@@ -2623,7 +4033,7 @@ def _fit_messages_to_context(
     budget = max(1024, int(n_ctx) - int(max_tokens) - 256)
 
     def total_est() -> int:
-        return sum(_estimate_tokens(str(m.get("content") or "")) for m in fitted)
+        return sum(_estimate_message_tokens(m) for m in fitted)
 
     if total_est() <= budget:
         return fitted
@@ -2632,10 +4042,10 @@ def _fit_messages_to_context(
         msg = fitted[idx]
         if msg.get("role") == "system":
             continue
-        content = msg.get("content")
-        if isinstance(content, str) and len(content) > 2400:
-            msg["content"] = _condense_long_text(
-                content,
+        plain_len = len(_extract_message_plain_text(msg.get("content")))
+        if plain_len > 2400:
+            _condense_message_content(
+                msg,
                 1200,
                 800,
                 "\n\n[... earlier attachment/turn condensed ...]\n\n",
@@ -2645,27 +4055,68 @@ def _fit_messages_to_context(
         drop_idx = 1 if fitted[0].get("role") == "system" else 0
         fitted.pop(drop_idx)
 
-    if total_est() > budget and isinstance(fitted[-1].get("content"), str):
-        other_tokens = sum(_estimate_tokens(str(m.get("content") or "")) for m in fitted[:-1])
-        remaining_tokens = max(512, budget - other_tokens)
-        last_text = fitted[-1]["content"]
+    if total_est() > budget:
+        other_tokens = sum(_estimate_message_tokens(m) for m in fitted[:-1])
+        img_tokens = _count_image_parts(fitted[-1].get("content")) * 256
+        remaining_tokens = max(512, budget - other_tokens - img_tokens)
+        last_text = _extract_message_plain_text(fitted[-1].get("content"))
         if _estimate_tokens(last_text) > remaining_tokens:
             char_budget = max(800, int(remaining_tokens * 2.5))
-            for _ in range(6):
-                candidate = _condense_long_text(
-                    last_text,
+            if isinstance(fitted[-1].get("content"), str):
+                for _ in range(6):
+                    candidate = _condense_long_text(
+                        last_text,
+                        max(300, int(char_budget * 0.5)),
+                        max(300, int(char_budget * 0.45)),
+                        "\n\n[... middle condensed to fit context window ...]\n\n",
+                    )
+                    if _estimate_tokens(candidate) <= remaining_tokens or len(candidate) >= len(last_text):
+                        last_text = candidate
+                        break
+                    char_budget = int(char_budget * 0.75)
+                    last_text = candidate
+                fitted[-1]["content"] = last_text
+            else:
+                _condense_message_content(
+                    fitted[-1],
                     max(300, int(char_budget * 0.5)),
                     max(300, int(char_budget * 0.45)),
                     "\n\n[... middle condensed to fit context window ...]\n\n",
                 )
-                if _estimate_tokens(candidate) <= remaining_tokens or len(candidate) >= len(last_text):
-                    last_text = candidate
-                    break
-                char_budget = int(char_budget * 0.75)
-                last_text = candidate
-            fitted[-1]["content"] = last_text
 
     return fitted
+
+
+def _llm_web_query_rewriter(user_prompt: str) -> str:
+    """Use the resident model to distill a short search query or return NONE."""
+    llm = STATE.llm
+    if llm is None or not hasattr(llm, "create_chat_completion"):
+        return ""
+    try:
+        resp = llm.create_chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the user's message into a short web search query (2-7 words). "
+                        "Reply ONLY with the search query, or reply NONE if no fresh external web lookup is needed."
+                    ),
+                },
+                {"role": "user", "content": str(user_prompt or "")[:600]},
+            ],
+            temperature=0.0,
+            top_p=0.9,
+            max_tokens=28,
+            stream=False,
+        )
+        raw = str(((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+        raw = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"[\r\n\"'`]+", " ", raw).strip()
+        if not raw or len(raw) > 120:
+            return ""
+        return raw
+    except Exception:
+        return ""
 
 
 def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]:
@@ -2673,19 +4124,57 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
     use_pcp = req.use_pcp if req.use_pcp is not None else bool(settings.get("pcp_enabled", True))
     top_k = req.pcp_top_k or int(settings.get("pcp_top_k", 4))
     show_reasoning = req.show_reasoning if req.show_reasoning is not None else bool(settings.get("show_reasoning", False))
+    use_web = req.use_web if req.use_web is not None else bool(settings.get("web_enabled", False))
+    web_cite = req.web_cite_sources if req.web_cite_sources is not None else bool(settings.get("web_cite_sources", True))
+
+    turn_warnings: List[str] = []
+    turn_sources: List[Dict[str, Any]] = []
 
     raw_messages = [m.model_dump(exclude_none=True) for m in req.messages]
     if not raw_messages:
+        STATE.last_turn_meta = {"sources": [], "warnings": [], "prompt_tokens_est": 0}
         return raw_messages, show_reasoning
 
-    # Locate the latest user message for semantic retrieval
+    # Strictly sanitize any incoming image_url parts (only safe data:image/...;base64,... allowed)
+    unsafe_stripped = 0
+    vision_skipped = 0
+    allow_vision_parts = bool(STATE.loaded_vision_capable or STATE.llm is None)
+    for msg in raw_messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            orig_imgs = _count_image_parts(content)
+            sanitized = _sanitize_message_content(content, keep_images=True)
+            kept_imgs = _count_image_parts(sanitized)
+            if orig_imgs > kept_imgs:
+                unsafe_stripped += (orig_imgs - kept_imgs)
+            if not allow_vision_parts and kept_imgs > 0:
+                sanitized, removed = _strip_images_with_placeholder(
+                    sanitized,
+                    "[Attached image skipped — active model has no vision projector (mmproj) loaded]",
+                )
+                vision_skipped += removed
+            msg["content"] = sanitized
+
+    if unsafe_stripped:
+        turn_warnings.append(
+            f"Stripped {unsafe_stripped} unsupported image reference(s); only local base64 image uploads are permitted."
+        )
+    if vision_skipped:
+        turn_warnings.append(
+            "Loaded model does not have a vision projector (mmproj) active; attached image(s) were skipped. "
+            "Pair an mmproj file or choose a vision model in CONFIG."
+        )
+
+    # Locate the latest user message for semantic retrieval & web context
     latest_user_idx = None
     latest_user_text = ""
     for idx in range(len(raw_messages) - 1, -1, -1):
-        if raw_messages[idx].get("role") == "user" and isinstance(raw_messages[idx].get("content"), str):
-            latest_user_idx = idx
-            latest_user_text = raw_messages[idx]["content"].strip()
-            break
+        if raw_messages[idx].get("role") == "user":
+            plain = _extract_message_plain_text(raw_messages[idx].get("content")).strip()
+            if plain or isinstance(raw_messages[idx].get("content"), list):
+                latest_user_idx = idx
+                latest_user_text = plain
+                break
 
     # Include recent conversation turns when the latest reply is short (ignoring large attached file bodies)
     query_core = re.sub(
@@ -2697,8 +4186,9 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
     if retrieval_query and len(query_core) < 120 and latest_user_idx is not None:
         prior_turns: List[str] = []
         for msg in raw_messages[:latest_user_idx]:
-            if msg.get("role") in ("user", "assistant") and isinstance(msg["content"], str):
-                cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", msg["content"], flags=re.IGNORECASE).strip()
+            if msg.get("role") in ("user", "assistant"):
+                plain_prior = _extract_message_plain_text(msg.get("content"))
+                cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", plain_prior, flags=re.IGNORECASE).strip()
                 if cleaned:
                     prior_turns.append(cleaned[:200])
         if prior_turns:
@@ -2726,6 +4216,7 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
             user_name=target_persona.get("user_name", ""),
             never_forget=target_persona.get("never_forget", ""),
             notes=notes_source,
+            continuity_notes=target_persona.get("continuity_notes", ""),
         )
         effective_sys = _build_effective_system_prompt(persona_prefix)
     else:
@@ -2737,23 +4228,81 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
     else:
         raw_messages.insert(0, {"role": "system", "content": effective_sys})
 
-    if use_pcp and PCP_INDEX is not None and PCP_INDEX.ready and retrieval_query:
+    # Inject structured Core Facts & Relationships for the active/target persona
+    facts_dir = (
+        _resolve_persona_folder(target_persona["folder"])
+        if target_persona is not None
+        else _get_active_pcp_dir()
+    )
+    persona_facts = _load_persona_facts(facts_dir)
+    if persona_facts and "CORE FACTS & RELATIONSHIPS:" not in raw_messages[0]["content"]:
+        facts_block = format_core_facts_block(persona_facts, query=retrieval_query or latest_user_text, max_facts=12)
+        if facts_block:
+            raw_messages[0]["content"] = (
+                raw_messages[0]["content"].rstrip()
+                + "\n\nCORE FACTS & RELATIONSHIPS:\n"
+                + facts_block
+            )
+
+    # Inject Hybrid PCP archive excerpts
+    can_search_index = use_pcp and PCP_INDEX is not None and PCP_INDEX.ready and bool(retrieval_query)
+    if can_search_index and target_persona is not None:
+        try:
+            can_search_index = PCP_INDEX.data_dir.resolve() == _resolve_persona_folder(target_persona["folder"]).resolve()
+        except Exception:
+            can_search_index = False
+    if can_search_index and PCP_INDEX is not None:
         excerpts = PCP_INDEX.search(retrieval_query, limit=top_k)
         if excerpts and "ARCHIVE EXCERPTS:" not in raw_messages[0]["content"]:
             archive_block = "\n\n---\n\n".join(excerpts)
             raw_messages[0]["content"] = raw_messages[0]["content"].rstrip() + "\n\nARCHIVE EXCERPTS:\n" + archive_block
 
+    # Opt-in live web search & URL reader (strictly off unless use_web=True)
+    if use_web and query_core and "WEB RESULTS:" not in raw_messages[0]["content"]:
+        web_mode = str(settings.get("web_search_mode") or "smart")
+        rewriter = _llm_web_query_rewriter if web_mode == "smart" else None
+        try:
+            web_res = gather_web_context(
+                user_text=query_core,
+                provider=str(settings.get("web_provider") or "auto"),
+                searxng_url=str(settings.get("web_searxng_url") or ""),
+                api_key=str(settings.get("web_api_key") or ""),
+                search_mode=web_mode,
+                query_rewriter=rewriter,
+                max_results=4,
+            )
+            turn_sources = web_res.get("sources") or []
+            turn_warnings.extend(web_res.get("warnings") or [])
+            ctx_block = str(web_res.get("context_block") or "").strip()
+            if ctx_block:
+                grounding_note = build_web_grounding_note(cite_sources=bool(web_cite))
+                raw_messages[0]["content"] = (
+                    raw_messages[0]["content"].rstrip()
+                    + "\n\n"
+                    + grounding_note
+                    + "\n"
+                    + ctx_block
+                )
+        except Exception as exc:
+            log.warning(f"Web lookup error: {exc}")
+            turn_warnings.append(f"Web lookup failed: {exc}")
+
     last_user_msg = next(
-        (m for m in reversed(raw_messages) if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        (m for m in reversed(raw_messages) if m.get("role") == "user"),
         None,
     )
-    if last_user_msg is not None and "[Attached File:" in last_user_msg["content"]:
-        reminder = (
-            "[Respond directly to the attached text above by referencing its actual scenes, characters, and details. "
-            "Do not repeat or paraphrase your previous reply.]"
-        )
-        if reminder not in last_user_msg["content"]:
-            last_user_msg["content"] = last_user_msg["content"].rstrip() + "\n\n" + reminder
+    if last_user_msg is not None:
+        last_user_plain = _extract_message_plain_text(last_user_msg.get("content"))
+        if "[Attached File:" in last_user_plain:
+            reminder = (
+                "[Respond directly to the attached text above by referencing its actual scenes, characters, and details. "
+                "Do not repeat or paraphrase your previous reply.]"
+            )
+            if reminder not in last_user_plain:
+                last_user_msg["content"] = _append_text_to_message_content(
+                    last_user_msg.get("content"),
+                    "\n\n" + reminder,
+                )
 
     effective_n_ctx = int(STATE.loaded_context_size or settings.get("n_ctx") or 8192)
     effective_max_tokens = int(req.max_tokens or settings.get("max_tokens") or 512)
@@ -2767,9 +4316,19 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
         and not show_reasoning
     ):
         for msg in raw_messages:
-            if msg.get("role") in ("system", "user") and isinstance(msg.get("content"), str):
-                if "/no_think" not in msg["content"]:
-                    msg["content"] = msg["content"].rstrip() + "\n/no_think"
+            if msg.get("role") in ("system", "user"):
+                plain = _extract_message_plain_text(msg.get("content"))
+                if "/no_think" not in plain:
+                    msg["content"] = _append_text_to_message_content(msg.get("content"), "\n/no_think")
+
+    prompt_tokens_est = sum(_estimate_message_tokens(m) for m in raw_messages)
+    STATE.last_turn_meta = {
+        "sources": turn_sources,
+        "warnings": turn_warnings,
+        "prompt_tokens_est": prompt_tokens_est,
+        "n_ctx": effective_n_ctx,
+        "web_used": bool(use_web and turn_sources),
+    }
 
     return raw_messages, show_reasoning
 
@@ -2798,8 +4357,9 @@ def _chat_completion_args(req: ChatRequest, prepared_messages: List[Dict[str, An
     for m in prepared_messages:
         role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
         content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
-        if role == "assistant" and isinstance(content, str) and content.strip():
-            ai_turns.append(content.strip())
+        plain_ai = _extract_message_plain_text(content).strip()
+        if role == "assistant" and plain_ai:
+            ai_turns.append(plain_ai)
     ai_turns = ai_turns[-3:]
     if ai_turns and STATE.llm is not None and hasattr(STATE.llm, "tokenize"):
         try:
@@ -2888,6 +4448,7 @@ def _stream_generator(
     prepared_messages: List[Dict[str, Any]],
     generation_id: int,
     show_reasoning: bool,
+    turn_meta: Optional[Dict[str, Any]] = None,
 ):
     start = time.perf_counter()
     first_token_at: Optional[float] = None
@@ -2967,6 +4528,22 @@ def _stream_generator(
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 "ghost_aborted": True,
             })
+
+        elapsed_now = max(0.01, time.perf_counter() - start)
+        decode_now = elapsed_now - ((first_token_at - start) if first_token_at else 0.0)
+        rate_now = token_count / decode_now if decode_now > 0 else 0.0
+        meta_payload = dict(turn_meta or {})
+        meta_payload["tok_per_sec"] = round(rate_now, 1)
+        meta_payload["elapsed_sec"] = round(elapsed_now, 2)
+        meta_payload["chunks"] = token_count
+        yield _sse({
+            "id": f"chatcmpl-{generation_id}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [],
+            "ghost_meta": meta_payload,
+        })
         yield "data: [DONE]\n\n"
     except Exception as exc:
         failed = True
@@ -3012,8 +4589,10 @@ def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=409, detail="No model resident. Open CONFIG and click MOUNT first.")
 
     generation_id = STATE.begin_generation(bool(req.stream))
+    STATE.last_turn_meta = {}
     try:
         prepared_messages, show_reasoning = _prepare_pcp_messages(req)
+        turn_meta = dict(STATE.last_turn_meta or {})
     except Exception:
         STATE.end_generation(generation_id)
         raise
@@ -3024,7 +4603,7 @@ def chat_completions(req: ChatRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream_generator(req, prepared_messages, generation_id, show_reasoning),
+            _stream_generator(req, prepared_messages, generation_id, show_reasoning, turn_meta=turn_meta),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             background=BackgroundTask(STATE.end_generation, generation_id),
@@ -3056,6 +4635,12 @@ def chat_completions(req: ChatRequest):
     elapsed = time.perf_counter() - start
     usage = out.get("usage", {})
     tps = usage.get("completion_tokens", 0) / elapsed if elapsed > 0 else 0.0
+    if isinstance(out, dict):
+        out["ghost_meta"] = {
+            **turn_meta,
+            "tok_per_sec": round(tps, 1),
+            "elapsed_sec": round(elapsed, 2),
+        }
     log.info(
         f"COMPLETION :: model={req.model} prompt_tok={usage.get('prompt_tokens', '?')} "
         f"completion_tok={usage.get('completion_tokens', '?')} time={elapsed:.2f}s speed={tps:.2f} tok/s"

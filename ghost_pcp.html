@@ -721,6 +721,150 @@
                 opacity: 0.9;
             }
         }
+        .web-pill {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            padding: 8px 11px;
+            white-space: nowrap;
+        }
+        .web-pill.on {
+            border-color: rgba(95, 227, 161, 0.75);
+            color: var(--ok);
+            background: rgba(95, 227, 161, 0.14);
+            box-shadow: 0 0 12px rgba(95, 227, 161, 0.2);
+        }
+        .mic-btn.recording {
+            border-color: rgba(255, 107, 129, 0.85);
+            color: var(--danger);
+            background: rgba(255, 107, 129, 0.15);
+            animation: ghostPulse 1.2s infinite ease-in-out;
+        }
+        @keyframes ghostPulse {
+            0%, 100% { box-shadow: 0 0 0 rgba(255, 107, 129, 0.1); }
+            50% { box-shadow: 0 0 14px rgba(255, 107, 129, 0.45); }
+        }
+        .img-thumb-preview {
+            width: 34px;
+            height: 34px;
+            object-fit: cover;
+            border-radius: 5px;
+            border: 1px solid var(--line);
+            vertical-align: middle;
+        }
+        .msg-image-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .msg-image-preview {
+            max-width: 240px;
+            max-height: 220px;
+            border-radius: 8px;
+            border: 1px solid var(--line);
+            object-fit: contain;
+            background: #0b0c10;
+        }
+        .source-chips-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .source-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 9px;
+            border-radius: 999px;
+            border: 1px solid rgba(154, 123, 255, 0.35);
+            background: rgba(154, 123, 255, 0.09);
+            color: #d6caff;
+            font-size: 11.5px;
+            text-decoration: none;
+            max-width: 260px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .source-chip:hover {
+            border-color: var(--purple);
+            color: #fff;
+        }
+        .msg-meta-note {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 4px;
+        }
+        .telemetry-pill {
+            font-family: Consolas, monospace;
+            font-size: 11.5px;
+            color: var(--muted);
+            padding: 3px 8px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: #101218;
+        }
+        .mem-tabs {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            border-bottom: 1px solid var(--line);
+            padding-bottom: 8px;
+        }
+        .mem-tab-btn.active {
+            border-color: var(--purple);
+            background: rgba(154, 123, 255, 0.16);
+            color: #fff;
+        }
+        .mem-panel {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .mem-panel.active {
+            display: flex;
+        }
+        .mem-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 360px;
+            overflow-y: auto;
+        }
+        .mem-item {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 10px 12px;
+            background: var(--panel-raised);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .mem-item-hdr {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .catalog-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+            gap: 8px;
+        }
+        .catalog-card {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 10px;
+            background: #101218;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
     </style>
 </head>
 <body>
@@ -732,9 +876,11 @@
     <div class="header-controls">
         <span id="persona-pill" class="badge active" onclick="openPersonaModal(false)" title="Choose or manage saved AI personas">AI: DEFAULT ▾</span>
         <span id="pcp-badge" class="badge" onclick="openArchiveModal()" title="Manage PCP Archive Volumes">PCP: CHECKING...</span>
+        <span id="telemetry-pill" class="telemetry-pill" title="Live speed &amp; context window usage">0.0 tok/s</span>
         <span id="status-indicator" style="color: #888; font-size: 12.5px; font-weight: 600;">OFFLINE</span>
-        <button id="save-clear-button" onclick="saveAndClearChat()" title="Save this chat thread with a timestamp to your PCP archive and clear the window so the conversation continues without missing a beat">SAVE &amp; CLEAR</button>
+        <button id="save-clear-button" onclick="saveAndClearChat()" title="Save this chat thread with a timestamp and continuity summary to your PCP archive and clear the window">SAVE &amp; CLEAR</button>
         <button id="new-chat-button" class="secondary" onclick="startNewChat()" title="Clear conversation without saving">NEW CHAT</button>
+        <button class="secondary" onclick="openMemoriesModal()">[ MEMORIES ]</button>
         <button class="secondary" onclick="openArchiveModal()">[ ARCHIVE ]</button>
         <button class="secondary" onclick="openRemoteModal()">[ PHONE / TUNNEL ]</button>
         <button class="secondary" onclick="openSettings()">[ CONFIG ]</button>
@@ -746,8 +892,12 @@
 <div id="chat-attachments-bar" style="display: none;"></div>
 <div id="input-area">
     <input type="file" id="chat-file-input" multiple accept=".pdf,.txt,.md,.csv,.json,.log" style="display: none;" onchange="handleChatFileSelect(this.files)">
+    <input type="file" id="chat-image-input" multiple accept="image/*" style="display: none;" onchange="handleChatImageSelect(this.files)">
     <button id="attach-file-button" class="secondary" onclick="document.getElementById('chat-file-input').click()" title="Attach PDF or text files to chat or save them to your PCP database">[ + FILE ]</button>
-    <textarea id="user-input" rows="1" placeholder="Say something..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
+    <button id="attach-image-button" class="secondary" onclick="document.getElementById('chat-image-input').click()" title="Attach images (or paste screenshot with Ctrl+V) for Vision models">[ + IMG ]</button>
+    <button id="web-toggle-button" class="secondary web-pill" onclick="toggleWebAccess()" title="Toggle live web search and URL page reading (off by default)">WEB: OFF</button>
+    <button id="mic-button" class="secondary mic-btn" onclick="toggleVoiceDictation()" title="Speak into microphone (Web Speech API)">[ MIC ]</button>
+    <textarea id="user-input" rows="1" placeholder="Say something (paste URL to read when WEB is ON, or paste an image)..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
     <button id="send-button" onclick="sendMessage()">SEND</button>
 </div>
 
@@ -760,12 +910,14 @@
         </div>
 
         <p style="margin: 0; color: var(--muted); line-height: 1.45;">
-            Each AI persona keeps its own isolated memory folder (`ghost_pcp_*.md`, vector index, and saved post-import conversations). Pick an AI below or import a new OpenAI ChatGPT / Google Gemini archive.
+            Each AI persona keeps its own isolated memory folder (`ghost_pcp_*.md`, core facts, threads, continuity notes, and vector index). Pick an AI below, import an archive, or restore a `.zip` backup bundle.
         </p>
 
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             <button onclick="openNewPersonaImport()">+ NEW AI PERSONA (IMPORT ARCHIVE)</button>
             <button class="secondary" onclick="openPersonaEditor(null)">+ CREATE EMPTY PERSONA</button>
+            <input type="file" id="bundle-import-input" accept=".zip" style="display: none;" onchange="handleImportPersonaBundle(this.files)">
+            <button class="secondary" onclick="document.getElementById('bundle-import-input').click()">+ RESTORE BACKUP (.ZIP)</button>
         </div>
 
         <div id="persona-list" class="persona-grid"></div>
@@ -792,6 +944,10 @@
             <div class="control-group">
                 <label for="edit-persona-notes">Personality, Tone &amp; Voice Notes (optional)</label>
                 <textarea id="edit-persona-notes" rows="3" placeholder="How they speak, quirks, attitude, shared history..."></textarea>
+            </div>
+            <div class="control-group">
+                <label for="edit-persona-continuity">Recent Session Continuity &amp; Evolution Notes (auto-updated on SAVE &amp; CLEAR)</label>
+                <textarea id="edit-persona-continuity" rows="3" placeholder="Recent ongoing developments, active threads, and growth notes..."></textarea>
             </div>
             <div class="control-grid">
                 <div class="control-group">
@@ -824,12 +980,53 @@
         <div class="control-group">
             <label>Target Local GGUF Model (`./ghost_models`)</label>
             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                <select id="model-select" style="flex: 1; min-width: 220px;"></select>
+                <select id="model-select" style="flex: 1; min-width: 220px;" onchange="updateMmprojHint()"></select>
                 <button onclick="checkFit()" class="secondary">CHECK FIT</button>
                 <button id="mount-btn" onclick="loadSelectedModel()">MOUNT</button>
                 <button id="unload-btn" onclick="unloadSelectedModel()" class="secondary">UNLOAD</button>
             </div>
+            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px;">
+                <label for="mmproj-select" style="font-size: 12px; color: var(--muted); white-space: nowrap;">Vision Projector (`mmproj`):</label>
+                <select id="mmproj-select" style="flex: 1; min-width: 200px;">
+                    <option value="auto">Auto (pair matching vision mmproj if present)</option>
+                    <option value="none">Disabled (text only)</option>
+                </select>
+                <span id="vision-status-note" style="font-size: 11.5px; color: var(--muted);"></span>
+            </div>
         </div>
+
+        <details id="model-downloader-section" style="border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #101218;">
+            <summary style="cursor: pointer; color: var(--purple); font-weight: 700; font-size: 13px;">Get More GGUF Models (HuggingFace Downloader)</summary>
+            <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 10px;">
+                <div style="font-size: 12px; color: var(--muted);">One-click starter models (downloaded cleanly into `./ghost_models` with resume support; vision models include their `mmproj` projector):</div>
+                <div id="model-catalog-grid" class="catalog-grid"></div>
+                <div style="display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--line);">
+                    <label style="font-size: 12px; color: var(--muted);">Or Download Any Public HuggingFace GGUF Repo (`owner/repo` or URL)</label>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <input type="text" id="hf-repo-input" style="flex: 1; min-width: 200px;" placeholder="e.g. bartowski/Qwen2.5-7B-Instruct-GGUF">
+                        <button type="button" class="secondary" onclick="listHfRepoFiles()">LIST GGUF FILES</button>
+                    </div>
+                    <div id="hf-files-picker" style="display: none; gap: 8px; flex-wrap: wrap; align-items: center;">
+                        <select id="hf-file-select" style="flex: 1; min-width: 200px;"></select>
+                        <select id="hf-mmproj-select" style="flex: 1; min-width: 160px;">
+                            <option value="">No mmproj (text only)</option>
+                        </select>
+                        <button type="button" onclick="downloadCustomHfModel()">DOWNLOAD SELECTED</button>
+                    </div>
+                </div>
+                <div id="dl-progress-wrap" style="display: none; flex-direction: column; gap: 5px; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(154, 123, 255, 0.45); background: rgba(154, 123, 255, 0.08);">
+                    <div style="display: flex; justify-content: space-between; font-size: 12px;">
+                        <span id="dl-stage-text">Downloading...</span>
+                        <span id="dl-percent-text">0%</span>
+                    </div>
+                    <div class="progress-bar-outer"><div id="dl-progress-bar" class="progress-bar-inner"></div></div>
+                    <div style="display: flex; justify-content: flex-end;">
+                        <button type="button" id="dl-cancel-btn" class="secondary" style="padding: 3px 10px; font-size: 11.5px; color: var(--warn);" onclick="cancelModelDownload()">CANCEL DOWNLOAD</button>
+                    </div>
+                </div>
+                <div id="dl-status-msg" class="status-line"></div>
+            </div>
+        </details>
 
         <div class="control-grid">
             <div class="control-group">
@@ -860,7 +1057,8 @@
         <div class="control-grid">
             <div class="control-group">
                 <label><input type="checkbox" id="pcp-enabled" checked> Enable PCP Archive Grounding</label>
-                <small>Automatically retrieves relevant passages from `ghost_pcp_*.md` on every turn without citations.</small>
+                <small>Hybrid semantic + lexical retrieval from `ghost_pcp_*.md` on every turn.</small>
+                <label style="margin-top: 6px;"><input type="checkbox" id="auto-continuity-summary" checked> Capture Continuity Summary on SAVE &amp; CLEAR</label>
                 <label for="pcp-top-k" style="margin-top: 6px;">Retrieved Archive Passages per Turn</label>
                 <input type="number" id="pcp-top-k" min="1" max="12" step="1" value="4">
             </div>
@@ -870,7 +1068,42 @@
                     <option value="silas">Silas</option>
                     <option value="kara">Kara</option>
                 </select>
-                <small>Used when clicking the speaker button on the model's responses.</small>
+                <small>Drop any Piper `.onnx` + `.onnx.json` pair into `./piper_models` to add voices.</small>
+            </div>
+        </div>
+
+        <div style="border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #101218; display: flex; flex-direction: column; gap: 8px;">
+            <strong style="color: var(--text); font-size: 13px;">Opt-In Live Web Search &amp; URL Reader (Off by Default)</strong>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label><input type="checkbox" id="web-enabled" onchange="syncWebToggleUi(this.checked)"> Enable Live Web Access (`WEB: ON`)</label>
+                    <label style="margin-top: 4px;"><input type="checkbox" id="web-cite-sources" checked> Show clickable source link pills below replies</label>
+                </div>
+                <div class="control-group">
+                    <label for="web-provider">Search Provider</label>
+                    <select id="web-provider" onchange="updateWebProviderFields()">
+                        <option value="auto">Auto (Free DuckDuckGo + Wikipedia, no key)</option>
+                        <option value="searxng">Self-Hosted SearXNG Instance</option>
+                        <option value="brave">Brave Search API</option>
+                        <option value="tavily">Tavily Search API</option>
+                    </select>
+                </div>
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="web-search-mode">Trigger Mode</label>
+                    <select id="web-search-mode">
+                        <option value="smart">Smart (model decides if lookup is needed + URLs)</option>
+                        <option value="always">Always search when Web is ON</option>
+                        <option value="url_only">Read pasted http(s):// URLs only</option>
+                    </select>
+                </div>
+                <div class="control-group" id="web-cred-group">
+                    <label for="web-searxng-url" id="web-searxng-label" style="display: none;">SearXNG URL (e.g. http://127.0.0.1:8080)</label>
+                    <input type="text" id="web-searxng-url" style="display: none;" placeholder="http://127.0.0.1:8080">
+                    <label for="web-api-key" id="web-api-key-label" style="display: none;">Search API Key</label>
+                    <input type="password" id="web-api-key" style="display: none;" placeholder="Enter API key (stored locally only)">
+                </div>
             </div>
         </div>
 
@@ -949,8 +1182,8 @@
 
         <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
             <input type="file" id="file-input" multiple accept=".zip,.json,.jsonl,.html,.htm,.md,.txt,.pdf" style="display: none;" onchange="handleFileSelect(this.files)">
-            <h4>Drop Your ChatGPT or Google Gemini Export (.zip, .json, .html, .md, .txt, or .pdf) Here</h4>
-            <p>Or click to select your ChatGPT `.zip` / `conversations.json`, Google Gemini Takeout `.zip` / `MyActivity.json` / `MyActivity.html`, or `.md`, `.txt`, `.pdf` files.<br>GHostPCP auto-detects Google vs OpenAI, cleans boilerplate, builds `ghost_pcp_01.md` volumes in the persona's folder, and indexes them in the background.</p>
+            <h4>Drop Your AI Archive (.zip, .json, .html, .md, .txt, or .pdf) Here</h4>
+            <p>Supports OpenAI ChatGPT (`.zip` / `conversations.json`), Google Gemini Takeout (`MyActivity.json` / `MyActivity.html`), Anthropic Claude (`conversations.json`), xAI Grok, Character.AI, and plain documents.<br>GHostPCP auto-detects the format, deduplicates repeated threads, builds `ghost_pcp_01.md` volumes in the persona's folder, and indexes them cleanly.</p>
         </div>
 
         <div class="control-group">
@@ -1050,6 +1283,104 @@
     </div>
 </div>
 
+<!-- 2B. SECOND-BRAIN MEMORY INSPECTOR, CORE FACTS & THREADS MODAL -->
+<div id="memories-modal" class="modal-backdrop">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>GHostPCP // MEMORY &amp; CONTINUITY INSPECTOR</h3>
+            <button class="secondary" onclick="closeMemoriesModal()">CLOSE</button>
+        </div>
+
+        <div class="mem-tabs">
+            <button type="button" class="secondary mem-tab-btn active" data-tab="search" onclick="switchMemoryTab('search')">SEARCH MEMORIES</button>
+            <button type="button" class="secondary mem-tab-btn" data-tab="facts" onclick="switchMemoryTab('facts')">CORE FACTS &amp; PEOPLE</button>
+            <button type="button" class="secondary mem-tab-btn" data-tab="threads" onclick="switchMemoryTab('threads')">THREADS &amp; CONTINUITY</button>
+            <button type="button" class="secondary mem-tab-btn" data-tab="volumes" onclick="switchMemoryTab('volumes')">VOLUMES (`ghost_pcp_*.md`)</button>
+        </div>
+
+        <!-- Tab 1: Hybrid Memory Search -->
+        <div id="mem-panel-search" class="mem-panel active">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <input type="text" id="mem-search-input" style="flex: 1;" placeholder="Search memories by keyword, exact name, date, or concept..." onkeydown="if(event.key==='Enter') searchMemoriesInspector()">
+                <button type="button" onclick="searchMemoriesInspector()">SEARCH</button>
+            </div>
+            <div id="mem-search-results" class="mem-list">
+                <div class="fit-report">Enter a query above to test hybrid semantic + lexical recall for the active persona.</div>
+            </div>
+        </div>
+
+        <!-- Tab 2: Core Facts & Relationship Aliases -->
+        <div id="mem-panel-facts" class="mem-panel">
+            <div style="font-size: 12.5px; color: var(--muted);">
+                Save permanent names, relationships, dates, and life details with aliases (e.g. Subject: <em>Jordan</em>, Aliases: <em>my brother, bro</em>) so your AI always remembers even indirect questions.
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="fact-subject-input">Subject / Name</label>
+                    <input type="text" id="fact-subject-input" placeholder="e.g. Jordan, My Home Lab, Work Goal">
+                </div>
+                <div class="control-group">
+                    <label for="fact-aliases-input">Aliases / Relationship Clues (comma-separated)</label>
+                    <input type="text" id="fact-aliases-input" placeholder="e.g. my brother, sibling, bro">
+                </div>
+            </div>
+            <div class="control-grid">
+                <div class="control-group">
+                    <label for="fact-category-input">Category</label>
+                    <select id="fact-category-input">
+                        <option value="person">Person / Family</option>
+                        <option value="preference">Preference / Style</option>
+                        <option value="project">Project / Goal</option>
+                        <option value="general">General Fact</option>
+                    </select>
+                </div>
+                <div class="control-group" style="justify-content: flex-end;">
+                    <label><input type="checkbox" id="fact-pinned-input" checked> Always Keep Pinned in Context</label>
+                </div>
+            </div>
+            <div class="control-group">
+                <label for="fact-text-input">Fact Details</label>
+                <textarea id="fact-text-input" rows="2" placeholder="What your AI should permanently know about this subject..."></textarea>
+            </div>
+            <div>
+                <button type="button" onclick="savePersonaFact()">+ SAVE CORE FACT</button>
+            </div>
+            <div id="mem-facts-list" class="mem-list"></div>
+        </div>
+
+        <!-- Tab 3: Saved Threads, Continuity & Export -->
+        <div id="mem-panel-threads" class="mem-panel">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                <input type="text" id="thread-title-input" style="flex: 1;" placeholder="Thread snapshot title (optional)...">
+                <button type="button" onclick="saveCurrentChatAsThread()">SAVE CURRENT CHAT SNAPSHOT</button>
+                <button type="button" class="secondary" onclick="exportActivePersonaBundle()">EXPORT PERSONA (.ZIP)</button>
+            </div>
+            <div class="control-group">
+                <label for="mem-continuity-preview">Active Persona Continuity Log (auto-captured on SAVE &amp; CLEAR)</label>
+                <textarea id="mem-continuity-preview" rows="3" readonly placeholder="No continuity notes captured yet."></textarea>
+            </div>
+            <div id="mem-threads-list" class="mem-list"></div>
+        </div>
+
+        <!-- Tab 4: Markdown Volumes Viewer / Editor -->
+        <div id="mem-panel-volumes" class="mem-panel">
+            <div id="mem-volumes-list" class="mem-list"></div>
+            <div id="mem-volume-editor" style="display: none; flex-direction: column; gap: 8px; padding-top: 6px; border-top: 1px solid var(--line);">
+                <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                    <strong id="mem-volume-editing-name" style="color: var(--purple); font-size: 13px;"></strong>
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" onclick="saveEditedVolume()">SAVE &amp; RE-INDEX</button>
+                        <button type="button" class="secondary" onclick="closeVolumeEditor()">CANCEL</button>
+                    </div>
+                </div>
+                <textarea id="mem-volume-content" rows="10" style="font-family: Consolas, monospace; font-size: 12px;"></textarea>
+            </div>
+        </div>
+
+        <div id="memories-modal-message" class="status-line"></div>
+    </div>
+</div>
+
 <!-- 3. PHONE & ANYWHERE CLOUDFLARE TUNNEL MODAL -->
 <div id="remote-modal" class="modal-backdrop">
     <div class="modal-content">
@@ -1093,6 +1424,8 @@
 
     const API = "/v1";
     let currentModel = "";
+    let currentMmproj = null;
+    let currentVisionCapable = false;
     const conversation = [];
     let pendingAttachments = [];
     let editingIndex = null;
@@ -1102,6 +1435,7 @@
     let remoteInfo = null;
     let ingestPollTimer = null;
     let tunnelPollTimer = null;
+    let downloadPollTimer = null;
     let activeQrObjectUrl = null;
     let activeStreamController = null;
     let streamingIndex = null;
@@ -1111,6 +1445,133 @@
     let editingPersonaId = null;
     let stagedIngestFiles = [];
     let stagedLocalPath = "";
+    let webEnabled = false;
+    let mmprojFilesList = [];
+    let editingVolumeName = null;
+    let speechRecognition = null;
+    let isRecordingSpeech = false;
+
+    function extractPlainText(content) {
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+            return content
+                .filter(p => p && p.type === "text" && typeof p.text === "string")
+                .map(p => p.text)
+                .join("\n")
+                .trim();
+        }
+        return String(content || "");
+    }
+
+    function extractImageUrls(content) {
+        if (!Array.isArray(content)) return [];
+        return content
+            .filter(p => p && p.type === "image_url" && p.image_url && typeof p.image_url.url === "string")
+            .map(p => p.image_url.url);
+    }
+
+    function syncWebToggleUi(enabled) {
+        webEnabled = Boolean(enabled);
+        const btn = document.getElementById("web-toggle-button");
+        if (btn) {
+            btn.innerText = webEnabled ? "WEB: ON" : "WEB: OFF";
+            btn.classList.toggle("on", webEnabled);
+        }
+        const cb = document.getElementById("web-enabled");
+        if (cb && cb.checked !== webEnabled) cb.checked = webEnabled;
+    }
+
+    function updateWebProviderFields() {
+        const provider = document.getElementById("web-provider")?.value || "auto";
+        const sxLabel = document.getElementById("web-searxng-label");
+        const sxInput = document.getElementById("web-searxng-url");
+        const keyLabel = document.getElementById("web-api-key-label");
+        const keyInput = document.getElementById("web-api-key");
+        const showSx = provider === "searxng";
+        const showKey = provider === "brave" || provider === "tavily";
+        if (sxLabel) sxLabel.style.display = showSx ? "block" : "none";
+        if (sxInput) sxInput.style.display = showSx ? "block" : "none";
+        if (keyLabel) keyLabel.style.display = showKey ? "block" : "none";
+        if (keyInput) keyInput.style.display = showKey ? "block" : "none";
+    }
+
+    async function toggleWebAccess() {
+        const nextVal = !webEnabled;
+        syncWebToggleUi(nextVal);
+        try {
+            const base = lastSettings || readSettings();
+            const updated = { ...base, web_enabled: nextVal };
+            await api("/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(updated)
+            });
+            lastSettings = updated;
+        } catch (e) {}
+    }
+
+    function toggleVoiceDictation() {
+        const btn = document.getElementById("mic-button");
+        const input = document.getElementById("user-input");
+        const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRec) {
+            alert("Browser Speech Recognition requires Chrome, Edge, or Safari (and HTTPS or localhost).");
+            return;
+        }
+        if (isRecordingSpeech && speechRecognition) {
+            try { speechRecognition.stop(); } catch (e) {}
+            isRecordingSpeech = false;
+            if (btn) {
+                btn.classList.remove("recording");
+                btn.innerText = "[ MIC ]";
+            }
+            return;
+        }
+        try {
+            speechRecognition = new SpeechRec();
+            speechRecognition.lang = navigator.language || "en-US";
+            speechRecognition.interimResults = true;
+            speechRecognition.continuous = true;
+            const prefix = input && input.value.trim() ? `${input.value.trim()} ` : "";
+            let finalTranscript = "";
+            speechRecognition.onresult = (event) => {
+                let interim = "";
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const txt = event.results[i][0]?.transcript || "";
+                    if (event.results[i].isFinal) {
+                        finalTranscript += txt + " ";
+                    } else {
+                        interim += txt;
+                    }
+                }
+                if (input) {
+                    input.value = `${prefix}${finalTranscript}${interim}`.trimStart();
+                }
+            };
+            speechRecognition.onerror = () => {
+                isRecordingSpeech = false;
+                if (btn) {
+                    btn.classList.remove("recording");
+                    btn.innerText = "[ MIC ]";
+                }
+            };
+            speechRecognition.onend = () => {
+                isRecordingSpeech = false;
+                if (btn) {
+                    btn.classList.remove("recording");
+                    btn.innerText = "[ MIC ]";
+                }
+            };
+            speechRecognition.start();
+            isRecordingSpeech = true;
+            if (btn) {
+                btn.classList.add("recording");
+                btn.innerText = "STOP MIC";
+            }
+        } catch (e) {
+            alert(`Could not start microphone: ${e.message}`);
+        }
+    }
 
     async function api(path, options = {}) {
         const headers = new Headers(options.headers || {});
@@ -1132,7 +1593,7 @@
             const data = await api("/chat/history");
             const serverMsgs = Array.isArray(data.messages) ? data.messages : [];
             const same = serverMsgs.length === conversation.length && serverMsgs.every(
-                (m, i) => m.role === conversation[i]?.role && m.content === conversation[i]?.content
+                (m, i) => m.role === conversation[i]?.role && JSON.stringify(m.content) === JSON.stringify(conversation[i]?.content)
             );
             if (!same) {
                 const grew = serverMsgs.length > conversation.length;
@@ -1146,7 +1607,7 @@
     async function syncConversationToServer() {
         try {
             const payload = conversation
-                .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+                .filter(m => m && (m.role === "user" || m.role === "assistant") && (typeof m.content === "string" || Array.isArray(m.content)))
                 .map(m => ({ role: m.role, content: m.content }));
             await api("/chat/history", {
                 method: "POST",
@@ -1159,6 +1620,7 @@
     function readSettings() {
         return {
             model: document.getElementById("model-select").value || (lastSettings?.model ?? "Qwen3-14B-Q5_K_M.gguf"),
+            mmproj_model: document.getElementById("mmproj-select")?.value || (lastSettings?.mmproj_model ?? "auto"),
             chat_format: document.getElementById("chat-format").value,
             system_prompt: document.getElementById("system-prompt").value,
             pcp_enabled: document.getElementById("pcp-enabled").checked,
@@ -1167,6 +1629,13 @@
             blocked_phrases: document.getElementById("blocked-phrases").value,
             protected_words: document.getElementById("protected-words").value,
             show_reasoning: document.getElementById("show-reasoning").checked,
+            web_enabled: document.getElementById("web-enabled")?.checked === true,
+            web_provider: document.getElementById("web-provider")?.value || "auto",
+            web_searxng_url: document.getElementById("web-searxng-url")?.value || "",
+            web_api_key: document.getElementById("web-api-key")?.value || "",
+            web_search_mode: document.getElementById("web-search-mode")?.value || "smart",
+            web_cite_sources: document.getElementById("web-cite-sources")?.checked !== false,
+            auto_continuity_summary: document.getElementById("auto-continuity-summary")?.checked !== false,
             temperature: Number(document.getElementById("temp-slider").value),
             top_p: Number(document.getElementById("top-slider").value),
             min_p: Number(document.getElementById("min-p").value),
@@ -1181,6 +1650,10 @@
     }
 
     function writeSettings(settings) {
+        const mmSel = document.getElementById("mmproj-select");
+        if (mmSel && settings.mmproj_model && Array.from(mmSel.options).some(o => o.value === settings.mmproj_model)) {
+            mmSel.value = settings.mmproj_model;
+        }
         document.getElementById("system-prompt").value = settings.system_prompt || "";
         document.getElementById("chat-format").value = settings.chat_format || "auto";
         document.getElementById("pcp-enabled").checked = settings.pcp_enabled !== false;
@@ -1191,6 +1664,14 @@
         document.getElementById("blocked-phrases").value = settings.blocked_phrases ?? "";
         document.getElementById("protected-words").value = settings.protected_words ?? "";
         document.getElementById("show-reasoning").checked = settings.show_reasoning === true;
+        syncWebToggleUi(settings.web_enabled === true);
+        if (document.getElementById("web-provider")) document.getElementById("web-provider").value = settings.web_provider || "auto";
+        if (document.getElementById("web-searxng-url")) document.getElementById("web-searxng-url").value = settings.web_searxng_url || "";
+        if (document.getElementById("web-api-key")) document.getElementById("web-api-key").value = settings.web_api_key || "";
+        if (document.getElementById("web-search-mode")) document.getElementById("web-search-mode").value = settings.web_search_mode || "smart";
+        if (document.getElementById("web-cite-sources")) document.getElementById("web-cite-sources").checked = settings.web_cite_sources !== false;
+        if (document.getElementById("auto-continuity-summary")) document.getElementById("auto-continuity-summary").checked = settings.auto_continuity_summary !== false;
+        updateWebProviderFields();
         const temperature = settings.temperature ?? 0.7;
         const topP = settings.top_p ?? 0.95;
         const minP = settings.min_p ?? 0.05;
@@ -1276,9 +1757,13 @@
         const map = {
             google: "Google Gemini",
             openai: "OpenAI ChatGPT",
-            mixed: "Gemini + ChatGPT",
+            claude: "Anthropic Claude",
+            grok: "xAI Grok",
+            character_ai: "Character.AI",
+            mixed: "Multi-Source",
             markdown: "Documents / MD",
             existing: "Existing Archive",
+            bundle: "Restored Backup",
             custom: "Custom AI"
         };
         return map[String(sourceType || "").toLowerCase()] || "Saved AI";
@@ -1387,6 +1872,22 @@
             addBtn.onclick = () => openAddFilesToPersona(p.id);
             actions.appendChild(addBtn);
 
+            const memBtn = document.createElement("button");
+            memBtn.className = "secondary";
+            memBtn.innerText = "MEMORIES";
+            memBtn.onclick = async () => {
+                if (!p.active) await choosePersonaAndOpenMemories(p.id);
+                else { closePersonaModal(); openMemoriesModal(); }
+            };
+            actions.appendChild(memBtn);
+
+            const expBtn = document.createElement("button");
+            expBtn.className = "secondary";
+            expBtn.innerText = "BACKUP";
+            expBtn.title = "Export portable persona .zip backup";
+            expBtn.onclick = () => exportPersonaBundle(p.id, p.name);
+            actions.appendChild(expBtn);
+
             if (p.folder && p.folder !== ".") {
                 const delBtn = document.createElement("button");
                 delBtn.className = "secondary";
@@ -1399,6 +1900,67 @@
             card.appendChild(actions);
             listEl.appendChild(card);
         });
+    }
+
+    async function choosePersonaAndOpenMemories(personaId) {
+        const res = await api(`/personas/${encodeURIComponent(personaId)}/select`, { method: "POST" });
+        conversation.length = 0;
+        (res.messages || []).forEach(m => conversation.push({ role: m.role, content: m.content }));
+        if (res.persona) applyActivePersonaToUi(res.persona);
+        await fetchPersonas();
+        await refreshPCPStatus();
+        renderConversation(false);
+        closePersonaModal();
+        openMemoriesModal();
+    }
+
+    async function exportPersonaBundle(personaId, personaName) {
+        try {
+            const headers = new Headers();
+            const token = getAuthToken();
+            if (token) headers.set("Authorization", `Bearer ${token}`);
+            const resp = await fetch(`${API}/personas/${encodeURIComponent(personaId)}/export`, { headers });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.detail || `Export failed (${resp.status})`);
+            }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            const slug = String(personaName || personaId).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-|-$/g, "") || personaId;
+            a.download = `ghostpcp-persona-${slug}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (e) {
+            alert(`Backup export failed: ${e.message}`);
+        }
+    }
+
+    async function handleImportPersonaBundle(fileList) {
+        const file = fileList && fileList[0];
+        const input = document.getElementById("bundle-import-input");
+        if (!file) return;
+        const msgEl = document.getElementById("persona-modal-message");
+        if (msgEl) msgEl.innerText = `Restoring ${file.name}...`;
+        try {
+            const formData = new FormData();
+            formData.append("file", file);
+            const res = await api("/personas/import-bundle", { method: "POST", body: formData });
+            conversation.length = 0;
+            (res.messages || []).forEach(m => conversation.push({ role: m.role, content: m.content }));
+            if (res.persona) applyActivePersonaToUi(res.persona);
+            await fetchPersonas();
+            await refreshPCPStatus();
+            renderConversation(false);
+            if (msgEl) msgEl.innerText = `Restored ${res.persona?.name || "persona"} (${res.volumes_imported || 0} volume(s)).`;
+        } catch (e) {
+            if (msgEl) msgEl.innerText = `Restore error: ${e.message}`;
+        } finally {
+            if (input) input.value = "";
+        }
     }
 
     async function fetchPersonas() {
@@ -1465,6 +2027,9 @@
         document.getElementById("edit-persona-user-name").value = target ? (target.user_name || "") : "";
         document.getElementById("edit-persona-never-forget").value = target ? (target.never_forget || "") : "";
         document.getElementById("edit-persona-notes").value = target ? (target.notes || "") : "";
+        if (document.getElementById("edit-persona-continuity")) {
+            document.getElementById("edit-persona-continuity").value = target ? (target.continuity_notes || "") : "";
+        }
         document.getElementById("edit-persona-protected").value = target ? (target.protected_words || "") : "";
         const voiceSel = document.getElementById("edit-persona-voice");
         if (voiceSel && target?.tts_voice && Array.from(voiceSel.options).some(o => o.value === target.tts_voice)) {
@@ -1493,6 +2058,7 @@
             user_name: document.getElementById("edit-persona-user-name").value.trim(),
             never_forget: document.getElementById("edit-persona-never-forget").value.trim(),
             notes: document.getElementById("edit-persona-notes").value.trim(),
+            continuity_notes: document.getElementById("edit-persona-continuity")?.value.trim() || "",
             tts_voice: document.getElementById("edit-persona-voice").value || "silas",
             protected_words: document.getElementById("edit-persona-protected").value.trim()
         };
@@ -1559,27 +2125,223 @@
         openArchiveModal();
     }
 
+    let modelsMetadata = [];
+
     async function fetchModels() {
         try {
             const data = await api("/models");
+            modelsMetadata = Array.isArray(data.data) ? data.data : [];
+            mmprojFilesList = Array.isArray(data.mmproj_files) ? data.mmproj_files : [];
+
             const select = document.getElementById("model-select");
             select.innerHTML = "";
-            data.data.forEach(m => {
+            modelsMetadata.forEach(m => {
                 const opt = document.createElement("option");
                 opt.value = m.id;
-                opt.innerText = `${m.id} (${m.file_size_gib} GiB)`;
+                const visTag = m.auto_mmproj ? " [VISION]" : "";
+                opt.innerText = `${m.id} (${m.file_size_gib} GiB)${visTag}`;
                 select.appendChild(opt);
             });
-            if (currentModel && data.data.some(m => m.id === currentModel)) {
+            if (currentModel && modelsMetadata.some(m => m.id === currentModel)) {
                 select.value = currentModel;
-            } else if (lastSettings?.model && data.data.some(m => m.id === lastSettings.model)) {
+            } else if (lastSettings?.model && modelsMetadata.some(m => m.id === lastSettings.model)) {
                 select.value = lastSettings.model;
             }
-            select.disabled = data.data.length === 0;
+            select.disabled = modelsMetadata.length === 0;
+
+            const mmSel = document.getElementById("mmproj-select");
+            if (mmSel) {
+                const prev = mmSel.value || lastSettings?.mmproj_model || "auto";
+                mmSel.innerHTML = `
+                    <option value="auto">Auto (pair matching vision mmproj if present)</option>
+                    <option value="none">Disabled (text only)</option>
+                `;
+                mmprojFilesList.forEach(mm => {
+                    const opt = document.createElement("option");
+                    opt.value = mm.id;
+                    opt.innerText = `${mm.id} (${mm.file_size_gib} GiB)`;
+                    mmSel.appendChild(opt);
+                });
+                if (Array.from(mmSel.options).some(o => o.value === prev)) {
+                    mmSel.value = prev;
+                }
+            }
+            updateMmprojHint();
         } catch (e) {
             setStatus("API OFFLINE", "var(--danger)");
             document.getElementById("loader-message").innerText = e.message;
         }
+    }
+
+    function updateMmprojHint() {
+        const modelId = document.getElementById("model-select")?.value || "";
+        const mmSel = document.getElementById("mmproj-select")?.value || "auto";
+        const noteEl = document.getElementById("vision-status-note");
+        if (!noteEl) return;
+        const meta = modelsMetadata.find(m => m.id === modelId);
+        if (currentVisionCapable && currentModel === modelId && currentMmproj) {
+            noteEl.style.color = "var(--ok)";
+            noteEl.innerText = `Vision ON (${currentMmproj})`;
+        } else if (mmSel !== "auto" && mmSel !== "none") {
+            noteEl.style.color = "var(--purple)";
+            noteEl.innerText = `Will load with ${mmSel}`;
+        } else if (mmSel === "auto" && meta && meta.auto_mmproj) {
+            noteEl.style.color = "var(--ok)";
+            noteEl.innerText = `Auto-pairs ${meta.auto_mmproj}`;
+        } else if (meta && meta.vision_likely && !mmprojFilesList.length) {
+            noteEl.style.color = "var(--warn)";
+            noteEl.innerText = "Vision model missing mmproj GGUF";
+        } else {
+            noteEl.style.color = "var(--muted)";
+            noteEl.innerText = "Text model";
+        }
+    }
+
+    async function fetchModelCatalog() {
+        const grid = document.getElementById("model-catalog-grid");
+        if (!grid) return;
+        try {
+            const data = await api("/models/catalog");
+            const installed = new Set(data.local_models || []);
+            const items = data.catalog || [];
+            grid.replaceChildren();
+            items.forEach(item => {
+                const card = document.createElement("div");
+                card.className = "catalog-card";
+                const isDone = installed.has(item.save_as);
+                card.innerHTML = `
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:6px;">
+                        <strong style="font-size:12.5px; color:var(--text);">${escapeHtml(item.title)}</strong>
+                        <span class="source-pill">${item.vision ? "Vision" : `${item.size_gb} GB`}</span>
+                    </div>
+                    <div style="font-size:11.5px; color:var(--muted); line-height:1.35;">${escapeHtml(item.description)}</div>
+                    <div style="font-size:11px; color:var(--purple);">${escapeHtml(item.vram_note)}${item.vision ? ` · ${item.size_gb} GB` : ""}</div>
+                `;
+                const btn = document.createElement("button");
+                btn.type = "button";
+                btn.className = isDone ? "secondary" : "";
+                btn.style.marginTop = "auto";
+                btn.style.padding = "5px 9px";
+                btn.style.fontSize = "11.5px";
+                btn.innerText = isDone ? "INSTALLED" : "DOWNLOAD";
+                btn.disabled = isDone;
+                btn.onclick = () => startCatalogDownload(item.id);
+                card.appendChild(btn);
+                grid.appendChild(card);
+            });
+        } catch (e) {}
+    }
+
+    async function startCatalogDownload(catalogId) {
+        try {
+            await api("/models/download", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ catalog_id: catalogId })
+            });
+            startDownloadPolling();
+        } catch (e) {
+            document.getElementById("dl-status-msg").innerText = `Download error: ${e.message}`;
+        }
+    }
+
+    async function listHfRepoFiles() {
+        const repo = document.getElementById("hf-repo-input").value.trim();
+        const msg = document.getElementById("dl-status-msg");
+        if (!repo) return;
+        msg.innerText = `Inspecting ${repo}...`;
+        try {
+            const data = await api(`/models/hf-files?repo_id=${encodeURIComponent(repo)}`);
+            const fileSel = document.getElementById("hf-file-select");
+            const mmSel = document.getElementById("hf-mmproj-select");
+            const picker = document.getElementById("hf-files-picker");
+            fileSel.innerHTML = "";
+            mmSel.innerHTML = `<option value="">No mmproj (text only)</option>`;
+            (data.models || []).forEach(f => {
+                const opt = document.createElement("option");
+                opt.value = f.filename;
+                opt.innerText = `${f.local_name} (${f.size_gb} GB)`;
+                fileSel.appendChild(opt);
+            });
+            (data.mmprojs || []).forEach(m => {
+                const opt = document.createElement("option");
+                opt.value = m.filename;
+                opt.innerText = `${m.local_name} (${m.size_gb} GB)`;
+                mmSel.appendChild(opt);
+            });
+            picker.style.display = (data.models || []).length ? "flex" : "none";
+            msg.innerText = (data.models || []).length
+                ? `Found ${data.models.length} GGUF file(s) in ${data.repo_id}.`
+                : `No .gguf files found in ${data.repo_id}.`;
+        } catch (e) {
+            msg.innerText = e.message;
+        }
+    }
+
+    async function downloadCustomHfModel() {
+        const repoId = document.getElementById("hf-repo-input").value.trim();
+        const filename = document.getElementById("hf-file-select").value;
+        const mmprojFilename = document.getElementById("hf-mmproj-select").value;
+        if (!repoId || !filename) return;
+        try {
+            await api("/models/download", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    repo_id: repoId,
+                    filename,
+                    mmproj_filename: mmprojFilename || null
+                })
+            });
+            startDownloadPolling();
+        } catch (e) {
+            document.getElementById("dl-status-msg").innerText = `Download error: ${e.message}`;
+        }
+    }
+
+    function startDownloadPolling() {
+        if (downloadPollTimer) clearInterval(downloadPollTimer);
+        pollModelDownloadStatus();
+        downloadPollTimer = setInterval(pollModelDownloadStatus, 750);
+    }
+
+    async function pollModelDownloadStatus() {
+        try {
+            const st = await api("/models/download/status");
+            const wrap = document.getElementById("dl-progress-wrap");
+            const stage = document.getElementById("dl-stage-text");
+            const pct = document.getElementById("dl-percent-text");
+            const bar = document.getElementById("dl-progress-bar");
+            const msg = document.getElementById("dl-status-msg");
+            if (st.running) {
+                wrap.style.display = "flex";
+                const mbDone = (st.downloaded_bytes / (1024 * 1024)).toFixed(0);
+                const mbTotal = st.total_bytes ? (st.total_bytes / (1024 * 1024)).toFixed(0) : "?";
+                stage.innerText = `${st.stage} (${mbDone}/${mbTotal} MB · ${st.speed_mbps.toFixed(1)} MB/s)`;
+                pct.innerText = `${st.progress_pct.toFixed(1)}%`;
+                bar.style.width = `${Math.min(100, st.progress_pct)}%`;
+                msg.innerText = "";
+            } else {
+                wrap.style.display = "none";
+                if (downloadPollTimer) {
+                    clearInterval(downloadPollTimer);
+                    downloadPollTimer = null;
+                }
+                if (st.stage === "Complete") {
+                    msg.innerText = `Downloaded ${st.filename}${st.mmproj_filename ? ` + ${st.mmproj_filename}` : ""}. Ready to MOUNT above!`;
+                    await fetchModels();
+                    await fetchModelCatalog();
+                } else if (st.error) {
+                    msg.innerText = `${st.stage}: ${st.error}`;
+                }
+            }
+        } catch (e) {}
+    }
+
+    async function cancelModelDownload() {
+        try {
+            await api("/models/download/cancel", { method: "POST" });
+        } catch (e) {}
     }
 
     async function refreshPCPStatus() {
@@ -1607,7 +2369,7 @@
             } else {
                 badge.innerText = "PCP: NO ARCHIVE (CLICK TO IMPORT)";
                 badge.className = "badge";
-                summary.innerText = `No ghost_pcp_*.md volumes found in ${pcp.data_dir}.\nDrop an OpenAI ChatGPT or Google Gemini export (.zip, conversations.json, MyActivity.json, or source folder) below.`;
+                summary.innerText = `No ghost_pcp_*.md volumes found in ${pcp.data_dir}.\nDrop an OpenAI ChatGPT, Google Gemini, Claude, Grok, or Character.AI export (.zip, .json, .html, or source folder) below.`;
             }
             return pcp;
         } catch (e) {
@@ -1627,7 +2389,11 @@
             const plan = await api("/preflight", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({model: settings.model, n_ctx: settings.n_ctx})
+                body: JSON.stringify({
+                    model: settings.model,
+                    n_ctx: settings.n_ctx,
+                    mmproj_model: settings.mmproj_model || "auto"
+                })
             });
             const offload = plan.n_gpu_layers === 0
                 ? "CPU-only fallback"
@@ -1635,7 +2401,7 @@
             const details = [
                 `${plan.architecture} · ${plan.quantization} · ${plan.parameter_count.toLocaleString()} params`,
                 `${plan.weight_gib.toFixed(2)} GiB weights · ${(plan.kv_cache_estimate_bytes / (1024 ** 3)).toFixed(2)} GiB KV (${plan.kv_cache_type})`,
-                `${offload} · ${plan.gpu_name || "CPU"}`
+                `${offload} · ${plan.gpu_name || "CPU"}${plan.vision_capable ? ` · Vision: ${plan.mmproj_model}` : ""}`
             ];
             if (plan.warnings.length) details.push(...plan.warnings);
             report.innerText = details.join("\n");
@@ -1665,16 +2431,20 @@
                 body: JSON.stringify({
                     model,
                     n_ctx: settings.n_ctx,
-                    chat_format: settings.chat_format
+                    chat_format: settings.chat_format,
+                    mmproj_model: settings.mmproj_model || "auto"
                 })
             });
             currentModel = model;
+            currentMmproj = loaded.mmproj_model || null;
+            currentVisionCapable = Boolean(loaded.vision_capable);
             lastSettings = settings;
-            setStatus(`ONLINE: ${model}`, "var(--purple)");
+            setStatus(`ONLINE: ${model}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
+            updateMmprojHint();
             const plan = loaded.preflight;
             const offload = plan.n_gpu_layers === 0 ? "CPU-only" : `${plan.n_gpu_layers}/${plan.total_layers} GPU layers`;
-            document.getElementById("fit-report").innerText = `${plan.architecture} · ${plan.quantization} · ${offload} · KV: ${plan.kv_cache_type} (${loaded.load_seconds}s)`;
-            document.getElementById("loader-message").innerText = `Mounted ${model}. Ready to chat.`;
+            document.getElementById("fit-report").innerText = `${plan.architecture} · ${plan.quantization} · ${offload} · KV: ${plan.kv_cache_type} (${loaded.load_seconds}s)${currentVisionCapable ? ` · Vision: ${currentMmproj}` : ""}`;
+            document.getElementById("loader-message").innerText = `Mounted ${model}${currentVisionCapable ? ` with vision (${currentMmproj})` : ""}. Ready to chat.`;
             document.getElementById("user-input").disabled = false;
             document.getElementById("send-button").disabled = false;
         } catch (e) {
@@ -1691,6 +2461,9 @@
         try {
             await api("/unload", {method: "POST"});
             currentModel = "";
+            currentMmproj = null;
+            currentVisionCapable = false;
+            updateMmprojHint();
             document.getElementById("user-input").disabled = true;
             document.getElementById("send-button").disabled = true;
             setStatus("MODEL UNLOADED", "#888");
@@ -1847,7 +2620,8 @@
                 const ta = document.createElement("textarea");
                 ta.className = "inline-edit-textarea";
                 ta.id = `edit-ta-${idx}`;
-                ta.value = isUser ? msg.content : stripThinkBlocks(msg.content);
+                const plainMsg = extractPlainText(msg.content);
+                ta.value = isUser ? plainMsg : stripThinkBlocks(plainMsg);
 
                 const btnRow = document.createElement("div");
                 btnRow.className = "inline-edit-actions";
@@ -1871,10 +2645,28 @@
                 body.className = "message-body";
 
                 if (isUser) {
-                    body.innerHTML = formatUserMessageHtml(msg.content.replace(/<\/?think>/gi, ""));
+                    const imgs = extractImageUrls(msg.content);
+                    if (imgs.length) {
+                        const grid = document.createElement("div");
+                        grid.className = "msg-image-grid";
+                        imgs.forEach(src => {
+                            const im = document.createElement("img");
+                            im.className = "msg-image-preview";
+                            im.src = src;
+                            im.alt = "Attached image";
+                            grid.appendChild(im);
+                        });
+                        body.appendChild(grid);
+                    }
+                    const txt = extractPlainText(msg.content).replace(/<\/?think>/gi, "");
+                    if (txt) {
+                        const txtSpan = document.createElement("div");
+                        txtSpan.innerHTML = formatUserMessageHtml(txt);
+                        body.appendChild(txtSpan);
+                    }
                     div.appendChild(body);
                 } else {
-                    const parts = splitThinkBlocks(String(msg.content));
+                    const parts = splitThinkBlocks(String(extractPlainText(msg.content)));
                     for (const part of parts) {
                         if (part.type === "text") {
                             const span = document.createElement("div");
@@ -1893,6 +2685,39 @@
                         }
                     }
                     div.appendChild(body);
+                    if (msg.meta) {
+                        const sources = Array.isArray(msg.meta.sources) ? msg.meta.sources : [];
+                        const validSources = sources.filter(s => s && /^https?:\/\//i.test(String(s.url || "")));
+                        if (validSources.length && (lastSettings?.web_cite_sources !== false)) {
+                            const row = document.createElement("div");
+                            row.className = "source-chips-row";
+                            validSources.forEach(s => {
+                                const a = document.createElement("a");
+                                a.className = "source-chip";
+                                a.href = s.url;
+                                a.target = "_blank";
+                                a.rel = "noopener noreferrer";
+                                a.title = s.url;
+                                a.innerText = s.title || s.url;
+                                row.appendChild(a);
+                            });
+                            div.appendChild(row);
+                        }
+                        const warns = Array.isArray(msg.meta.warnings) ? msg.meta.warnings : [];
+                        if (warns.length || msg.meta.tok_per_sec) {
+                            const note = document.createElement("div");
+                            note.className = "msg-meta-note";
+                            const bits = [];
+                            if (msg.meta.tok_per_sec) bits.push(`${msg.meta.tok_per_sec} tok/s`);
+                            if (msg.meta.prompt_tokens_est && msg.meta.n_ctx) {
+                                const pct = Math.min(100, Math.round((msg.meta.prompt_tokens_est / msg.meta.n_ctx) * 100));
+                                bits.push(`ctx ${pct}%`);
+                            }
+                            if (warns.length) bits.push(warns[0]);
+                            note.innerText = bits.join(" · ");
+                            div.appendChild(note);
+                        }
+                    }
                 }
 
                 // Action Bar (Stop in active user message actions only; Speaker & Redo on AI; Copy, Edit & Delete on both)
@@ -2010,7 +2835,8 @@
         resetActiveVoiceButton();
 
         const voiceName = document.getElementById("tts-voice")?.value || lastSettings?.tts_voice || "silas";
-        const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
+        const plain = extractPlainText(msg.content);
+        const clean = msg.role === "assistant" ? stripThinkBlocks(plain) : plain;
         const controller = new AbortController();
         activeTtsController = controller;
         // Instantiate Audio synchronously during the click event so mobile browsers keep playback gesture rights
@@ -2108,7 +2934,8 @@
     async function copyMessage(idx, buttonEl) {
         const msg = conversation[idx];
         if (!msg) return;
-        const clean = msg.role === "assistant" ? stripThinkBlocks(msg.content) : msg.content;
+        const plain = extractPlainText(msg.content);
+        const clean = msg.role === "assistant" ? stripThinkBlocks(plain) : plain;
         try {
             await copyTextToClipboard(clean);
             const prev = buttonEl.innerText;
@@ -2134,8 +2961,14 @@
         const ta = document.getElementById(`edit-ta-${idx}`);
         if (!ta) return;
         const updated = ta.value.trim();
-        if (!updated) return;
-        conversation[idx].content = updated;
+        if (!updated && extractImageUrls(conversation[idx]?.content).length === 0) return;
+        const oldContent = conversation[idx]?.content;
+        if (Array.isArray(oldContent)) {
+            const imgs = oldContent.filter(p => p && p.type === "image_url");
+            conversation[idx].content = updated ? [{ type: "text", text: updated }, ...imgs] : imgs;
+        } else {
+            conversation[idx].content = updated;
+        }
         editingIndex = null;
         renderConversation(false);
         syncConversationToServer();
@@ -2199,6 +3032,7 @@
         activeStreamController = controller;
         let accumulated = "";
         let sawAbortMarker = false;
+        let turnMeta = null;
         let paintHandle = null;
         const paint = () => {
             paintHandle = null;
@@ -2225,6 +3059,19 @@
             }
             if (chunk.error) throw new Error(chunk.error.message || "Generation error");
             if (chunk.ghost_aborted) sawAbortMarker = true;
+            if (chunk.ghost_meta) {
+                turnMeta = chunk.ghost_meta;
+                const tPill = document.getElementById("telemetry-pill");
+                if (tPill && turnMeta) {
+                    const bits = [];
+                    if (turnMeta.tok_per_sec) bits.push(`${turnMeta.tok_per_sec} tok/s`);
+                    if (turnMeta.prompt_tokens_est && turnMeta.n_ctx) {
+                        const pct = Math.min(100, Math.round((turnMeta.prompt_tokens_est / turnMeta.n_ctx) * 100));
+                        bits.push(`ctx ${pct}%`);
+                    }
+                    if (bits.length) tPill.innerText = bits.join(" · ");
+                }
+            }
             const delta = chunk.choices?.[0]?.delta;
             if (!delta) return;
             if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
@@ -2258,7 +3105,9 @@
                     max_tokens: settings.max_tokens,
                     use_pcp: settings.pcp_enabled,
                     pcp_top_k: settings.pcp_top_k,
-                    show_reasoning: settings.show_reasoning
+                    show_reasoning: settings.show_reasoning,
+                    use_web: webEnabled,
+                    web_cite_sources: settings.web_cite_sources !== false
                 })
             });
             if (!response.ok) {
@@ -2290,7 +3139,7 @@
             paint();
             if (activeStreamController === controller) activeStreamController = null;
         }
-        return {content: accumulated, aborted: sawAbortMarker || abortRequested};
+        return {content: accumulated, aborted: sawAbortMarker || abortRequested, meta: turnMeta};
     }
 
     async function redoMessage(idx) {
@@ -2311,6 +3160,7 @@
 
         const previousContent = conversation[idx].content;
         conversation[idx].content = "";
+        conversation[idx].meta = null;
         streamingIndex = idx;
         renderConversation(false);
 
@@ -2323,6 +3173,7 @@
             } else {
                 conversation[idx].content = result.content || previousContent;
             }
+            if (result.meta) conversation[idx].meta = result.meta;
             renderConversation(false);
         } catch (e) {
             conversation[idx].content = previousContent;
@@ -2350,12 +3201,101 @@
         }
         bar.style.display = "flex";
         bar.innerHTML = pendingAttachments.map((att, idx) => {
+            if (att.kind === "image") {
+                return `<div class="attachment-chip"><img class="img-thumb-preview" src="${att.dataUrl}" alt="${escapeHtml(att.name)}"><span>${escapeHtml(att.name)}</span><button type="button" class="secondary" onclick="removeChatAttachment(${idx})" title="Remove image">x</button></div>`;
+            }
             const sizeLabel = `${(att.chars || 0).toLocaleString()} chars`;
             const saveControl = att.savedTo
                 ? `<span style="color: var(--purple); font-size: 11px;">Saved: ${escapeHtml(att.savedTo)}</span>`
                 : `<button type="button" class="secondary" ${att.saving ? "disabled" : ""} onclick="saveAttachmentToArchive(${idx})" title="Permanently index into pcp_data">${att.saving ? "SAVING..." : "SAVE TO DB"}</button>`;
             return `<div class="attachment-chip"><span>${escapeHtml(att.name)} (${sizeLabel})</span>${saveControl}<button type="button" class="secondary" onclick="removeChatAttachment(${idx})" title="Remove attachment">x</button></div>`;
         }).join("");
+    }
+
+    function resizeImageFileToDataUrl(file, maxDim = 1024) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error("Could not read image file."));
+            reader.onload = () => {
+                const img = new Image();
+                img.onerror = () => reject(new Error("Invalid or unsupported image."));
+                img.onload = () => {
+                    let w = img.naturalWidth || img.width || 1;
+                    let h = img.naturalHeight || img.height || 1;
+                    if (w > maxDim || h > maxDim) {
+                        const scale = Math.min(maxDim / w, maxDim / h);
+                        w = Math.max(1, Math.round(w * scale));
+                        h = Math.max(1, Math.round(h * scale));
+                    }
+                    const canvas = document.createElement("canvas");
+                    canvas.width = w;
+                    canvas.height = h;
+                    const ctx = canvas.getContext("2d");
+                    ctx.drawImage(img, 0, 0, w, h);
+                    const outMime = (file.type === "image/png" && (file.size || 0) < 400000) ? "image/png" : "image/jpeg";
+                    resolve(canvas.toDataURL(outMime, 0.88));
+                };
+                img.src = reader.result;
+            };
+            reader.readAsDataURL(file);
+        });
+    }
+
+    async function handleChatImageSelect(fileList) {
+        const files = Array.from(fileList || []).filter(f => f && String(f.type || "").startsWith("image/"));
+        const input = document.getElementById("chat-image-input");
+        if (!files.length) return;
+        const btn = document.getElementById("attach-image-button");
+        if (btn) btn.disabled = true;
+        try {
+            for (const f of files.slice(0, 6)) {
+                const dataUrl = await resizeImageFileToDataUrl(f, 1024);
+                pendingAttachments.push({
+                    kind: "image",
+                    name: f.name || "pasted-image.jpg",
+                    dataUrl
+                });
+            }
+            renderChatAttachments();
+            if (!currentVisionCapable) {
+                setStatus("ATTACHED IMAGE (PAIR MMPROJ IN CONFIG FOR VISION)", "var(--warn)");
+            }
+        } catch (err) {
+            alert(`Could not load image: ${err.message}`);
+        } finally {
+            if (input) input.value = "";
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    document.getElementById("user-input")?.addEventListener("paste", (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        const imgFiles = [];
+        for (const item of items) {
+            if (item.kind === "file" && item.type.startsWith("image/")) {
+                const file = item.getAsFile();
+                if (file) imgFiles.push(file);
+            }
+        }
+        if (imgFiles.length) {
+            e.preventDefault();
+            handleChatImageSelect(imgFiles);
+        }
+    });
+
+    const chatContainerEl = document.getElementById("chat-container");
+    if (chatContainerEl) {
+        chatContainerEl.addEventListener("dragover", e => { e.preventDefault(); });
+        chatContainerEl.addEventListener("drop", e => {
+            if (!e.dataTransfer?.files?.length) return;
+            e.preventDefault();
+            const dropped = Array.from(e.dataTransfer.files);
+            const imgs = dropped.filter(f => String(f.type || "").startsWith("image/"));
+            const docs = dropped.filter(f => !String(f.type || "").startsWith("image/"));
+            if (imgs.length) handleChatImageSelect(imgs);
+            if (docs.length) handleChatFileSelect(docs);
+        });
     }
 
     function removeChatAttachment(idx) {
@@ -2457,8 +3397,18 @@
 
         let userContent = text;
         if (pendingAttachments.length > 0) {
-            const fileBlocks = pendingAttachments.map(att => `[Attached File: ${att.name}]\n${att.text}\n[/Attached File]`);
-            userContent = [...fileBlocks, text || "Please read the attached file(s)."].join("\n\n");
+            const fileAtts = pendingAttachments.filter(att => att.kind !== "image");
+            const imgAtts = pendingAttachments.filter(att => att.kind === "image" && att.dataUrl);
+            const fileBlocks = fileAtts.map(att => `[Attached File: ${att.name}]\n${att.text}\n[/Attached File]`);
+            const textBody = [...fileBlocks, text || (imgAtts.length ? "Please look at the attached image(s)." : "Please read the attached file(s).")].join("\n\n");
+            if (imgAtts.length > 0) {
+                userContent = [
+                    { type: "text", text: textBody },
+                    ...imgAtts.map(att => ({ type: "image_url", image_url: { url: att.dataUrl } }))
+                ];
+            } else {
+                userContent = textBody;
+            }
             pendingAttachments = [];
             renderChatAttachments();
         }
@@ -2478,6 +3428,7 @@
             } else {
                 conversation[replyIndex].content = result.content || "(empty response)";
             }
+            if (result.meta) conversation[replyIndex].meta = result.meta;
         } catch (e) {
             conversation[replyIndex].content = abortRequested
                 ? (conversation[replyIndex].content || "*[Stopped before any output.]*")
@@ -2515,8 +3466,10 @@
             });
             conversation.length = 0;
             editingIndex = null;
-            lastSavedBanner = `Saved ${res.turns_saved} turn(s) to ${res.saved_to} [${res.timestamp}] · ${res.total_passages.toLocaleString()} total passages active. Continue whenever you're ready.`;
+            const contSnippet = res.continuity_note ? ` · Continuity captured` : "";
+            lastSavedBanner = `Saved ${res.turns_saved} turn(s) to ${res.saved_to} [${res.timestamp}]${contSnippet} · ${res.total_passages.toLocaleString()} total passages active. Continue whenever you're ready.`;
             await refreshPCPStatus();
+            await fetchPersonas();
             renderConversation(false);
             document.getElementById("user-input").focus();
         } catch (error) {
@@ -2935,6 +3888,7 @@
     function openSettings() {
         document.getElementById("settings-modal").style.display = "flex";
         fetchModels();
+        fetchModelCatalog();
         fetchVoices();
     }
     function closeSettings() {
@@ -2961,6 +3915,366 @@
         closeArchiveModal();
         openSettings();
     }
+
+    // --- Second-Brain Memory Inspector, Facts & Threads Modal ---
+    function openMemoriesModal() {
+        document.getElementById("memories-modal").style.display = "flex";
+        document.getElementById("memories-modal-message").innerText = "";
+        closeVolumeEditor();
+        loadPersonaFacts();
+        loadPersonaThreads();
+        loadVolumesList();
+        const contPreview = document.getElementById("mem-continuity-preview");
+        if (contPreview) {
+            contPreview.value = activePersona?.continuity_notes || "";
+        }
+    }
+    function closeMemoriesModal() {
+        document.getElementById("memories-modal").style.display = "none";
+        closeVolumeEditor();
+    }
+    function switchMemoryTab(tabName) {
+        document.querySelectorAll(".mem-tab-btn").forEach(btn => {
+            btn.classList.toggle("active", btn.dataset.tab === tabName);
+        });
+        document.querySelectorAll(".mem-panel").forEach(panel => {
+            panel.classList.toggle("active", panel.id === `mem-panel-${tabName}`);
+        });
+    }
+
+    async function searchMemoriesInspector() {
+        const q = document.getElementById("mem-search-input").value.trim();
+        const list = document.getElementById("mem-search-results");
+        if (!q) return;
+        list.innerHTML = `<div class="fit-report">Searching archive...</div>`;
+        try {
+            const data = await api(`/pcp/search?q=${encodeURIComponent(q)}&limit=10`);
+            const results = data.results || [];
+            if (!results.length) {
+                list.innerHTML = `<div class="fit-report">No matching passages found in active persona volumes.</div>`;
+                return;
+            }
+            list.replaceChildren();
+            results.forEach(item => {
+                const div = document.createElement("div");
+                div.className = "mem-item";
+                const hdr = document.createElement("div");
+                hdr.className = "mem-item-hdr";
+                hdr.innerHTML = `<strong style="color:var(--purple); font-size:12px;">${escapeHtml((item.kind || "memory").toUpperCase())}</strong><span class="source-pill">Score ${Number(item.score || 0).toFixed(3)}</span>`;
+                const body = document.createElement("pre");
+                body.style.margin = "0";
+                body.style.whiteSpace = "pre-wrap";
+                body.style.fontFamily = "inherit";
+                body.style.fontSize = "12.5px";
+                body.style.color = "var(--text)";
+                body.innerText = item.text || "";
+                div.appendChild(hdr);
+                div.appendChild(body);
+                list.appendChild(div);
+            });
+        } catch (e) {
+            list.innerHTML = `<div class="fit-report" style="color:var(--danger);">${escapeHtml(e.message)}</div>`;
+        }
+    }
+
+    async function loadPersonaFacts() {
+        const list = document.getElementById("mem-facts-list");
+        if (!list) return;
+        if (!activePersona?.id) {
+            list.innerHTML = `<div class="fit-report">Select or create an AI persona first to manage Core Facts.</div>`;
+            return;
+        }
+        try {
+            const data = await api(`/personas/${encodeURIComponent(activePersona.id)}/facts`);
+            const facts = data.facts || [];
+            if (!facts.length) {
+                list.innerHTML = `<div class="fit-report">No structured facts saved yet. Add names, relationships, or life details above.</div>`;
+                return;
+            }
+            list.replaceChildren();
+            facts.forEach(f => {
+                const div = document.createElement("div");
+                div.className = "mem-item";
+                const aliasText = (f.aliases || []).length ? `Aliases: ${f.aliases.join(", ")}` : "";
+                const hdr = document.createElement("div");
+                hdr.className = "mem-item-hdr";
+                hdr.innerHTML = `<div><strong style="color:var(--text);">${escapeHtml(f.subject)}</strong> <span class="source-pill">${escapeHtml(f.category)}</span></div>`;
+                const delBtn = document.createElement("button");
+                delBtn.type = "button";
+                delBtn.className = "secondary";
+                delBtn.style.padding = "3px 8px";
+                delBtn.style.fontSize = "11px";
+                delBtn.style.color = "var(--danger)";
+                delBtn.innerText = "DELETE";
+                delBtn.onclick = () => deletePersonaFact(f.id);
+                hdr.appendChild(delBtn);
+                div.appendChild(hdr);
+                if (aliasText) {
+                    const aEl = document.createElement("div");
+                    aEl.style.fontSize = "11.5px";
+                    aEl.style.color = "var(--purple)";
+                    aEl.innerText = aliasText;
+                    div.appendChild(aEl);
+                }
+                const body = document.createElement("div");
+                body.style.fontSize = "12.5px";
+                body.innerText = f.fact;
+                div.appendChild(body);
+                list.appendChild(div);
+            });
+        } catch (e) {}
+    }
+
+    async function savePersonaFact() {
+        if (!activePersona?.id) {
+            alert("Create or select an AI persona first.");
+            return;
+        }
+        const subject = document.getElementById("fact-subject-input").value.trim();
+        const rawAliases = document.getElementById("fact-aliases-input").value.trim();
+        const category = document.getElementById("fact-category-input").value;
+        const pinned = document.getElementById("fact-pinned-input").checked;
+        const fact = document.getElementById("fact-text-input").value.trim();
+        if (!subject || !fact) {
+            alert("Enter both Subject and Fact Details.");
+            return;
+        }
+        const aliases = rawAliases.split(",").map(s => s.trim()).filter(Boolean);
+        try {
+            await api(`/personas/${encodeURIComponent(activePersona.id)}/facts`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ subject, aliases, category, pinned, fact })
+            });
+            document.getElementById("fact-subject-input").value = "";
+            document.getElementById("fact-aliases-input").value = "";
+            document.getElementById("fact-text-input").value = "";
+            document.getElementById("memories-modal-message").innerText = `Saved core fact for "${subject}".`;
+            await loadPersonaFacts();
+            await fetchPersonas();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    async function deletePersonaFact(factId) {
+        if (!activePersona?.id) return;
+        try {
+            await api(`/personas/${encodeURIComponent(activePersona.id)}/facts/${encodeURIComponent(factId)}`, { method: "DELETE" });
+            await loadPersonaFacts();
+            await fetchPersonas();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    async function loadPersonaThreads() {
+        const list = document.getElementById("mem-threads-list");
+        if (!list) return;
+        if (!activePersona?.id) {
+            list.innerHTML = `<div class="fit-report">Select or create an AI persona first to save conversation snapshots.</div>`;
+            return;
+        }
+        try {
+            const data = await api(`/personas/${encodeURIComponent(activePersona.id)}/threads`);
+            const threads = data.threads || [];
+            if (!threads.length) {
+                list.innerHTML = `<div class="fit-report">No saved thread snapshots yet. Save your active conversation above to switch between topics later.</div>`;
+                return;
+            }
+            list.replaceChildren();
+            threads.forEach(t => {
+                const div = document.createElement("div");
+                div.className = "mem-item";
+                const hdr = document.createElement("div");
+                hdr.className = "mem-item-hdr";
+                hdr.innerHTML = `<strong style="color:var(--text);">${escapeHtml(t.title)}</strong><span style="font-size:11.5px; color:var(--muted);">${t.message_count} msgs · ${escapeHtml(t.updated_at || "")}</span>`;
+                const btns = document.createElement("div");
+                btns.style.display = "flex";
+                btns.style.gap = "6px";
+                const loadBtn = document.createElement("button");
+                loadBtn.type = "button";
+                loadBtn.style.padding = "4px 9px";
+                loadBtn.style.fontSize = "11.5px";
+                loadBtn.innerText = "LOAD THREAD";
+                loadBtn.onclick = () => loadSavedThread(t.id);
+                const delBtn = document.createElement("button");
+                delBtn.type = "button";
+                delBtn.className = "secondary";
+                delBtn.style.padding = "4px 9px";
+                delBtn.style.fontSize = "11.5px";
+                delBtn.style.color = "var(--danger)";
+                delBtn.innerText = "DELETE";
+                delBtn.onclick = () => deleteSavedThread(t.id);
+                btns.appendChild(loadBtn);
+                btns.appendChild(delBtn);
+                div.appendChild(hdr);
+                if (t.preview) {
+                    const prev = document.createElement("div");
+                    prev.style.fontSize = "12px";
+                    prev.style.color = "var(--muted)";
+                    prev.innerText = t.preview;
+                    div.appendChild(prev);
+                }
+                div.appendChild(btns);
+                list.appendChild(div);
+            });
+        } catch (e) {}
+    }
+
+    async function saveCurrentChatAsThread() {
+        if (!activePersona?.id) {
+            alert("Select or create an AI persona first.");
+            return;
+        }
+        if (!conversation.length) {
+            alert("Current chat is empty.");
+            return;
+        }
+        const title = document.getElementById("thread-title-input").value.trim();
+        try {
+            await api(`/personas/${encodeURIComponent(activePersona.id)}/threads/save`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title, messages: conversation })
+            });
+            document.getElementById("thread-title-input").value = "";
+            document.getElementById("memories-modal-message").innerText = "Saved conversation thread snapshot.";
+            await loadPersonaThreads();
+            await fetchPersonas();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    async function loadSavedThread(threadId) {
+        if (!activePersona?.id || isGenerating) return;
+        try {
+            const res = await api(`/personas/${encodeURIComponent(activePersona.id)}/threads/${encodeURIComponent(threadId)}/load`, { method: "POST" });
+            conversation.length = 0;
+            (res.messages || []).forEach(m => conversation.push({ role: m.role, content: m.content }));
+            renderConversation(true);
+            closeMemoriesModal();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    async function deleteSavedThread(threadId) {
+        if (!activePersona?.id) return;
+        try {
+            await api(`/personas/${encodeURIComponent(activePersona.id)}/threads/${encodeURIComponent(threadId)}`, { method: "DELETE" });
+            await loadPersonaThreads();
+            await fetchPersonas();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    function exportActivePersonaBundle() {
+        if (!activePersona?.id) {
+            alert("Select an AI persona first.");
+            return;
+        }
+        exportPersonaBundle(activePersona.id, activePersona.name);
+    }
+
+    async function loadVolumesList() {
+        const list = document.getElementById("mem-volumes-list");
+        if (!list) return;
+        try {
+            const data = await api("/pcp/volumes");
+            const vols = data.volumes || [];
+            if (!vols.length) {
+                list.innerHTML = `<div class="fit-report">No ghost_pcp_*.md volumes found in active folder.</div>`;
+                return;
+            }
+            list.replaceChildren();
+            vols.forEach(v => {
+                const volName = v.filename || v.name || "ghost_pcp_01.md";
+                const volBytes = Number(v.bytes ?? v.size_bytes ?? 0);
+                const div = document.createElement("div");
+                div.className = "mem-item";
+                const row = document.createElement("div");
+                row.className = "mem-item-hdr";
+                row.innerHTML = `<strong style="color:var(--text);">${escapeHtml(volName)}</strong><span style="font-size:11.5px; color:var(--muted);">${(volBytes / 1024).toFixed(1)} KB · ${escapeHtml(v.modified || "")}</span>`;
+                const btns = document.createElement("div");
+                btns.style.display = "flex";
+                btns.style.gap = "6px";
+                const editBtn = document.createElement("button");
+                editBtn.type = "button";
+                editBtn.className = "secondary";
+                editBtn.style.padding = "4px 9px";
+                editBtn.style.fontSize = "11.5px";
+                editBtn.innerText = "VIEW / EDIT";
+                editBtn.onclick = () => openVolumeEditor(volName);
+                const delBtn = document.createElement("button");
+                delBtn.type = "button";
+                delBtn.className = "secondary";
+                delBtn.style.padding = "4px 9px";
+                delBtn.style.fontSize = "11.5px";
+                delBtn.style.color = "var(--danger)";
+                delBtn.innerText = "DELETE";
+                delBtn.onclick = () => deleteVolumeFile(volName);
+                btns.appendChild(editBtn);
+                btns.appendChild(delBtn);
+                row.appendChild(btns);
+                div.appendChild(row);
+                list.appendChild(div);
+            });
+        } catch (e) {}
+    }
+
+    async function openVolumeEditor(filename) {
+        try {
+            const data = await api(`/pcp/volumes/${encodeURIComponent(filename)}`);
+            editingVolumeName = filename;
+            document.getElementById("mem-volume-editing-name").innerText = filename;
+            document.getElementById("mem-volume-content").value = data.content || "";
+            document.getElementById("mem-volume-editor").style.display = "flex";
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    function closeVolumeEditor() {
+        editingVolumeName = null;
+        const ed = document.getElementById("mem-volume-editor");
+        if (ed) ed.style.display = "none";
+    }
+
+    async function saveEditedVolume() {
+        if (!editingVolumeName) return;
+        const content = document.getElementById("mem-volume-content").value;
+        document.getElementById("memories-modal-message").innerText = `Saving ${editingVolumeName} and re-indexing...`;
+        try {
+            const res = await api(`/pcp/volumes/${encodeURIComponent(editingVolumeName)}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ content })
+            });
+            document.getElementById("memories-modal-message").innerText = `Saved ${res.filename} (${Number(res.total_passages ?? res.passages ?? 0).toLocaleString()} total passages). Backup stored in backups/.`;
+            closeVolumeEditor();
+            await loadVolumesList();
+            await refreshPCPStatus();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
+    async function deleteVolumeFile(filename) {
+        if (!window.confirm(`Delete ${filename}? (A backup copy will be moved to backups/ before removal.)`)) return;
+        try {
+            await api(`/pcp/volumes/${encodeURIComponent(filename)}`, { method: "DELETE" });
+            document.getElementById("memories-modal-message").innerText = `Moved ${filename} to backups/ and re-indexed.`;
+            if (editingVolumeName === filename) closeVolumeEditor();
+            await loadVolumesList();
+            await refreshPCPStatus();
+        } catch (e) {
+            document.getElementById("memories-modal-message").innerText = e.message;
+        }
+    }
+
     async function openRemoteModal() {
         document.getElementById("remote-modal").style.display = "flex";
         await refreshRemoteModal();
@@ -2997,6 +4311,7 @@
         }
         await loadConversationFromServer(true);
         await fetchModels();
+        await fetchModelCatalog();
         await fetchVoices();
         await fetchPersonas();
         if (lastSettings) writeSettings(lastSettings);
@@ -3005,9 +4320,13 @@
         try {
             const st = await api("/status");
             currentModel = st.resident_model || "";
+            currentMmproj = st.mmproj_model || null;
+            currentVisionCapable = Boolean(st.vision_capable);
+            if (typeof st.web_enabled === "boolean") syncWebToggleUi(st.web_enabled);
+            updateMmprojHint();
             const chosenBefore = sessionStorage.getItem("ghost_pcp_persona_chosen") === "1";
             if (currentModel) {
-                setStatus(`ONLINE: ${currentModel}`, "var(--purple)");
+                setStatus(`ONLINE: ${currentModel}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
                 document.getElementById("user-input").disabled = false;
                 document.getElementById("send-button").disabled = false;
                 if (!chosenBefore && personasList.length > 0) {

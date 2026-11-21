@@ -4,7 +4,7 @@
 Public License v3.0 or later (see `LICENSE`). Bundled third-party components
 and models retain their own licenses.
 
-The standalone Windows release bundle (`GHostPCP-v1.2.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
+The standalone Windows release bundle (`GHostPCP-v1.3.0-win64.zip`) includes the following third-party open-source components and pre-trained models, governed by their respective licenses:
 
 ---
 
@@ -51,8 +51,8 @@ The standalone Windows release bundles (or downloads on demand) pre-trained voic
 
 ## 4. Additional Runtime Libraries
 
-- **`llama.cpp` / `llama-cpp-python`**: Georgi Gerganov & contributors / Andrei Betlen (**MIT License**)
+- **`llama.cpp` / `llama-cpp-python` (including `mtmd` multimodal vision support)**: Georgi Gerganov & contributors / Andrei Betlen (**MIT License**)
 - **ONNX Runtime (`onnxruntime` 1.30.0)**: Microsoft Corporation (**MIT License**)
 - **NVIDIA CUDA Runtime (`cublas64_13.dll`, `cublasLt64_13.dll`)**: NVIDIA Corporation (redistributable runtime components under NVIDIA CUDA Toolkit EULA)
 - **`pypdf`**: Matthieu Thillay, Martin Thoma & pypdf contributors (**BSD-3-Clause License**)
-- **FastAPI, Uvicorn, Pydantic, NumPy, Safetensors, Tokenizers, SoundDevice, SoundFile (`libsndfile`, LGPL-2.1), PyWebView, QRCode**: Distributed under their respective open-source licenses (MIT / BSD / Apache-2.0 / LGPL-2.1).
+- **FastAPI, Uvicorn, Pydantic, NumPy, Safetensors, Tokenizers, HuggingFace Hub, Requests, SoundDevice, SoundFile (`libsndfile`, LGPL-2.1), PyWebView, QRCode**: Distributed under their respective open-source licenses (MIT / BSD / Apache-2.0 / LGPL-2.1).

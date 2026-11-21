@@ -11,7 +11,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -310,6 +310,7 @@ class GHostPCPTests(unittest.TestCase):
             ROOT / "ghost_pcp.py",
             ROOT / "pcp_ingest.py",
             ROOT / "pcp_retrieval.py",
+            ROOT / "pcp_web.py",
             ROOT / "persona.py",
             ROOT / "ghost_pcp.html",
             ROOT / "build_pcp.py",
@@ -554,6 +555,7 @@ class GHostPCPTests(unittest.TestCase):
             "ghost_pcp.py",
             "pcp_ingest.py",
             "pcp_retrieval.py",
+            "pcp_web.py",
             "persona.py",
             "ghost_pcp.html",
             "build_pcp.py",
@@ -621,6 +623,13 @@ class GHostPCPTests(unittest.TestCase):
             'id="ingest-persona-name"',
             'id="ingest-user-name"',
             'id="ingest-never-forget"',
+            'id="web-toggle-button"',
+            'id="attach-image-button"',
+            'id="mic-button"',
+            'id="memories-modal"',
+            'id="mmproj-select"',
+            'id="model-downloader-section"',
+            'id="telemetry-pill"',
         ):
             self.assertIn(control_id, html)
 
@@ -663,10 +672,19 @@ class GHostPCPTests(unittest.TestCase):
             "copyRemoteUrl",
             "finishArchiveAndOpenConfig",
             "handleChatFileSelect",
+            "handleChatImageSelect",
             "renderChatAttachments",
             "saveAttachmentToArchive",
             "removeChatAttachment",
             "formatUserMessageHtml",
+            "toggleWebAccess",
+            "toggleVoiceDictation",
+            "openMemoriesModal",
+            "closeMemoriesModal",
+            "savePersonaFact",
+            "exportPersonaBundle",
+            "handleImportPersonaBundle",
+            "fetchModelCatalog",
             "initialize",
         )
         for fn_name in required_functions:
@@ -1445,6 +1463,424 @@ class GHostPCPTests(unittest.TestCase):
                 ghost_pcp.PCP_INDEX = orig_pcp
                 with ghost_pcp.STATE._history_lock:
                     ghost_pcp.STATE.conversation = orig_conv
+
+    def test_web_search_ssrf_and_rewriter_and_offline_default(self):
+        import pcp_web
+        import ghost_pcp
+
+        # 1. SSRF protections must block localhost, loopback, link-local metadata, private LAN, and file:// URLs
+        for blocked_url in (
+            "http://localhost:5555/v1/status",
+            "http://127.0.0.1:8080/secret",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.25/admin",
+            "http://10.0.0.1/internal",
+            "file:///C:/Windows/win.ini",
+        ):
+            with self.assertRaises(ValueError):
+                pcp_web.validate_public_url(blocked_url)
+
+        # 2. HTTP redirect pointing at loopback must be blocked before following
+        with patch.object(pcp_web.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            fake_redirect = MagicMock()
+            fake_redirect.status_code = 302
+            fake_redirect.headers = {"Location": "http://127.0.0.1/internal"}
+            with patch.object(pcp_web.requests, "get", return_value=fake_redirect):
+                with self.assertRaises(ValueError):
+                    pcp_web.fetch_url_content("https://example.com/start")
+
+        # 3. Mocked public page fetch + DDG search + query rewriter veto / execution
+        with patch.object(pcp_web.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            html_page = MagicMock()
+            html_page.status_code = 200
+            html_page.headers = {"Content-Type": "text/html; charset=utf-8"}
+            html_page.encoding = "utf-8"
+            html_page.url = "https://example.com/notice"
+            html_page.iter_content.return_value = [
+                b"<html><head><title>Station Notice</title></head><body><main>Dock 4 opens at 08:00 UTC.</main></body></html>"
+            ]
+
+            with patch.object(pcp_web.requests, "get", return_value=html_page):
+                vetoed = pcp_web.gather_web_context(
+                    user_text="tell me what I like for breakfast",
+                    provider="auto",
+                    search_mode="smart",
+                    query_rewriter=lambda _q: "NONE",
+                )
+                self.assertEqual(vetoed["search_results"], [])
+                self.assertEqual(vetoed["context_block"], "")
+
+                url_read = pcp_web.gather_web_context(
+                    user_text="Read https://example.com/notice please",
+                    provider="auto",
+                    search_mode="url_only",
+                )
+                self.assertEqual(len(url_read["pages_read"]), 1)
+                self.assertIn("Dock 4 opens at 08:00 UTC.", url_read["context_block"])
+                self.assertEqual(url_read["sources"][0]["url"], "https://example.com/notice")
+
+        with patch.object(
+            pcp_web,
+            "search_web",
+            return_value=[{
+                "title": "Latest Release",
+                "url": "https://example.org/release",
+                "snippet": "Release 1.3.0 launched today.",
+                "provider": "duckduckgo",
+            }],
+        ):
+            res_auto = pcp_web.gather_web_context(
+                user_text="What is new with GHostPCP?",
+                provider="auto",
+                search_mode="smart",
+                query_rewriter=lambda _q: "GHostPCP latest release",
+            )
+            self.assertIn("[Web Search Results]", res_auto["context_block"])
+            self.assertEqual(res_auto["sources"][0]["url"], "https://example.org/release")
+
+            # Strict offline default: _prepare_pcp_messages does NOT search unless use_web=True
+            with tempfile.TemporaryDirectory() as tmp, patch.object(
+                ghost_pcp, "SETTINGS_PATH", Path(tmp) / "settings.json"
+            ), patch.object(ghost_pcp, "PCP_DATA_DIR", Path(tmp) / "pcp_data"), patch.object(
+                pcp_web, "gather_web_context"
+            ) as mock_gather:
+                mock_gather.return_value = res_auto
+                req_off = ghost_pcp.ChatRequest(
+                    model="Qwen3-14B-Q5_K_M.gguf",
+                    messages=[{"role": "user", "content": "Latest news please"}],
+                )
+                prep_off, _ = ghost_pcp._prepare_pcp_messages(req_off)
+                mock_gather.assert_not_called()
+                self.assertNotIn("[Web Search Results]", prep_off[0]["content"])
+
+                req_on = ghost_pcp.ChatRequest(
+                    model="Qwen3-14B-Q5_K_M.gguf",
+                    messages=[{"role": "user", "content": "Latest news please"}],
+                    use_web=True,
+                )
+                with patch.object(ghost_pcp, "gather_web_context", return_value=res_auto):
+                    prep_on, _ = ghost_pcp._prepare_pcp_messages(req_on)
+                self.assertIn("LIVE WEB CONTEXT RULES:", prep_on[0]["content"])
+                self.assertIn("[Web Search Results]", prep_on[0]["content"])
+                self.assertEqual(len(ghost_pcp.STATE.last_turn_meta.get("sources") or []), 1)
+
+    def test_universal_importers_claude_grok_charai_and_dedup(self):
+        import pcp_ingest
+
+        claude_export = json.dumps([
+            {
+                "name": "Orbital Log",
+                "chat_messages": [
+                    {
+                        "sender": "human",
+                        "created_at": "2026-02-01T10:00:00Z",
+                        "content": [{"type": "text", "text": "Did the solar panel deploy?"}],
+                    },
+                    {
+                        "sender": "assistant",
+                        "created_at": "2026-02-01T10:00:05Z",
+                        "content": [
+                            {"type": "thinking", "thinking": "internal thought should skip"},
+                            {"type": "text", "text": "Yes, Array West locked cleanly at sunrise."},
+                        ],
+                    },
+                ],
+            }
+        ]).encode("utf-8")
+
+        grok_export = json.dumps({
+            "conversations": [
+                {
+                    "conversation": {"title": "Grok Session"},
+                    "responses": [
+                        {"response": {"sender": "human", "message": "Check sensor drift.", "create_time": 1767225600}},
+                        {"response": {"sender": "assistant", "message": "Drift is under 0.02 degrees.", "create_time": 1767225610}},
+                    ],
+                }
+            ]
+        }).encode("utf-8")
+
+        char_ai_export = json.dumps({
+            "histories": [
+                {
+                    "msgs": [
+                        {"src": {"is_human": True}, "text": "Remember the greenhouse code?"},
+                        {"src": {"is_human": False}, "text": "Code 4412 unlocks the cedar door."},
+                    ]
+                }
+            ]
+        }).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "pcp_data"
+            summary = pcp_ingest.ingest_files(
+                file_items=[
+                    ("claude.json", claude_export),
+                    ("claude_duplicate.json", claude_export),
+                    ("grok.json", grok_export),
+                    ("charai.json", char_ai_export),
+                ],
+                output_dir=out_dir,
+                blocked_phrases=[],
+                protected_words=[],
+                replace_existing=True,
+            )
+            self.assertEqual(summary["interactions_total"], 3)
+            self.assertEqual(summary["interactions_kept"], 3)
+            self.assertEqual(summary["duplicates_skipped"], 1)
+            self.assertEqual(summary["source_type"], "mixed")
+            vol_text = (out_dir / "ghost_pcp_01.md").read_text(encoding="utf-8")
+            self.assertIn("Array West locked cleanly at sunrise.", vol_text)
+            self.assertNotIn("internal thought should skip", vol_text)
+            self.assertIn("Drift is under 0.02 degrees.", vol_text)
+            self.assertIn("Code 4412 unlocks the cedar door.", vol_text)
+
+    def test_hybrid_bm25_exact_name_retrieval(self):
+        from pcp_retrieval import PCPIndex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "pcp_data"
+            pdir.mkdir()
+            (pdir / "ghost_pcp_01.md").write_text(
+                "### CONVERSATION: Alpha [2026-01-01 09:00:00]\n"
+                "**User:** Tell me about general maintenance.\n"
+                "**Assistant:** All routine pumps look normal.\n\n---\n\n"
+                "### CONVERSATION: Beta [2026-01-02 10:00:00]\n"
+                "**User:** Tell me about maintenance on Kestrel-99 valve.\n"
+                "**Assistant:** The Kestrel-99 spare valve sits in Locker D.\n\n---\n",
+                encoding="utf-8",
+            )
+            idx = PCPIndex(pdir, cache_dir=pdir, model=FakeEmbedder())
+            self.assertTrue(idx.ready)
+            detailed = idx.search_detailed("Where is the Kestrel-99 valve?", limit=2)
+            self.assertTrue(detailed)
+            self.assertIn("Kestrel-99", detailed[0]["text"])
+            self.assertGreater(detailed[0]["lexical"], 0.0)
+
+    def test_core_facts_continuity_threads_volumes_and_bundle_roundtrip(self):
+        import ghost_pcp
+        from pcp_retrieval import PCPIndex
+
+        orig_pcp = ghost_pcp.PCP_INDEX
+        orig_llm = ghost_pcp.STATE.llm
+        with ghost_pcp.STATE._history_lock:
+            orig_conv = list(ghost_pcp.STATE.conversation)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                data_dir = base / "pcp_data"
+                settings_path = base / "settings.json"
+                ghost_pcp.STATE.llm = None
+                with patch.object(ghost_pcp, "PCP_DATA_DIR", data_dir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", settings_path
+                ), patch(
+                    "pcp_retrieval.NativeBGEModel", return_value=FakeEmbedder()
+                ), TestClient(ghost_pcp.app) as client:
+                    created = client.post(
+                        "/v1/personas",
+                        json={"name": "Silas", "user_name": "Kelly", "never_forget": "Always kind."},
+                    )
+                    self.assertEqual(created.status_code, 200)
+                    pid = created.json()["persona"]["id"]
+                    pdir = data_dir / "personas" / pid
+
+                    # 1. Core Facts with alias ("my brother" -> Jordan)
+                    fact_res = client.post(
+                        f"/v1/personas/{pid}/facts",
+                        json={
+                            "subject": "Jordan",
+                            "aliases": ["my brother", "sibling"],
+                            "category": "person",
+                            "fact": "Jordan runs a coffee roastery in Portland.",
+                            "pinned": True,
+                        },
+                    )
+                    self.assertEqual(fact_res.status_code, 200)
+
+                    # Indirect query mentioning "my brother" (not "Jordan") injects Jordan's fact cleanly
+                    req = ghost_pcp.ChatRequest(
+                        model="Qwen3-14B-Q5_K_M.gguf",
+                        persona_id=pid,
+                        messages=[{"role": "user", "content": "What does my brother do for a living?"}],
+                    )
+                    prepared, _ = ghost_pcp._prepare_pcp_messages(req)
+                    self.assertIn("CORE FACTS & RELATIONSHIPS:", prepared[0]["content"])
+                    self.assertIn("Jordan runs a coffee roastery in Portland.", prepared[0]["content"])
+
+                    # 2. Save thread snapshot, then save-session with deterministic continuity capture
+                    th_save = client.post(
+                        f"/v1/personas/{pid}/threads/save",
+                        json={
+                            "title": "Morning Check-In",
+                            "messages": [
+                                {"role": "user", "content": "We planned the Portland visit."},
+                                {"role": "assistant", "content": "Sounds great, let's bring espresso beans."},
+                            ],
+                        },
+                    )
+                    self.assertEqual(th_save.status_code, 200)
+                    tid = th_save.json()["thread"]["id"]
+
+                    sess_res = client.post(
+                        "/v1/pcp/save-session",
+                        json={
+                            "capture_continuity": True,
+                            "messages": [
+                                {"role": "user", "content": "We finalized the telescope mount design."},
+                                {"role": "assistant", "content": "Aluminum dovetail rail is ready for machining."},
+                            ],
+                        },
+                    )
+                    self.assertEqual(sess_res.status_code, 200)
+                    self.assertTrue(sess_res.json().get("continuity_note"))
+                    pers_after = client.get("/v1/personas").json()["personas"][0]
+                    self.assertIn("telescope mount", pers_after["continuity_notes"])
+
+                    # 3. Search memories & inspect / edit / delete volume
+                    search_res = client.get("/v1/pcp/search", params={"q": "telescope"})
+                    self.assertEqual(search_res.status_code, 200)
+                    self.assertTrue(search_res.json()["results"])
+
+                    vols = client.get("/v1/pcp/volumes").json()["volumes"]
+                    self.assertEqual(vols[0]["filename"], "ghost_pcp_01.md")
+                    read_vol = client.get("/v1/pcp/volumes/ghost_pcp_01.md").json()
+                    updated_text = read_vol["content"] + "\n\n### NOTE [2026-03-01 09:00:00]\n**User:** Add spare eyepiece.\n**Assistant:** Packed Plossl 25mm.\n\n---\n"
+                    put_res = client.put("/v1/pcp/volumes/ghost_pcp_01.md", json={"content": updated_text})
+                    self.assertEqual(put_res.status_code, 200)
+                    self.assertGreaterEqual(put_res.json()["total_passages"], 1)
+                    self.assertTrue((pdir / "backups").is_dir())
+                    reindexed_search = client.get("/v1/pcp/search", params={"q": "Plossl"})
+                    self.assertTrue(any("Plossl 25mm" in r["text"] for r in reindexed_search.json()["results"]))
+
+                    # 4. Reload saved thread cleanly
+                    th_load = client.post(f"/v1/personas/{pid}/threads/{tid}/load")
+                    self.assertEqual(th_load.status_code, 200)
+                    self.assertEqual(len(th_load.json()["messages"]), 2)
+
+                    # 5. Export zip bundle and import it cleanly as a portable clone
+                    exp_res = client.get(f"/v1/personas/{pid}/export")
+                    self.assertEqual(exp_res.status_code, 200)
+                    self.assertEqual(exp_res.headers["content-type"], "application/zip")
+
+                    imp_res = client.post(
+                        "/v1/personas/import-bundle",
+                        files={"file": ("backup.zip", exp_res.content, "application/zip")},
+                    )
+                    self.assertEqual(imp_res.status_code, 200)
+                    imported_pid = imp_res.json()["persona"]["id"]
+                    self.assertNotEqual(imported_pid, pid)
+                    facts_cloned = client.get(f"/v1/personas/{imported_pid}/facts").json()["facts"]
+                    self.assertEqual(facts_cloned[0]["subject"], "Jordan")
+        finally:
+            ghost_pcp.PCP_INDEX = orig_pcp
+            ghost_pcp.STATE.llm = orig_llm
+            with ghost_pcp.STATE._history_lock:
+                ghost_pcp.STATE.conversation = orig_conv
+
+    def test_mmproj_auto_pairing_safety_and_vision_prompt_sanitization(self):
+        import ghost_pcp
+
+        orig_llm = ghost_pcp.STATE.llm
+        orig_model = ghost_pcp.STATE.loaded_model
+        orig_mmproj = ghost_pcp.STATE.loaded_mmproj
+        orig_vis = ghost_pcp.STATE.loaded_vision_capable
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                mdir = base / "ghost_models"
+                mdir.mkdir()
+                (mdir / "Qwen3-14B-Q5_K_M.gguf").write_bytes(b"GGUF")
+                (mdir / "gemma-3-4b-it-Q4_K_M.gguf").write_bytes(b"GGUF")
+                (mdir / "gemma-3-4b-it-mmproj-f16.gguf").write_bytes(b"MMPROJ")
+                (mdir / "mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf").write_bytes(b"MMPROJ")
+
+                with patch.object(ghost_pcp, "MODEL_DIR", mdir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", base / "settings.json"
+                ):
+                    listed = ghost_pcp.scan_models()
+                    listed_ids = [m["id"] for m in listed]
+                    # mmproj files must NEVER pollute the primary GGUF dropdown
+                    self.assertEqual(set(listed_ids), {"Qwen3-14B-Q5_K_M.gguf", "gemma-3-4b-it-Q4_K_M.gguf"})
+                    # gemma-3 pairs cleanly with gemma-3 mmproj; text-only Qwen3-14B stays unpaired!
+                    self.assertEqual(
+                        ghost_pcp._find_paired_mmproj("gemma-3-4b-it-Q4_K_M.gguf", "auto"),
+                        "gemma-3-4b-it-mmproj-f16.gguf",
+                    )
+                    self.assertIsNone(ghost_pcp._find_paired_mmproj("Qwen3-14B-Q5_K_M.gguf", "auto"))
+
+                    # Mock MTMDChatHandler & Llama to verify load_model attaches vision handler cleanly
+                    fake_mtmd_instance = MagicMock()
+                    fake_llama_instance = MagicMock()
+                    with patch.object(
+                        ghost_pcp, "MTMDChatHandler", return_value=fake_mtmd_instance
+                    ) as mock_mtmd, patch.object(
+                        ghost_pcp, "Llama", return_value=fake_llama_instance
+                    ) as mock_llama, patch.object(
+                        ghost_pcp,
+                        "preflight_model",
+                        return_value={
+                            "n_gpu_layers": 10,
+                            "kv_type": 1,
+                            "kv_cache_type": "F16",
+                            "mmproj_model": "gemma-3-4b-it-mmproj-f16.gguf",
+                            "vision_capable": True,
+                            "warnings": [],
+                        },
+                    ):
+                        ghost_pcp.STATE.llm = None
+                        ghost_pcp.load_model("gemma-3-4b-it-Q4_K_M.gguf", 4096, "auto", "auto")
+                        mock_mtmd.assert_called_once()
+                        self.assertIs(mock_llama.call_args.kwargs.get("chat_handler"), fake_mtmd_instance)
+                        self.assertTrue(ghost_pcp.STATE.loaded_vision_capable)
+
+                        # Vision prompt accepts data:image/... URLs and strips external http:// URLs
+                        req_vis = ghost_pcp.ChatRequest(
+                            model="gemma-3-4b-it-Q4_K_M.gguf",
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "What is shown here?"},
+                                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                                    {"type": "image_url", "image_url": {"url": "https://evil.example/track.png"}},
+                                ],
+                            }],
+                        )
+                        prep_vis, _ = ghost_pcp._prepare_pcp_messages(req_vis)
+                        user_parts = prep_vis[-1]["content"]
+                        self.assertIsInstance(user_parts, list)
+                        self.assertEqual(len([p for p in user_parts if p["type"] == "image_url"]), 1)
+                        self.assertTrue(any("Stripped 1 unsupported" in w for w in ghost_pcp.STATE.last_turn_meta["warnings"]))
+
+                        # Text-only loaded model omits images cleanly with a user warning
+                        ghost_pcp.STATE.loaded_vision_capable = False
+                        prep_txt, _ = ghost_pcp._prepare_pcp_messages(req_vis)
+                        self.assertIsInstance(prep_txt[-1]["content"], str)
+                        self.assertIn("no vision projector", prep_txt[-1]["content"])
+        finally:
+            ghost_pcp.STATE.llm = orig_llm
+            ghost_pcp.STATE.loaded_model = orig_model
+            ghost_pcp.STATE.loaded_mmproj = orig_mmproj
+            ghost_pcp.STATE.loaded_vision_capable = orig_vis
+
+    def test_model_catalog_and_download_status_routes(self):
+        import ghost_pcp
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ghost_pcp, "MODEL_DIR", Path(tmp) / "ghost_models"
+        ), patch.object(
+            ghost_pcp, "SETTINGS_PATH", Path(tmp) / "settings.json"
+        ), patch.object(
+            ghost_pcp, "PCP_DATA_DIR", Path(tmp) / "pcp_data"
+        ), TestClient(ghost_pcp.app) as client:
+            cat_res = client.get("/v1/models/catalog")
+            self.assertEqual(cat_res.status_code, 200)
+            catalog = cat_res.json()["catalog"]
+            self.assertGreaterEqual(len(catalog), 5)
+            self.assertTrue(any(c.get("vision") and c.get("mmproj_filename") for c in catalog))
+
+            dl_stat = client.get("/v1/models/download/status")
+            self.assertEqual(dl_stat.status_code, 200)
+            self.assertIn("running", dl_stat.json())
 
 
 if __name__ == "__main__":

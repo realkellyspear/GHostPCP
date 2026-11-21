@@ -355,7 +355,12 @@ def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
     """Return (role, text) from a ChatGPT/AI Studio mapping message or flat message dict."""
     if not isinstance(msg_obj, dict):
         return "", ""
-    inner = msg_obj.get("message") if isinstance(msg_obj.get("message"), dict) else msg_obj
+    if isinstance(msg_obj.get("message"), dict):
+        inner = msg_obj["message"]
+    elif isinstance(msg_obj.get("response"), dict):
+        inner = msg_obj["response"]
+    else:
+        inner = msg_obj
     if not isinstance(inner, dict):
         return "", ""
 
@@ -365,9 +370,19 @@ def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
     author = inner.get("author")
     if isinstance(author, dict):
         role = str(author.get("role") or "")
+    elif isinstance(inner.get("sender"), str):
+        role = inner["sender"]
+    elif isinstance(inner.get("src"), dict) and "is_human" in inner["src"]:
+        role = "user" if inner["src"]["is_human"] else "assistant"
+    elif "is_human" in inner:
+        role = "user" if inner["is_human"] else "assistant"
     else:
         role = str(inner.get("role") or "")
     role = role.lower().strip()
+    if role == "human":
+        role = "user"
+    elif role in ("grok", "claude", "character", "char"):
+        role = "assistant"
 
     # Ignore hidden system or tool scaffolding messages
     metadata = inner.get("metadata")
@@ -386,10 +401,29 @@ def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
                 text_parts.append(part)
             elif isinstance(part, dict) and isinstance(part.get("text"), str):
                 text_parts.append(part["text"])
+    elif isinstance(content, list):
+        # Anthropic Claude content block list: [{"type": "text", "text": "..."}]
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict):
+                btype = str(block.get("type") or "text").lower()
+                if btype in ("thinking", "tool_use", "tool_result"):
+                    continue
+                if isinstance(block.get("text"), str):
+                    text_parts.append(block["text"])
     elif isinstance(content, str):
         text_parts.append(content)
     elif isinstance(inner.get("text"), str):
         text_parts.append(inner["text"])
+    elif isinstance(inner.get("message"), str):
+        text_parts.append(inner["message"])
+    elif isinstance(inner.get("candidates"), list):
+        # Character.AI candidates fallback
+        for cand in inner["candidates"]:
+            if isinstance(cand, dict) and isinstance(cand.get("raw_content"), str) and cand["raw_content"].strip():
+                text_parts.append(cand["raw_content"])
+                break
 
     text = "\n".join(p for p in text_parts if p).strip()
     return role, text
@@ -678,9 +712,17 @@ def extract_gemini_html_pairs(raw_html: str) -> List[Tuple[str, str]]:
 
 
 def detect_json_source(data: object) -> str:
-    """Detect whether parsed JSON data is from Google ('google'), OpenAI ('openai'), or 'unknown'."""
-    if isinstance(data, dict) and isinstance(data.get("chunkedPrompt"), dict):
-        return "google"
+    """Detect archive source: 'google', 'openai', 'claude', 'grok', 'character_ai', or 'unknown'."""
+    if isinstance(data, dict):
+        if isinstance(data.get("chunkedPrompt"), dict):
+            return "google"
+        if isinstance(data.get("histories"), list):
+            return "character_ai"
+        if isinstance(data.get("conversations"), list):
+            inner_conv = data["conversations"]
+            if inner_conv and isinstance(inner_conv[0], dict) and ("responses" in inner_conv[0] or "conversation" in inner_conv[0]):
+                return "grok"
+            return detect_json_source(inner_conv)
 
     items = data if isinstance(data, list) else [data]
     sample = [x for x in items[:50] if isinstance(x, dict)]
@@ -690,6 +732,12 @@ def detect_json_source(data: object) -> str:
     for entry in sample:
         if "mapping" in entry and isinstance(entry["mapping"], dict):
             return "openai"
+        if "chat_messages" in entry and isinstance(entry["chat_messages"], list):
+            return "claude"
+        if "responses" in entry and isinstance(entry["responses"], list):
+            return "grok"
+        if "histories" in entry or "msgs" in entry or (isinstance(entry.get("src"), dict) and "is_human" in entry["src"]):
+            return "character_ai"
 
     if any(_is_gemini_activity_entry(entry) for entry in sample):
         return "google"
@@ -704,15 +752,20 @@ def detect_json_source(data: object) -> str:
 
 
 def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
-    """Extract (user_text, assistant_text) pairs from OpenAI ChatGPT or generic JSON/JSONL data."""
+    """Extract (user_text, assistant_text) pairs from ChatGPT, Claude, Grok, Character.AI, or generic JSON."""
     pairs: List[Tuple[str, str]] = []
-    items = data if isinstance(data, list) else [data]
+    if isinstance(data, dict) and isinstance(data.get("conversations"), list) and "mapping" not in data:
+        items = data["conversations"]
+    elif isinstance(data, dict) and isinstance(data.get("histories"), list):
+        items = data["histories"]
+    else:
+        items = data if isinstance(data, list) else [data]
 
-    # Case 1: Flat list of {role, text/content} or {instruction, response} messages
+    # Case 1: Flat list of {role/sender, text/content/message} or {instruction, response} messages
     if items and all(
         isinstance(x, dict)
-        and ("role" in x or "instruction" in x)
-        and "mapping" not in x
+        and ("role" in x or "sender" in x or "instruction" in x or "is_human" in x or isinstance(x.get("src"), dict))
+        and not any(k in x for k in ("mapping", "chat_messages", "responses", "msgs", "histories"))
         and not _is_gemini_activity_entry(x)
         for x in items[:5]
     ):
@@ -744,7 +797,7 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
         if pairs:
             return pairs
 
-    # Case 2: Standard ChatGPT conversations.json (or Google AI Studio chunkedPrompt)
+    # Case 2: Nested conversation objects (ChatGPT mapping, Claude chat_messages, Grok responses, Character.AI msgs)
     for entry in items:
         if not isinstance(entry, dict):
             continue
@@ -755,7 +808,17 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
         else:
             def find_messages(obj: object) -> Optional[Iterable]:
                 if isinstance(obj, dict):
-                    for key in ("mapping", "messages", "history", "threads", "items", "chunks"):
+                    for key in (
+                        "mapping",
+                        "chat_messages",
+                        "responses",
+                        "msgs",
+                        "messages",
+                        "history",
+                        "threads",
+                        "items",
+                        "chunks",
+                    ):
                         if key in obj and isinstance(obj[key], (list, dict)):
                             return obj[key]
                     for val in obj.values():
@@ -791,13 +854,12 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
 
 
 def extract_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str]], str]:
-    """Detect source provider ('google', 'openai', or 'unknown') and return (pairs, source)."""
+    """Detect source provider and return (pairs, source)."""
     source = detect_json_source(data)
     if source == "google":
         gemini_entries = _extract_gemini_entries_from_data(data)
         if gemini_entries:
             return [(u, a) for u, a, _ in gemini_entries], "google"
-        # Google AI Studio chunkedPrompt fallback
         aistudio_pairs = _extract_chatgpt_or_generic_pairs(data)
         if aistudio_pairs:
             return aistudio_pairs, "google"
@@ -805,9 +867,10 @@ def extract_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str]], str]
 
     pairs = _extract_chatgpt_or_generic_pairs(data)
     if pairs:
-        return pairs, ("openai" if source == "openai" else "unknown")
+        if source in ("openai", "claude", "grok", "character_ai"):
+            return pairs, source
+        return pairs, "unknown"
 
-    # Secondary check in case Gemini entries appeared later in a mixed list
     gemini_entries = _extract_gemini_entries_from_data(data)
     if gemini_entries:
         return [(u, a) for u, a, _ in gemini_entries], "google"
@@ -1018,25 +1081,31 @@ def _is_generated_volume_md(path_str: str, raw_bytes: Optional[bytes] = None) ->
     return False
 
 
+_SOURCE_META = {
+    "google": ("gemini_export", "Google Gemini"),
+    "openai": ("chatgpt_export", "OpenAI ChatGPT"),
+    "claude": ("claude_export", "Anthropic Claude"),
+    "grok": ("grok_export", "xAI Grok"),
+    "character_ai": ("character_ai_export", "Character.AI"),
+}
+
+
 def _source_summary_fields(detected_sources: Set[str], mode_override: Optional[str] = None) -> Dict[str, str]:
-    clean = {s for s in detected_sources if s in ("google", "openai")}
-    if clean == {"google"}:
+    clean = [s for s in sorted(detected_sources) if s in _SOURCE_META]
+    if len(clean) == 1:
+        src = clean[0]
+        mode, label = _SOURCE_META[src]
         return {
-            "mode": mode_override or "gemini_export",
-            "source_type": "google",
-            "source_label": "Google Gemini",
+            "mode": mode_override or mode,
+            "source_type": src,
+            "source_label": label,
         }
-    if clean == {"openai"}:
-        return {
-            "mode": mode_override or "chatgpt_export",
-            "source_type": "openai",
-            "source_label": "OpenAI ChatGPT",
-        }
-    if clean == {"google", "openai"}:
+    if len(clean) > 1:
+        labels = " + ".join(_SOURCE_META[s][1] for s in clean)
         return {
             "mode": mode_override or "mixed_export",
             "source_type": "mixed",
-            "source_label": "Google Gemini + OpenAI ChatGPT",
+            "source_label": labels,
         }
     if mode_override == "markdown_import":
         return {
@@ -1174,7 +1243,7 @@ def discover_source_paths(source_path: Path) -> List[Path]:
         for f in other_jsons:
             try:
                 parsed = json.loads(f.read_text(encoding="utf-8-sig", errors="replace"))
-                if detect_json_source(parsed) in ("google", "openai"):
+                if detect_json_source(parsed) in _SOURCE_META:
                     valid_other_jsons.append(f)
             except Exception:
                 continue
@@ -1218,10 +1287,10 @@ def ingest_files(
     def _consume_json_data(label: str, data_obj: object) -> None:
         pairs, src = extract_pairs_with_source(data_obj)
         if pairs:
-            if src in ("google", "openai"):
+            if src in _SOURCE_META:
                 detected_sources.add(src)
                 if progress_callback:
-                    src_name = "Google Gemini" if src == "google" else "OpenAI ChatGPT"
+                    src_name = _SOURCE_META[src][1]
                     progress_callback(f"Detected {src_name} ({label}): {len(pairs):,} turns...", 0.18)
             all_pairs.extend(pairs)
 
@@ -1341,6 +1410,17 @@ def ingest_files(
         }
         return summary
 
+    # Deduplicate identical interaction pairs within the imported batch while preserving order
+    deduped_pairs: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+    for u, a in all_pairs:
+        key = (u.strip(), a.strip())
+        if key[0] and key[1] and key not in seen_pairs:
+            seen_pairs.add(key)
+            deduped_pairs.append((u, a))
+    duplicates_skipped = len(all_pairs) - len(deduped_pairs)
+    all_pairs = deduped_pairs
+
     if progress_callback:
         progress_callback("Filtering corporate refusals and boilerplate...", 0.22)
 
@@ -1365,6 +1445,7 @@ def ingest_files(
         "interactions_total": len(all_pairs),
         "interactions_kept": len(kept_pairs),
         "interactions_stripped": stripped_count,
+        "duplicates_skipped": duplicates_skipped,
         "volumes_written": len(written_paths),
         "volume_files": [p.name for p in written_paths],
     }
