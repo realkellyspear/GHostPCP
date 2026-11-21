@@ -566,7 +566,9 @@ class GHostPCPTests(unittest.TestCase):
             temp_root = Path(tmp) / "project"
             sandbox = Path(tmp) / "sandbox"
             bge_dir = Path(tmp) / "bge"
+            stt_dir = Path(tmp) / "stt"
             bge_dir.mkdir()
+            stt_dir.mkdir()
             for name in source_files:
                 target = temp_root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -578,6 +580,7 @@ class GHostPCPTests(unittest.TestCase):
             for directory, name in (
                 ("assets", "ghost_icon.ico"),
                 ("piper_models", "README.md"),
+                ("stt_model", "README.md"),
                 ("ghost_models", "README.md"),
             ):
                 target = temp_root / directory / name
@@ -588,6 +591,8 @@ class GHostPCPTests(unittest.TestCase):
 
             with patch.object(package_release, "ROOT", temp_root), patch(
                 "pcp_retrieval._resolve_bge_model_dir", return_value=bge_dir
+            ), patch(
+                "ghost_pcp._resolve_stt_model_dir", return_value=stt_dir
             ):
                 package_release.stage_clean_sandbox(sandbox, link_sample_gguf=False)
                 archive_path = Path(tmp) / "release.zip"
@@ -828,7 +833,9 @@ class GHostPCPTests(unittest.TestCase):
             orig_pcp = ghost_pcp.PCP_INDEX
             ghost_pcp.STATE.conversation.clear()
             try:
-                with patch.object(ghost_pcp, "PCP_DATA_DIR", out_dir), TestClient(ghost_pcp.app) as client:
+                with patch.object(ghost_pcp, "PCP_DATA_DIR", out_dir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", out_dir / "settings.json"
+                ), TestClient(ghost_pcp.app) as client:
                     ghost_pcp.PCP_INDEX = pcp_idx
                     empty = client.get("/v1/chat/history")
                     self.assertEqual(empty.status_code, 200)
@@ -1001,7 +1008,9 @@ class GHostPCPTests(unittest.TestCase):
             # 3. POST /v1/chat/extract-file (preview + save_to_archive=True) with isolated PCP_DATA_DIR
             orig_pcp = ghost_pcp.PCP_INDEX
             try:
-                with patch.object(ghost_pcp, "PCP_DATA_DIR", out_dir), TestClient(ghost_pcp.app) as client:
+                with patch.object(ghost_pcp, "PCP_DATA_DIR", out_dir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", out_dir / "settings.json"
+                ), TestClient(ghost_pcp.app) as client:
                     ghost_pcp.PCP_INDEX = pcp_idx
                     res_preview = client.post(
                         "/v1/chat/extract-file",
@@ -1881,6 +1890,82 @@ class GHostPCPTests(unittest.TestCase):
             dl_stat = client.get("/v1/models/download/status")
             self.assertEqual(dl_stat.status_code, 200)
             self.assertIn("running", dl_stat.json())
+
+    def test_offline_moonshine_stt_and_host_mic_routes(self):
+        import soundfile as sf
+        from piper import PiperVoice
+        import ghost_pcp
+
+        voice = PiperVoice.load(
+            str(ROOT / "piper_models" / "silas.onnx"),
+            str(ROOT / "piper_models" / "silas.onnx.json"),
+        )
+        pcm_int16 = np.concatenate([
+            np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+            for chunk in voice.synthesize("Check the weather station before midnight and open web search.")
+        ])
+        wav_buf = io.BytesIO()
+        sf.write(wav_buf, pcm_int16, voice.config.sample_rate, format="WAV", subtype="PCM_16")
+        wav_bytes = wav_buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ghost_pcp, "SETTINGS_PATH", Path(tmp) / "settings.json"
+        ), patch.object(
+            ghost_pcp, "PCP_DATA_DIR", Path(tmp) / "pcp_data"
+        ), TestClient(ghost_pcp.app) as client:
+            st = client.get("/v1/status")
+            self.assertEqual(st.status_code, 200)
+            self.assertTrue(st.json().get("stt_ready"))
+            self.assertIn("is_local_client", st.json())
+
+            # Remote clients cannot trigger host PC microphone
+            remote_start = client.post("/v1/audio/record/start")
+            self.assertEqual(remote_start.status_code, 403)
+
+            # Transcribe WAV upload offline via Moonshine-Base ONNX
+            tr_res = client.post(
+                "/v1/audio/transcribe",
+                files={"file": ("speech.wav", wav_bytes, "audio/wav")},
+            )
+            self.assertEqual(tr_res.status_code, 200)
+            heard = tr_res.json()["text"].lower()
+            self.assertIn("weather", heard)
+            self.assertIn("midnight", heard)
+
+            # Local host loopback recording flow using mocked sounddevice.InputStream
+            class FakeStream:
+                def __init__(self, **kwargs):
+                    self.cb = kwargs.get("callback")
+
+                def start(self):
+                    audio_f32, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+                    n_out = max(1, int(round(len(audio_f32) * 16000 / sr)))
+                    resampled = np.interp(
+                        np.linspace(0, len(audio_f32) - 1, n_out),
+                        np.arange(len(audio_f32)),
+                        audio_f32,
+                    ).astype(np.float32)
+                    if self.cb:
+                        self.cb(resampled[:, None], len(resampled), None, None)
+
+                def stop(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            with patch.object(ghost_pcp, "_is_local_loopback_request", return_value=True), patch.object(
+                ghost_pcp.sd, "InputStream", side_effect=lambda **kw: FakeStream(**kw)
+            ), patch.object(
+                ghost_pcp.sd, "query_devices", return_value={"name": "Test USB Mic"}
+            ):
+                s_res = client.post("/v1/audio/record/start")
+                self.assertEqual(s_res.status_code, 200)
+                self.assertEqual(s_res.json()["status"], "recording")
+
+                e_res = client.post("/v1/audio/record/stop")
+                self.assertEqual(e_res.status_code, 200)
+                self.assertIn("weather", e_res.json()["text"].lower())
 
 
 if __name__ == "__main__":

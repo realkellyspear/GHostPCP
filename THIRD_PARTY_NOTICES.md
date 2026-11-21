@@ -49,6 +49,15 @@ The standalone Windows release bundles (or downloads on demand) pre-trained voic
 
 ---
 
+## 3B. Offline Speech-to-Text Model (`stt_model/`)
+
+- **`UsefulSensors/moonshine-base` (`onnx-community/moonshine-base-ONNX`)** (`encoder_model_int8.onnx`, `decoder_model_int8.onnx`, `tokenizer.json`, `config.json`):
+  - **Author**: Useful Sensors (ONNX conversion by `onnx-community`)
+  - **Source**: https://huggingface.co/onnx-community/moonshine-base-ONNX
+  - **License**: **MIT License**
+
+---
+
 ## 4. Additional Runtime Libraries
 
 - **`llama.cpp` / `llama-cpp-python` (including `mtmd` multimodal vision support)**: Georgi Gerganov & contributors / Andrei Betlen (**MIT License**)

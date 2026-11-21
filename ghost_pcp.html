@@ -896,7 +896,7 @@
     <button id="attach-file-button" class="secondary" onclick="document.getElementById('chat-file-input').click()" title="Attach PDF or text files to chat or save them to your PCP database">[ + FILE ]</button>
     <button id="attach-image-button" class="secondary" onclick="document.getElementById('chat-image-input').click()" title="Attach images (or paste screenshot with Ctrl+V) for Vision models">[ + IMG ]</button>
     <button id="web-toggle-button" class="secondary web-pill" onclick="toggleWebAccess()" title="Toggle live web search and URL page reading (off by default)">WEB: OFF</button>
-    <button id="mic-button" class="secondary mic-btn" onclick="toggleVoiceDictation()" title="Speak into microphone (Web Speech API)">[ MIC ]</button>
+    <button id="mic-button" class="secondary mic-btn" onclick="toggleVoiceDictation()" title="Dictate using offline local Moonshine Speech-to-Text (0 GB VRAM)">[ MIC ]</button>
     <textarea id="user-input" rows="1" placeholder="Say something (paste URL to read when WEB is ON, or paste an image)..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
     <button id="send-button" onclick="sendMessage()">SEND</button>
 </div>
@@ -1450,6 +1450,14 @@
     let editingVolumeName = null;
     let speechRecognition = null;
     let isRecordingSpeech = false;
+    let isLocalClient = (location.hostname === "127.0.0.1" || location.hostname === "localhost");
+    let micMode = null;
+    let micTranscribing = false;
+    let remoteAudioCtx = null;
+    let remoteMicStream = null;
+    let remoteMicProcessor = null;
+    let remotePcmChunks = [];
+    let remoteSampleRate = 16000;
 
     function extractPlainText(content) {
         if (typeof content === "string") return content;
@@ -1510,21 +1518,222 @@
         } catch (e) {}
     }
 
-    function toggleVoiceDictation() {
+    function setMicButtonState(label, recording = false, disabled = false) {
         const btn = document.getElementById("mic-button");
+        if (!btn) return;
+        btn.innerText = label;
+        btn.disabled = Boolean(disabled);
+        btn.classList.toggle("recording", Boolean(recording));
+    }
+
+    function restoreOnlineStatusBadge() {
+        if (currentModel) {
+            setStatus(`ONLINE: ${currentModel}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
+        } else {
+            setStatus("NO MODEL MOUNTED", "#888");
+        }
+    }
+
+    function appendDictatedText(text) {
+        const clean = String(text || "").trim();
         const input = document.getElementById("user-input");
-        const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRec) {
-            alert("Browser Speech Recognition requires Chrome, Edge, or Safari (and HTTPS or localhost).");
+        if (!input || !clean) return;
+        const existing = input.value;
+        if (existing && !/\s$/.test(existing)) {
+            input.value = `${existing} ${clean}`;
+        } else {
+            input.value = `${existing}${clean}`;
+        }
+        input.focus();
+    }
+
+    function encodeWavBlobFromChunks(chunks, srcRate) {
+        const total = chunks.reduce((acc, c) => acc + c.length, 0);
+        const merged = new Float32Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+        }
+        const targetRate = 16000;
+        let samples = merged;
+        if (srcRate && srcRate !== targetRate && total > 0) {
+            const ratio = srcRate / targetRate;
+            const outLen = Math.max(1, Math.floor(total / ratio));
+            samples = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+                const idx = i * ratio;
+                const lo = Math.floor(idx);
+                const hi = Math.min(total - 1, lo + 1);
+                const frac = idx - lo;
+                samples[i] = merged[lo] * (1 - frac) + merged[hi] * frac;
+            }
+        }
+        const buf = new ArrayBuffer(44 + samples.length * 2);
+        const view = new DataView(buf);
+        const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+        writeStr(0, "RIFF");
+        view.setUint32(4, 36 + samples.length * 2, true);
+        writeStr(8, "WAVE");
+        writeStr(12, "fmt ");
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, targetRate, true);
+        view.setUint32(28, targetRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeStr(36, "data");
+        view.setUint32(40, samples.length * 2, true);
+        let byteOff = 44;
+        for (let i = 0; i < samples.length; i++) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            view.setInt16(byteOff, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            byteOff += 2;
+        }
+        return new Blob([buf], { type: "audio/wav" });
+    }
+
+    function cleanupRemoteRecorder() {
+        try { if (remoteMicProcessor) remoteMicProcessor.disconnect(); } catch (e) {}
+        try { if (remoteMicStream) remoteMicStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+        try { if (remoteAudioCtx) remoteAudioCtx.close(); } catch (e) {}
+        remoteMicProcessor = null;
+        remoteMicStream = null;
+        remoteAudioCtx = null;
+    }
+
+    async function toggleVoiceDictation() {
+        if (micTranscribing) return;
+        const input = document.getElementById("user-input");
+
+        // 1. Stop currently active dictation session cleanly
+        if (micMode === "host") {
+            micTranscribing = true;
+            setMicButtonState("TRANSCRIBING...", false, true);
+            setStatus("TRANSCRIBING SPEECH (LOCAL)...", "var(--warn)");
+            try {
+                const res = await api("/audio/record/stop", { method: "POST" });
+                appendDictatedText(res.text);
+                if (!res.text) {
+                    setStatus("NO SPEECH DETECTED IN CLIP", "var(--warn)");
+                    setTimeout(restoreOnlineStatusBadge, 1800);
+                } else {
+                    restoreOnlineStatusBadge();
+                }
+            } catch (e) {
+                restoreOnlineStatusBadge();
+                alert(`Speech transcription failed: ${e.message}`);
+            } finally {
+                micMode = null;
+                micTranscribing = false;
+                setMicButtonState("[ MIC ]", false, false);
+            }
             return;
         }
-        if (isRecordingSpeech && speechRecognition) {
-            try { speechRecognition.stop(); } catch (e) {}
-            isRecordingSpeech = false;
-            if (btn) {
-                btn.classList.remove("recording");
-                btn.innerText = "[ MIC ]";
+
+        if (micMode === "remote_wav") {
+            const chunks = remotePcmChunks.slice();
+            const sr = remoteSampleRate;
+            remotePcmChunks = [];
+            cleanupRemoteRecorder();
+            micMode = null;
+            micTranscribing = true;
+            setMicButtonState("TRANSCRIBING...", false, true);
+            setStatus("TRANSCRIBING SPEECH...", "var(--warn)");
+            try {
+                const wavBlob = encodeWavBlobFromChunks(chunks, sr);
+                const fd = new FormData();
+                fd.append("file", wavBlob, "speech.wav");
+                const res = await api("/audio/transcribe", { method: "POST", body: fd });
+                appendDictatedText(res.text);
+                if (!res.text) {
+                    setStatus("NO SPEECH DETECTED IN CLIP", "var(--warn)");
+                    setTimeout(restoreOnlineStatusBadge, 1800);
+                } else {
+                    restoreOnlineStatusBadge();
+                }
+            } catch (e) {
+                restoreOnlineStatusBadge();
+                alert(`Speech transcription failed: ${e.message}`);
+            } finally {
+                micTranscribing = false;
+                setMicButtonState("[ MIC ]", false, false);
             }
+            return;
+        }
+
+        if (micMode === "speech_rec" && speechRecognition) {
+            try { speechRecognition.stop(); } catch (e) {}
+            micMode = null;
+            isRecordingSpeech = false;
+            setMicButtonState("[ MIC ]", false, false);
+            restoreOnlineStatusBadge();
+            return;
+        }
+
+        // 2. Start recording: Desktop host (sounddevice + local Moonshine ONNX) takes priority locally
+        if (isLocalClient) {
+            try {
+                const started = await api("/audio/record/start", { method: "POST" });
+                micMode = "host";
+                setMicButtonState("STOP MIC", true, false);
+                setStatus(`LISTENING (${started.device || "PC MIC"})...`, "var(--danger)");
+                return;
+            } catch (hostErr) {
+                // Fall through cleanly to browser capture if host mic unavailable
+                console.warn("Host mic fallback:", hostErr);
+            }
+        }
+
+        // 3. Remote device or browser fallback: local AudioContext PCM WAV upload -> local Moonshine ONNX
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                const ctx = new AudioCtx();
+                const source = ctx.createMediaStreamSource(stream);
+                const proc = ctx.createScriptProcessor(4096, 1, 1);
+                remotePcmChunks = [];
+                remoteSampleRate = ctx.sampleRate || 16000;
+                proc.onaudioprocess = (ev) => {
+                    if (micMode === "remote_wav") {
+                        remotePcmChunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+                    }
+                };
+                source.connect(proc);
+                proc.connect(ctx.destination);
+                remoteMicStream = stream;
+                remoteAudioCtx = ctx;
+                remoteMicProcessor = proc;
+                micMode = "remote_wav";
+                setMicButtonState("STOP MIC", true, false);
+                setStatus("LISTENING (BROWSER MIC)...", "var(--danger)");
+                return;
+            } catch (browserErr) {
+                cleanupRemoteRecorder();
+                const msg = browserErr?.message || String(browserErr || "Microphone permission denied");
+                if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
+                    alert(
+                        `Could not access microphone (${msg}).\n\n` +
+                        (isLocalClient
+                            ? "Check that your Windows microphone is plugged in and enabled in Windows Privacy Settings."
+                            : "Phone browsers require an HTTPS connection for mic access—use the Cloudflare Tunnel URL in [ PHONE / TUNNEL ].")
+                    );
+                    return;
+                }
+            }
+        }
+
+        // 4. Last-resort fallback: Web Speech API if browser offers it
+        const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRec) {
+            alert(
+                "Microphone could not be opened on this device.\n" +
+                (isLocalClient
+                    ? "Check Windows microphone permissions and default recording device."
+                    : "Phone browsers require HTTPS (Cloudflare Tunnel) for microphone access.")
+            );
             return;
         }
         try {
@@ -1548,27 +1757,27 @@
                     input.value = `${prefix}${finalTranscript}${interim}`.trimStart();
                 }
             };
-            speechRecognition.onerror = () => {
+            speechRecognition.onerror = (ev) => {
+                micMode = null;
                 isRecordingSpeech = false;
-                if (btn) {
-                    btn.classList.remove("recording");
-                    btn.innerText = "[ MIC ]";
+                setMicButtonState("[ MIC ]", false, false);
+                restoreOnlineStatusBadge();
+                if (ev?.error && ev.error !== "aborted") {
+                    alert(`Browser dictation error: ${ev.error}`);
                 }
             };
             speechRecognition.onend = () => {
+                micMode = null;
                 isRecordingSpeech = false;
-                if (btn) {
-                    btn.classList.remove("recording");
-                    btn.innerText = "[ MIC ]";
-                }
+                setMicButtonState("[ MIC ]", false, false);
+                restoreOnlineStatusBadge();
             };
             speechRecognition.start();
+            micMode = "speech_rec";
             isRecordingSpeech = true;
-            if (btn) {
-                btn.classList.add("recording");
-                btn.innerText = "STOP MIC";
-            }
+            setMicButtonState("STOP MIC", true, false);
         } catch (e) {
+            micMode = null;
             alert(`Could not start microphone: ${e.message}`);
         }
     }
@@ -4322,6 +4531,7 @@
             currentModel = st.resident_model || "";
             currentMmproj = st.mmproj_model || null;
             currentVisionCapable = Boolean(st.vision_capable);
+            if (typeof st.is_local_client === "boolean") isLocalClient = st.is_local_client;
             if (typeof st.web_enabled === "boolean") syncWebToggleUi(st.web_enabled);
             updateMmprojHint();
             const chosenBefore = sessionStorage.getItem("ghost_pcp_persona_chosen") === "1";

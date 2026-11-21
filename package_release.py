@@ -249,6 +249,16 @@ def stage_clean_sandbox(sandbox_dir: Path, link_sample_gguf: bool = True) -> Non
         if fpath.is_file():
             link_or_copy(fpath, sandbox_dir / "bge_model" / fname)
 
+    # Bundled Moonshine-Base int8 ONNX Speech-to-Text model (offline [MIC] dictation, 0 VRAM)
+    from ghost_pcp import _resolve_stt_model_dir
+    stt_src = _resolve_stt_model_dir()
+    for fname in ("encoder_model_int8.onnx", "decoder_model_int8.onnx", "tokenizer.json", "config.json"):
+        fpath = stt_src / fname
+        if fpath.is_file():
+            link_or_copy(fpath, sandbox_dir / "stt_model" / fname)
+    if (ROOT / "stt_model" / "README.md").is_file():
+        link_or_copy(ROOT / "stt_model" / "README.md", sandbox_dir / "stt_model" / "README.md")
+
     # Piper TTS voices (Silas & Kara) + upstream MODEL_CARD files
     link_or_copy(ROOT / "piper_models" / "README.md", sandbox_dir / "piper_models" / "README.md")
     for pattern in ("*.onnx*", "*.MODEL_CARD"):

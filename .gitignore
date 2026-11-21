@@ -21,6 +21,12 @@ piper_models/*.onnx
 piper_models/*.onnx.json
 !piper_models/README.md
 
+# Local Moonshine STT ONNX files (keep the folder and its README for GitHub)
+stt_model/*.onnx
+stt_model/tokenizer.json
+stt_model/config.json
+!stt_model/README.md
+
 # Private PCP archive volumes, embeddings, exports, and runtime settings
 pcp_data/
 .local/

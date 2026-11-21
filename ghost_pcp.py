@@ -263,6 +263,7 @@ MODEL_DIR = APP_DIR / "ghost_models"
 PIPER_MODEL_DIR = APP_DIR / "piper_models"
 PCP_DATA_DIR = APP_DIR / "pcp_data"
 BUNDLED_BGE_DIR = (APP_DIR / "bge_model") if (APP_DIR / "bge_model").is_dir() else (RESOURCE_DIR / "bge_model")
+BUNDLED_STT_DIR = (APP_DIR / "stt_model") if (APP_DIR / "stt_model").is_dir() else (RESOURCE_DIR / "stt_model")
 SETTINGS_PATH = APP_DIR / "ghost_pcp_settings.json"
 PAIRING_TOKEN_PATH = PCP_DATA_DIR / ".pairing_token"
 HTML_PATH = (APP_DIR / "ghost_pcp.html") if (APP_DIR / "ghost_pcp.html").is_file() else (RESOURCE_DIR / "ghost_pcp.html")
@@ -593,6 +594,251 @@ def stop_read_aloud() -> None:
         sd.stop()
     except Exception:
         pass
+
+
+_STT_ENGINE: Optional["_MoonshineSTT"] = None
+_STT_LOCK = threading.Lock()
+_STT_REQUIRED_FILES = (
+    ("onnx/encoder_model_int8.onnx", "encoder_model_int8.onnx"),
+    ("onnx/decoder_model_int8.onnx", "decoder_model_int8.onnx"),
+    ("tokenizer.json", "tokenizer.json"),
+    ("config.json", "config.json"),
+)
+
+
+def _is_local_loopback_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    forwarded = (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-forwarded-for")
+        or request.headers.get("x-real-ip")
+    )
+    return client_host in ("127.0.0.1", "::1", "localhost") and not forwarded
+
+
+def _has_local_stt_files(base_dir: Path) -> bool:
+    return base_dir.is_dir() and all((base_dir / local_name).is_file() for _, local_name in _STT_REQUIRED_FILES)
+
+
+def _resolve_stt_model_dir() -> Path:
+    for candidate in (APP_DIR / "stt_model", RESOURCE_DIR / "stt_model"):
+        if _has_local_stt_files(candidate):
+            return candidate
+
+    target_dir = APP_DIR / "stt_model"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+        repo_id = "onnx-community/moonshine-base-ONNX"
+        log.info(f"Downloading offline Moonshine-Base ONNX speech recognition model ({repo_id})...")
+        for remote_name, local_name in _STT_REQUIRED_FILES:
+            cached = Path(hf_hub_download(repo_id=repo_id, filename=remote_name))
+            shutil.copy2(cached, target_dir / local_name)
+        return target_dir
+    except Exception as exc:
+        raise RuntimeError(
+            f"Offline speech recognition model is not present in {target_dir} and could not be downloaded: {exc}"
+        ) from exc
+
+
+class _MoonshineSTT:
+    """Pure ONNX Runtime + tokenizers offline Speech-to-Text (Moonshine-Base int8, CPU, 0 VRAM)."""
+
+    SAMPLE_RATE = 16000
+    MAX_SEGMENT_SAMPLES = 16000 * 28
+
+    def __init__(self, model_dir: Optional[Path] = None):
+        import numpy as np
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        self._np = np
+        resolved = Path(model_dir) if model_dir is not None else _resolve_stt_model_dir()
+        self.model_dir = resolved
+
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = min(8, os.cpu_count() or 4)
+        self.encoder = ort.InferenceSession(
+            str(resolved / "encoder_model_int8.onnx"),
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self.decoder = ort.InferenceSession(
+            str(resolved / "decoder_model_int8.onnx"),
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self.encoder_input_name = self.encoder.get_inputs()[0].name
+        self.tokenizer = Tokenizer.from_file(str(resolved / "tokenizer.json"))
+        cfg = json.loads((resolved / "config.json").read_text(encoding="utf-8"))
+        self.bos_id = int(cfg.get("decoder_start_token_id") or cfg.get("bos_token_id") or 1)
+        self.eos_id = int(cfg.get("eos_token_id") or 2)
+
+    def _decode_segment(self, seg_16k: Any) -> str:
+        np = self._np
+        enc_out = self.encoder.run(None, {self.encoder_input_name: seg_16k[None, :]})[0]
+        max_steps = min(192, max(16, int((len(seg_16k) / self.SAMPLE_RATE) * 6.0) + 12))
+        tokens = [self.bos_id]
+        for _ in range(max_steps):
+            logits = self.decoder.run(
+                None,
+                {
+                    "input_ids": np.array([tokens], dtype=np.int64),
+                    "encoder_hidden_states": enc_out,
+                },
+            )[0]
+            nxt = int(np.argmax(logits[0, -1, :]))
+            if nxt == self.eos_id:
+                break
+            if len(tokens) >= 4 and tokens[-3:] == [nxt, nxt, nxt]:
+                break
+            tokens.append(nxt)
+        return re.sub(r"\s+", " ", self.tokenizer.decode(tokens, skip_special_tokens=True)).strip()
+
+    def transcribe_float32(self, audio: Any, sample_rate: int = 16000) -> str:
+        np = self._np
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1).astype(np.float32)
+        arr = arr.reshape(-1)
+        if arr.size == 0:
+            return ""
+        sr = int(sample_rate or self.SAMPLE_RATE)
+        if sr != self.SAMPLE_RATE and sr > 0:
+            n_out = max(1, int(round(len(arr) * self.SAMPLE_RATE / sr)))
+            arr = np.interp(np.linspace(0, len(arr) - 1, n_out), np.arange(len(arr)), arr).astype(np.float32)
+
+        if len(arr) < int(0.12 * self.SAMPLE_RATE):
+            return ""
+        peak = float(np.max(np.abs(arr)))
+        if peak < 0.004:
+            return ""
+
+        active = np.where(np.abs(arr) >= 0.004)[0]
+        if active.size == 0:
+            return ""
+        pad = int(0.25 * self.SAMPLE_RATE)
+        start = max(0, int(active[0]) - pad)
+        end = min(len(arr), int(active[-1]) + pad + 1)
+        trimmed = np.ascontiguousarray(arr[start:end], dtype=np.float32)
+        if len(trimmed) < int(0.12 * self.SAMPLE_RATE):
+            return ""
+
+        parts: List[str] = []
+        for offset in range(0, len(trimmed), self.MAX_SEGMENT_SAMPLES):
+            chunk = trimmed[offset : offset + self.MAX_SEGMENT_SAMPLES]
+            if len(chunk) < int(0.12 * self.SAMPLE_RATE):
+                continue
+            txt = self._decode_segment(chunk)
+            if txt:
+                parts.append(txt)
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _get_stt_engine() -> _MoonshineSTT:
+    global _STT_ENGINE
+    with _STT_LOCK:
+        if _STT_ENGINE is None:
+            _STT_ENGINE = _MoonshineSTT()
+        return _STT_ENGINE
+
+
+class _HostAudioRecorder:
+    SAMPLE_RATE = 16000
+    MAX_SAMPLES = 16000 * 90
+
+    def __init__(self):
+        self._buf_lock = threading.Lock()
+        self._stream_lock = threading.Lock()
+        self._stream: Optional[Any] = None
+        self._chunks: List[Any] = []
+        self._total_samples = 0
+        self.recording = False
+        self.device_name = ""
+
+    def _stop_and_close_stream(self) -> None:
+        with self._stream_lock:
+            stream = self._stream
+            self._stream = None
+            self.recording = False
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def start(self) -> str:
+        import numpy as np
+        self._stop_and_close_stream()
+        with self._buf_lock:
+            self._chunks = []
+            self._total_samples = 0
+
+        try:
+            dev = sd.query_devices(kind="input")
+            dev_name = str((dev or {}).get("name") or "Default Microphone")
+        except Exception:
+            dev_name = "Default Microphone"
+
+        def _callback(indata, frames, time_info, status):
+            if not self.recording:
+                return
+            with self._buf_lock:
+                if not self.recording or self._total_samples >= self.MAX_SAMPLES:
+                    return
+                take = min(frames, self.MAX_SAMPLES - self._total_samples)
+                if take > 0:
+                    self._chunks.append(np.array(indata[:take, 0], dtype=np.float32, copy=True))
+                    self._total_samples += take
+
+        with self._stream_lock:
+            self.device_name = dev_name
+            self.recording = True
+            try:
+                stream = sd.InputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    channels=1,
+                    dtype="float32",
+                    callback=_callback,
+                )
+                self._stream = stream
+                stream.start()
+            except Exception as exc:
+                self.recording = False
+                bad_stream = self._stream
+                self._stream = None
+                if bad_stream is not None:
+                    try:
+                        bad_stream.close()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Could not open host microphone: {exc}") from exc
+        return dev_name
+
+    def stop_and_extract(self) -> Tuple[Any, float]:
+        import numpy as np
+        self._stop_and_close_stream()
+        with self._buf_lock:
+            chunks = list(self._chunks)
+            self._chunks = []
+            self._total_samples = 0
+        if not chunks:
+            return np.zeros((0,), dtype=np.float32), 0.0
+        samples = np.concatenate(chunks).astype(np.float32)
+        return samples, round(len(samples) / self.SAMPLE_RATE, 2)
+
+    def cancel(self) -> None:
+        self._stop_and_close_stream()
+        with self._buf_lock:
+            self._chunks = []
+            self._total_samples = 0
+
+
+_AUDIO_REC = _HostAudioRecorder()
 
 
 def _init_pairing_token() -> str:
@@ -2914,11 +3160,16 @@ def reset_endpoint():
 
 
 @app.get("/v1/status", dependencies=[Depends(verify_access)])
-def status():
+def status(request: Request):
     pcp_ready = bool(PCP_INDEX and PCP_INDEX.ready)
     active_persona = _get_active_persona()
     settings = load_settings()
     web_enabled = bool(settings.get("web_enabled", False))
+    stt_ready = bool(
+        _STT_ENGINE is not None
+        or _has_local_stt_files(APP_DIR / "stt_model")
+        or _has_local_stt_files(RESOURCE_DIR / "stt_model")
+    )
     return {
         "engine": "GHostPCP",
         "backend": BACKEND_NAME,
@@ -2941,6 +3192,9 @@ def status():
         "ingesting": INGEST_STATE.running,
         "downloading_model": MODEL_DOWNLOAD_STATE.running,
         "web_enabled": web_enabled,
+        "stt_ready": stt_ready,
+        "recording_mic": _AUDIO_REC.recording,
+        "is_local_client": _is_local_loopback_request(request),
         "active_persona": (
             {"id": active_persona["id"], "name": active_persona["name"], "user_name": active_persona.get("user_name", "")}
             if active_persona
@@ -3730,13 +3984,7 @@ def tts_voices_endpoint():
 
 @app.post("/v1/tts", dependencies=[Depends(verify_access)])
 def tts_endpoint(req: TTSRequest, request: Request):
-    client_host = request.client.host if request.client else ""
-    forwarded = (
-        request.headers.get("cf-connecting-ip")
-        or request.headers.get("x-forwarded-for")
-        or request.headers.get("x-real-ip")
-    )
-    is_local_loopback = client_host in ("127.0.0.1", "::1", "localhost") and not forwarded
+    is_local_loopback = _is_local_loopback_request(request)
     play_locally = req.play_on_host if req.play_on_host is not None else is_local_loopback
 
     try:
@@ -3765,44 +4013,86 @@ def tts_stop_endpoint():
     return {"status": "stopped"}
 
 
+@app.post("/v1/audio/record/start", dependencies=[Depends(verify_access)])
+def audio_record_start_endpoint(request: Request):
+    if not _is_local_loopback_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Host microphone recording is restricted to local desktop sessions.",
+        )
+    try:
+        device_name = _AUDIO_REC.start()
+        return {"status": "recording", "device": device_name}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/v1/audio/record/stop", dependencies=[Depends(verify_access)])
+def audio_record_stop_endpoint(request: Request):
+    if not _is_local_loopback_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Host microphone recording is restricted to local desktop sessions.",
+        )
+    samples, duration_sec = _AUDIO_REC.stop_and_extract()
+    if duration_sec <= 0.05:
+        return {"text": "", "duration_sec": duration_sec, "engine": "moonshine-base-onnx"}
+    try:
+        text = _get_stt_engine().transcribe_float32(samples, sample_rate=_AUDIO_REC.SAMPLE_RATE)
+        return {"text": text, "duration_sec": duration_sec, "engine": "moonshine-base-onnx"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Speech transcription failed: {exc}") from exc
+
+
+@app.post("/v1/audio/record/cancel", dependencies=[Depends(verify_access)])
+def audio_record_cancel_endpoint(request: Request):
+    if not _is_local_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Host microphone recording is restricted to local desktop sessions.")
+    _AUDIO_REC.cancel()
+    return {"status": "cancelled"}
+
+
 @app.post("/v1/audio/transcribe", dependencies=[Depends(verify_access)])
 async def audio_transcribe_endpoint(file: UploadFile = File(...)):
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "Optional offline Whisper backend ('faster-whisper') is not installed. "
-                "Use the built-in browser microphone button or install faster-whisper."
-            ),
-        ) from exc
-
     raw_bytes = await file.read()
     if not raw_bytes or len(raw_bytes) > 25 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Audio clip is empty or exceeds 25 MB limit.")
 
-    suffix = Path(file.filename or "audio.webm").suffix or ".webm"
-    if suffix.lower() not in (".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac"):
-        suffix = ".webm"
-    tmp_path = None
+    # Decode standard PCM/WAV/FLAC/OGG directly in memory using built-in soundfile + Moonshine ONNX
     try:
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-            tf.write(raw_bytes)
-            tmp_path = tf.name
-        model = WhisperModel("base.en", device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(tmp_path)
-        transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
-        return {"text": transcript}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}") from exc
-    finally:
-        if tmp_path:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+        samples, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
+        text = _get_stt_engine().transcribe_float32(samples, sample_rate=int(sr))
+        return {"text": text, "engine": "moonshine-base-onnx"}
+    except Exception as sf_exc:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not decode audio upload as WAV/OGG/FLAC ({sf_exc}). Upload WAV or use [ MIC ].",
+            ) from exc
+
+        suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+        if suffix.lower() not in (".webm", ".wav", ".mp3", ".m4a", ".ogg", ".flac"):
+            suffix = ".webm"
+        tmp_path = None
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+                tf.write(raw_bytes)
+                tmp_path = tf.name
+            model = WhisperModel("base.en", device="cpu", compute_type="int8")
+            segments, _ = model.transcribe(tmp_path)
+            transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+            return {"text": transcript, "engine": "faster-whisper"}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}") from exc
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 # =====================================================================
@@ -4692,7 +4982,8 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
-    log.info("Shutdown signal received. Stopping tunnel and flushing VRAM ...")
+    log.info("Shutdown signal received. Stopping tunnel, microphone, and flushing VRAM ...")
+    _AUDIO_REC.cancel()
     stop_cloudflare_tunnel()
     unload_current_model()
     log.info("GHostPCP terminated cleanly.")
