@@ -21,7 +21,7 @@ Standard "chat with your docs" tools act like research librarians (*"According t
 2. **True Continuity & Second-Brain Memory Tools (`[ MEMORIES ]`)**: Save structured **Core Facts & People** with relationship aliases (e.g. linking *"Jordan"* to *"my brother"*) so indirect questions still recall accurately, capture evolving session **Continuity Notes** automatically on **SAVE & CLEAR**, bookmark and reload named conversation **Threads**, search or view/edit/delete individual `ghost_pcp_*.md` volumes (with automatic backups), and export or restore any persona as a single **`.zip` backup bundle**.
 3. **Local Vision (`[ + IMG ]` + `mmproj`) & In-App Model Downloader**: Attach or paste (`Ctrl+V`) images for vision-capable GGUF models paired with an `mmproj` projector via `llama.cpp` MTMD. Don't have a model yet? Open **[ CONFIG ] → Get More GGUF Models** to download curated starter models or inspect and pull `.gguf` files from any public HuggingFace repository straight into `./ghost_models`, complete with NVIDIA VRAM preflight sizing, FP16/Q8_0 KV cache selection, and live `tok/s` telemetry.
 4. **Opt-In Live Web Search & URL Reader (`WEB: OFF / ON`)**: Strictly **OFF by default** for 100% offline privacy. Flip **`WEB: ON`** in the chat bar to let your AI read pasted `http(s)://` links or perform fast DuckDuckGo/Wikipedia (no API key needed), self-hosted SearXNG, Brave, or Tavily lookups with clickable source chips below replies and SSRF protection against local network URLs.
-5. **Two-Way Local Voice (`[ MIC ]` & Piper TTS) + Phone Tunnel Anywhere**: Dictate offline with **`[ MIC ]`** powered by bundled **Moonshine Base ONNX** (`0 GB` GPU VRAM — works natively inside the desktop app via `sounddevice` and from paired HTTPS phone browsers) and click the speaker button on replies for instant local **Piper ONNX** speech synthesis (`Silas`, `Kara`, or any `.onnx` + `.onnx.json` voice in `piper_models/`). Open **[ PHONE / TUNNEL ]** to scan a QR code for encrypted mobile access via local Wi-Fi, Tailscale, or a one-click Cloudflare Quick Tunnel.
+5. **Two-Way Local Voice (`[ MIC ]` & Piper TTS) + Phone Tunnel Anywhere**: Dictate offline with **`[ MIC ]`** powered by bundled **Whisper-Base.en ONNX** (`0 GB` GPU VRAM — handles full multi-sentence paragraphs, natural pauses, and noisy desktop mics cleanly inside the desktop app via `sounddevice` and from paired HTTPS phone browsers) and click the speaker button on replies for instant local **Piper ONNX** speech synthesis (`Silas`, `Kara`, or any `.onnx` + `.onnx.json` voice in `piper_models/`). Open **[ PHONE / TUNNEL ]** to scan a QR code for encrypted mobile access via local Wi-Fi, Tailscale, or a one-click Cloudflare Quick Tunnel.
 
 ## See It in Action
 
@@ -54,7 +54,7 @@ GHostPCP.exe                 Standalone desktop application (built locally)
   ghost_models/                Place your local .gguf models here
     README.md
   piper_models/                Place local Piper TTS voice models here
-  stt_model/                   Bundled offline Moonshine-Base int8 ONNX STT model (0 VRAM)
+  stt_model/                   Bundled offline Whisper-Base.en int8 ONNX STT model (0 VRAM)
   pcp_data/                    Generated ghost_pcp_01.md..N volumes & embeddings.npz (git-ignored)
   assets/                      GHost circle logo and icons
 ```

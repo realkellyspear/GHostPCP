@@ -1891,18 +1891,22 @@ class GHostPCPTests(unittest.TestCase):
             self.assertEqual(dl_stat.status_code, 200)
             self.assertIn("running", dl_stat.json())
 
-    def test_offline_moonshine_stt_and_host_mic_routes(self):
+    def test_offline_whisper_stt_and_host_mic_routes(self):
         import soundfile as sf
         from piper import PiperVoice
         import ghost_pcp
 
         voice = PiperVoice.load(
-            str(ROOT / "piper_models" / "silas.onnx"),
-            str(ROOT / "piper_models" / "silas.onnx.json"),
+            str(ROOT / "piper_models" / "kara.onnx"),
+            str(ROOT / "piper_models" / "kara.onnx.json"),
+        )
+        long_prompt = (
+            "I made this app and it is called Ghost PCP. "
+            "Check the weather station before midnight and keep every word intact across long pauses."
         )
         pcm_int16 = np.concatenate([
             np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
-            for chunk in voice.synthesize("Check the weather station before midnight and open web search.")
+            for chunk in voice.synthesize(long_prompt)
         ])
         wav_buf = io.BytesIO()
         sf.write(wav_buf, pcm_int16, voice.config.sample_rate, format="WAV", subtype="PCM_16")
@@ -1922,17 +1926,24 @@ class GHostPCPTests(unittest.TestCase):
             remote_start = client.post("/v1/audio/record/start")
             self.assertEqual(remote_start.status_code, 403)
 
-            # Transcribe WAV upload offline via Moonshine-Base ONNX
+            # Transcribe WAV upload offline via Whisper-Base.en ONNX
             tr_res = client.post(
                 "/v1/audio/transcribe",
                 files={"file": ("speech.wav", wav_bytes, "audio/wav")},
             )
             self.assertEqual(tr_res.status_code, 200)
+            self.assertEqual(tr_res.json()["engine"], "whisper-base.en-onnx")
             heard = tr_res.json()["text"].lower()
             self.assertIn("weather", heard)
             self.assertIn("midnight", heard)
+            self.assertIn("pauses", heard)
 
-            # Local host loopback recording flow using mocked sounddevice.InputStream at native 48kHz
+            # Pure ambient room hum must return empty string (never Whisper hallucinated text)
+            rng = np.random.default_rng(123)
+            room_hum = rng.normal(0.0, 0.002, 44100 * 2).astype(np.float32)
+            self.assertEqual(ghost_pcp._get_stt_engine().transcribe_float32(room_hum, sample_rate=44100), "")
+
+            # Local host loopback recording flow: 48kHz quiet speech + 1.2s mid-sentence pause + 25Hz rumble
             class FakeStream:
                 def __init__(self, **kwargs):
                     self.cb = kwargs.get("callback")
@@ -1946,10 +1957,14 @@ class GHostPCPTests(unittest.TestCase):
                         np.arange(len(audio_f32)),
                         audio_f32,
                     ).astype(np.float32)
-                    # Simulate quiet USB mic (0.04x gain + slight DC bias) to verify normalization
-                    quiet = (resampled * 0.04 + 0.015).astype(np.float32)
+                    mid = len(resampled) // 2
+                    pause = np.zeros(int(self.sr * 1.2), dtype=np.float32)
+                    with_pause = np.concatenate([resampled[:mid], pause, resampled[mid:]])
+                    t = np.arange(len(with_pause), dtype=np.float32) / float(self.sr)
+                    # Quiet speech (0.04x) + tabletop 25Hz rumble + subtle DC offset
+                    dirty = (with_pause * 0.04 + 0.12 * np.sin(2 * np.pi * 25.0 * t) + 0.015).astype(np.float32)
                     if self.cb:
-                        self.cb(quiet[:, None], len(quiet), None, None)
+                        self.cb(dirty[:, None], len(dirty), None, None)
 
                 def stop(self):
                     pass
@@ -1979,7 +1994,11 @@ class GHostPCPTests(unittest.TestCase):
                 e_res = client.post("/v1/audio/record/stop")
                 self.assertEqual(e_res.status_code, 200)
                 self.assertEqual(e_res.json()["sample_rate"], 48000)
-                self.assertIn("weather", e_res.json()["text"].lower())
+                self.assertEqual(e_res.json()["engine"], "whisper-base.en-onnx")
+                stop_heard = e_res.json()["text"].lower()
+                self.assertIn("ghost pcp", stop_heard)
+                self.assertIn("weather", stop_heard)
+                self.assertIn("pauses", stop_heard)
 
     def test_smart_web_veto_and_tts_error_resilience(self):
         import ghost_pcp

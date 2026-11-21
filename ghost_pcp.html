@@ -896,7 +896,7 @@
     <button id="attach-file-button" class="secondary" onclick="document.getElementById('chat-file-input').click()" title="Attach PDF or text files to chat or save them to your PCP database">[ + FILE ]</button>
     <button id="attach-image-button" class="secondary" onclick="document.getElementById('chat-image-input').click()" title="Attach images (or paste screenshot with Ctrl+V) for Vision models">[ + IMG ]</button>
     <button id="web-toggle-button" class="secondary web-pill" onclick="toggleWebAccess()" title="Toggle live web search and URL page reading (off by default)">WEB: OFF</button>
-    <button id="mic-button" class="secondary mic-btn" onclick="toggleVoiceDictation()" title="Dictate using offline local Moonshine Speech-to-Text (0 GB VRAM)">[ MIC ]</button>
+    <button id="mic-button" class="secondary mic-btn" onclick="toggleVoiceDictation()" title="Dictate using offline local Whisper-Base.en Speech-to-Text (0 GB VRAM)">[ MIC ]</button>
     <textarea id="user-input" rows="1" placeholder="Say something (paste URL to read when WEB is ON, or paste an image)..." onkeydown="if(event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }"></textarea>
     <button id="send-button" onclick="sendMessage()">SEND</button>
 </div>
@@ -1076,7 +1076,7 @@
                     </select>
                     <button type="button" class="secondary" onclick="testSelectedMic()" style="white-space: nowrap;">TEST MIC</button>
                 </div>
-                <small id="mic-test-result">Offline Moonshine-Base ONNX speech recognition (0 GB VRAM).</small>
+                <small id="mic-test-result">Offline Whisper-Base.en ONNX speech recognition (0 GB VRAM).</small>
             </div>
         </div>
 
@@ -1685,7 +1685,7 @@
             return;
         }
 
-        // 2. Start recording: Desktop host (sounddevice + local Moonshine ONNX) takes priority locally
+        // 2. Start recording: Desktop host (sounddevice + local Whisper-Base.en ONNX) takes priority locally
         let hostMicError = "";
         if (isLocalClient) {
             try {
@@ -1700,7 +1700,7 @@
             }
         }
 
-        // 3. Remote device or browser fallback: local AudioContext PCM WAV upload -> local Moonshine ONNX
+        // 3. Remote device or browser fallback: local AudioContext PCM WAV upload -> local Whisper-Base.en ONNX
         if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });

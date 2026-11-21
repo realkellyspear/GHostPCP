@@ -25,6 +25,7 @@ piper_models/*.onnx.json
 stt_model/*.onnx
 stt_model/tokenizer.json
 stt_model/config.json
+stt_model/generation_config.json
 !stt_model/README.md
 
 # Private PCP archive volumes, embeddings, exports, and runtime settings

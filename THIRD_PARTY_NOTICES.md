@@ -51,9 +51,9 @@ The standalone Windows release bundles (or downloads on demand) pre-trained voic
 
 ## 3B. Offline Speech-to-Text Model (`stt_model/`)
 
-- **`UsefulSensors/moonshine-base` (`onnx-community/moonshine-base-ONNX`)** (`encoder_model_int8.onnx`, `decoder_model_int8.onnx`, `tokenizer.json`, `config.json`):
-  - **Author**: Useful Sensors (ONNX conversion by `onnx-community`)
-  - **Source**: https://huggingface.co/onnx-community/moonshine-base-ONNX
+- **`openai/whisper-base.en` (`onnx-community/whisper-base.en`)** (`encoder_model_int8.onnx`, `decoder_model_merged_int8.onnx`, `tokenizer.json`, `config.json`, `generation_config.json`):
+  - **Author**: OpenAI (ONNX conversion by `onnx-community`)
+  - **Source**: https://huggingface.co/onnx-community/whisper-base.en
   - **License**: **MIT License**
 
 ---

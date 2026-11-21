@@ -640,13 +640,14 @@ def stop_read_aloud() -> None:
         pass
 
 
-_STT_ENGINE: Optional["_MoonshineSTT"] = None
+_STT_ENGINE: Optional["_WhisperSTT"] = None
 _STT_LOCK = threading.Lock()
 _STT_REQUIRED_FILES = (
     ("onnx/encoder_model_int8.onnx", "encoder_model_int8.onnx"),
-    ("onnx/decoder_model_int8.onnx", "decoder_model_int8.onnx"),
+    ("onnx/decoder_model_merged_int8.onnx", "decoder_model_merged_int8.onnx"),
     ("tokenizer.json", "tokenizer.json"),
     ("config.json", "config.json"),
+    ("generation_config.json", "generation_config.json"),
 )
 
 
@@ -673,8 +674,8 @@ def _resolve_stt_model_dir() -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
         from huggingface_hub import hf_hub_download
-        repo_id = "onnx-community/moonshine-base-ONNX"
-        log.info(f"Downloading offline Moonshine-Base ONNX speech recognition model ({repo_id})...")
+        repo_id = "onnx-community/whisper-base.en"
+        log.info(f"Downloading offline Whisper-Base.en ONNX speech recognition model ({repo_id})...")
         for remote_name, local_name in _STT_REQUIRED_FILES:
             cached = Path(hf_hub_download(repo_id=repo_id, filename=remote_name))
             shutil.copy2(cached, target_dir / local_name)
@@ -685,11 +686,11 @@ def _resolve_stt_model_dir() -> Path:
         ) from exc
 
 
-class _MoonshineSTT:
-    """Pure ONNX Runtime + tokenizers offline Speech-to-Text (Moonshine-Base int8, CPU, 0 VRAM)."""
+class _WhisperSTT:
+    """Pure ONNX Runtime + tokenizers offline Speech-to-Text (Whisper-Base.en int8 with KV cache, CPU, 0 VRAM)."""
 
     SAMPLE_RATE = 16000
-    MAX_SEGMENT_SAMPLES = 16000 * 28
+    CHUNK_SAMPLES = 16000 * 30  # 30s Whisper encoder window
 
     def __init__(self, model_dir: Optional[Path] = None):
         import numpy as np
@@ -708,91 +709,234 @@ class _MoonshineSTT:
             providers=["CPUExecutionProvider"],
         )
         self.decoder = ort.InferenceSession(
-            str(resolved / "decoder_model_int8.onnx"),
+            str(resolved / "decoder_model_merged_int8.onnx"),
             sess_options=opts,
             providers=["CPUExecutionProvider"],
         )
-        self.encoder_input_name = self.encoder.get_inputs()[0].name
+        self._enc_input_name = self.encoder.get_inputs()[0].name
+        self._dec_out_names = [o.name for o in self.decoder.get_outputs()]
         self.tokenizer = Tokenizer.from_file(str(resolved / "tokenizer.json"))
-        cfg = json.loads((resolved / "config.json").read_text(encoding="utf-8"))
-        self.bos_id = int(cfg.get("decoder_start_token_id") or cfg.get("bos_token_id") or 1)
-        self.eos_id = int(cfg.get("eos_token_id") or 2)
 
-    def _decode_segment(self, seg_16k: Any) -> str:
+        cfg = json.loads((resolved / "config.json").read_text(encoding="utf-8"))
+        gen_cfg = json.loads((resolved / "generation_config.json").read_text(encoding="utf-8"))
+        self.n_mels = int(cfg.get("num_mel_bins") or 80)
+        self.n_layers = int(cfg.get("decoder_layers") or cfg.get("num_hidden_layers") or 6)
+        self.n_heads = int(cfg.get("decoder_attention_heads") or 8)
+        d_model = int(cfg.get("d_model") or 512)
+        self.head_dim = max(1, d_model // self.n_heads)
+        self.max_steps = min(224, max(64, int(cfg.get("max_target_positions") or 448) - 8))
+
+        self.start_id = int(gen_cfg.get("decoder_start_token_id") or cfg.get("decoder_start_token_id") or 50257)
+        self.eos_id = int(gen_cfg.get("eos_token_id") or cfg.get("eos_token_id") or 50256)
+        self.no_ts_id = int(gen_cfg.get("no_timestamps_token_id") or 50362)
+        self.init_ids = [self.start_id, self.no_ts_id]
+
+        suppress = [int(t) for t in (gen_cfg.get("suppress_tokens") or [])]
+        begin_suppress = [int(t) for t in (gen_cfg.get("begin_suppress_tokens") or [])]
+        self.suppress_ids = np.array(suppress, dtype=np.int64) if suppress else np.zeros((0,), dtype=np.int64)
+        self.begin_suppress_ids = np.array(begin_suppress, dtype=np.int64) if begin_suppress else np.zeros((0,), dtype=np.int64)
+
+        self._mel_filters = self._build_mel_filters(self.SAMPLE_RATE, 400, self.n_mels)
+        self._hann = np.hanning(401)[:-1].astype(np.float32)
+
+    def _build_mel_filters(self, sr: int, n_fft: int, n_mels: int) -> Any:
         np = self._np
-        enc_out = self.encoder.run(None, {self.encoder_input_name: seg_16k[None, :]})[0]
-        max_steps = min(192, max(16, int((len(seg_16k) / self.SAMPLE_RATE) * 6.0) + 12))
-        tokens = [self.bos_id]
-        for _ in range(max_steps):
-            logits = self.decoder.run(
+
+        def _hz_to_mel(freq: Any) -> Any:
+            f_min, f_sp = 0.0, 200.0 / 3.0
+            min_log_hz, min_log_mel = 1000.0, (1000.0 - f_min) / f_sp
+            logstep = np.log(6.4) / 27.0
+            if np.ndim(freq) == 0:
+                return min_log_mel + np.log(freq / min_log_hz) / logstep if freq >= min_log_hz else (freq - f_min) / f_sp
+            out = (freq - f_min) / f_sp
+            mask = freq >= min_log_hz
+            out[mask] = min_log_mel + np.log(freq[mask] / min_log_hz) / logstep
+            return out
+
+        def _mel_to_hz(mel: Any) -> Any:
+            f_min, f_sp = 0.0, 200.0 / 3.0
+            min_log_hz, min_log_mel = 1000.0, (1000.0 - f_min) / f_sp
+            logstep = np.log(6.4) / 27.0
+            out = f_min + f_sp * mel
+            mask = mel >= min_log_mel
+            out[mask] = min_log_hz * np.exp(logstep * (mel[mask] - min_log_mel))
+            return out
+
+        fft_freqs = np.linspace(0.0, sr / 2.0, n_fft // 2 + 1)
+        mels = np.linspace(_hz_to_mel(0.0), _hz_to_mel(8000.0), n_mels + 2)
+        f_pts = _mel_to_hz(mels)
+        slopes = f_pts[None, :] - fft_freqs[:, None]
+        down = -slopes[:, :-2] / (f_pts[1:-1] - f_pts[:-2])[None, :]
+        up = slopes[:, 2:] / (f_pts[2:] - f_pts[1:-1])[None, :]
+        fb = np.maximum(0.0, np.minimum(down, up))
+        enorm = 2.0 / (f_pts[2 : n_mels + 2] - f_pts[:n_mels])
+        fb *= enorm[None, :]
+        return fb.T.astype(np.float32)
+
+    def _compute_log_mel(self, audio_16k: Any) -> Any:
+        np = self._np
+        padded = np.zeros(self.CHUNK_SAMPLES, dtype=np.float32)
+        take = min(len(audio_16k), self.CHUNK_SAMPLES)
+        padded[:take] = audio_16k[:take]
+        x = np.pad(padded, (200, 200), mode="reflect")
+        n_frames = 3000
+        strides = (x.strides[0] * 160, x.strides[0])
+        frames = np.lib.stride_tricks.as_strided(x, shape=(n_frames, 400), strides=strides)
+        mag = np.abs(np.fft.rfft(frames * self._hann[None, :], n=400, axis=1)) ** 2
+        mel = self._mel_filters @ mag.T
+        log_spec = np.log10(np.maximum(mel, 1e-10))
+        log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return np.ascontiguousarray(log_spec[None, :, :], dtype=np.float32)
+
+    def _decode_window(self, window_16k: Any) -> str:
+        np = self._np
+        feats = self._compute_log_mel(window_16k)
+        enc_hidden = self.encoder.run(None, {self._enc_input_name: feats})[0]
+
+        empty_kv = np.zeros((1, self.n_heads, 0, self.head_dim), dtype=np.float32)
+        past: Dict[str, Any] = {}
+        for idx in range(self.n_layers):
+            past[f"past_key_values.{idx}.decoder.key"] = empty_kv
+            past[f"past_key_values.{idx}.decoder.value"] = empty_kv
+            past[f"past_key_values.{idx}.encoder.key"] = empty_kv
+            past[f"past_key_values.{idx}.encoder.value"] = empty_kv
+
+        cur_ids = np.array([self.init_ids], dtype=np.int64)
+        use_cache = np.array([False], dtype=bool)
+        tokens: List[int] = []
+        for step in range(self.max_steps):
+            outs = self.decoder.run(
                 None,
                 {
-                    "input_ids": np.array([tokens], dtype=np.int64),
-                    "encoder_hidden_states": enc_out,
+                    "input_ids": cur_ids,
+                    "encoder_hidden_states": enc_hidden,
+                    "use_cache_branch": use_cache,
+                    **past,
                 },
-            )[0]
-            nxt = int(np.argmax(logits[0, -1, :]))
+            )
+            logits = outs[0][0, -1, :].copy()
+            if self.suppress_ids.size > 0:
+                logits[self.suppress_ids] = -np.inf
+            if step == 0 and self.begin_suppress_ids.size > 0:
+                logits[self.begin_suppress_ids] = -np.inf
+            nxt = int(np.argmax(logits))
             if nxt == self.eos_id:
                 break
-            if len(tokens) >= 4 and tokens[-3:] == [nxt, nxt, nxt]:
+            if len(tokens) >= 4 and tokens[-4:] == [nxt, nxt, nxt, nxt]:
                 break
             tokens.append(nxt)
+
+            for out_idx, out_name in enumerate(self._dec_out_names[1:], start=1):
+                past_name = out_name.replace("present.", "past_key_values.", 1)
+                if step == 0 or ".decoder." in out_name:
+                    past[past_name] = outs[out_idx]
+            cur_ids = np.array([[nxt]], dtype=np.int64)
+            use_cache = np.array([True], dtype=bool)
+
         return re.sub(r"\s+", " ", self.tokenizer.decode(tokens, skip_special_tokens=True)).strip()
 
-    def transcribe_float32(self, audio: Any, sample_rate: int = 16000) -> str:
+    def _preprocess_audio(self, audio: Any, sample_rate: int) -> Any:
         np = self._np
         arr = np.asarray(audio, dtype=np.float32)
         if arr.ndim > 1:
             arr = arr.mean(axis=1).astype(np.float32)
         arr = arr.reshape(-1)
         if arr.size == 0:
-            return ""
-        sr = int(sample_rate or self.SAMPLE_RATE)
-        if sr != self.SAMPLE_RATE and sr > 0:
+            return np.zeros((0,), dtype=np.float32)
+
+        sr = max(8000, int(sample_rate or self.SAMPLE_RATE))
+        # Linear-phase ~85Hz Hann high-pass strips DC offset and tabletop/fan sub-bass rumble cleanly
+        win_hp = max(15, int(round(sr * 0.015)) | 1)
+        if len(arr) > win_hp:
+            k_hp = np.hanning(win_hp).astype(np.float32)
+            k_hp /= np.sum(k_hp)
+            arr = (arr - np.convolve(arr, k_hp, mode="same")).astype(np.float32)
+        else:
+            arr = (arr - float(np.median(arr))).astype(np.float32)
+
+        # Anti-alias low-pass before decimation when capturing at 44.1kHz / 48kHz
+        if sr != self.SAMPLE_RATE:
+            if sr > 17500 and len(arr) >= 31:
+                fc = 7200.0 / float(sr)
+                taps = np.arange(-15, 16, dtype=np.float32)
+                sinc = (2.0 * fc) * np.sinc(2.0 * fc * taps).astype(np.float32)
+                lp = (sinc * np.hanning(31)).astype(np.float32)
+                lp /= np.sum(lp)
+                arr = np.convolve(arr, lp, mode="same").astype(np.float32)
             n_out = max(1, int(round(len(arr) * self.SAMPLE_RATE / sr)))
             arr = np.interp(np.linspace(0, len(arr) - 1, n_out), np.arange(len(arr)), arr).astype(np.float32)
+        return arr
 
+    def transcribe_float32(self, audio: Any, sample_rate: int = 16000) -> str:
+        np = self._np
+        arr = self._preprocess_audio(audio, sample_rate)
         if len(arr) < int(0.12 * self.SAMPLE_RATE):
             return ""
-        # Remove DC bias so USB/analog mics don't fool VAD gating
-        arr = (arr - float(np.median(arr))).astype(np.float32)
+
         peak = float(np.max(np.abs(arr)))
-        if peak < 0.0015:
+        if peak < 0.002:
             return ""
 
-        gate = max(0.0018, peak * 0.08)
+        # Compute 50ms frame RMS to reject flat stationary room hum before calling Whisper
+        hop = 800
+        n_frames = max(1, len(arr) // hop)
+        trimmed_frames = arr[: n_frames * hop].reshape(n_frames, hop)
+        frame_rms = np.sqrt(np.mean(trimmed_frames * trimmed_frames, axis=1))
+        p95_rms = float(np.percentile(frame_rms, 95))
+        p10_rms = float(np.percentile(frame_rms, 10))
+        if p95_rms < 0.0028 or (p95_rms < 0.018 and (p95_rms / max(1e-6, p10_rms)) < 1.65):
+            return ""
+
+        gate = max(0.0022, p95_rms * 0.12)
         active = np.where(np.abs(arr) >= gate)[0]
         if active.size == 0:
             return ""
-        pad = int(0.25 * self.SAMPLE_RATE)
+        pad = int(0.35 * self.SAMPLE_RATE)
         start = max(0, int(active[0]) - pad)
         end = min(len(arr), int(active[-1]) + pad + 1)
         trimmed = np.ascontiguousarray(arr[start:end], dtype=np.float32)
         if len(trimmed) < int(0.12 * self.SAMPLE_RATE):
             return ""
 
-        # Boost low-gain microphones gently toward healthy speech range for quantized ONNX encoder
-        seg_peak = float(np.max(np.abs(trimmed)))
-        if 0.0 < seg_peak < 0.35:
-            gain = min(14.0, 0.7 / seg_peak)
-            trimmed = np.ascontiguousarray(np.clip(trimmed * gain, -1.0, 1.0), dtype=np.float32)
+        # RMS-based gain normalization boosts quiet speech without letting key taps suppress voice
+        if p95_rms < 0.08:
+            gain = min(12.0, 0.09 / max(1e-5, p95_rms))
+            trimmed = np.ascontiguousarray(np.clip(trimmed * gain, -0.98, 0.98), dtype=np.float32)
 
         parts: List[str] = []
-        for offset in range(0, len(trimmed), self.MAX_SEGMENT_SAMPLES):
-            chunk = trimmed[offset : offset + self.MAX_SEGMENT_SAMPLES]
-            if len(chunk) < int(0.12 * self.SAMPLE_RATE):
+        pos = 0
+        total = len(trimmed)
+        while pos < total:
+            if total - pos <= self.CHUNK_SAMPLES:
+                window = trimmed[pos:total]
+                pos = total
+            else:
+                # Split cleanly at the quietest pause between 23s and 29.5s
+                lo = pos + int(23.0 * self.SAMPLE_RATE)
+                hi = min(total, pos + int(29.5 * self.SAMPLE_RATE))
+                seg = trimmed[lo:hi]
+                if len(seg) >= hop:
+                    nf = len(seg) // hop
+                    f_e = np.mean(seg[: nf * hop].reshape(nf, hop) ** 2, axis=1)
+                    split_idx = lo + int(np.argmin(f_e)) * hop
+                else:
+                    split_idx = pos + self.CHUNK_SAMPLES
+                window = trimmed[pos:split_idx]
+                pos = split_idx
+            if len(window) < int(0.12 * self.SAMPLE_RATE):
                 continue
-            txt = self._decode_segment(chunk)
+            txt = self._decode_window(window)
             if txt:
                 parts.append(txt)
         return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
-def _get_stt_engine() -> _MoonshineSTT:
+def _get_stt_engine() -> _WhisperSTT:
     global _STT_ENGINE
     with _STT_LOCK:
         if _STT_ENGINE is None:
-            _STT_ENGINE = _MoonshineSTT()
+            _STT_ENGINE = _WhisperSTT()
         return _STT_ENGINE
 
 
@@ -4265,7 +4409,7 @@ def audio_record_stop_endpoint(request: Request):
             "sample_rate": capture_sr,
             "peak": peak,
             "rms": rms,
-            "engine": "moonshine-base-onnx",
+            "engine": "whisper-base.en-onnx",
         }
     try:
         text = _get_stt_engine().transcribe_float32(samples, sample_rate=capture_sr)
@@ -4280,7 +4424,7 @@ def audio_record_stop_endpoint(request: Request):
             "sample_rate": capture_sr,
             "peak": peak,
             "rms": rms,
-            "engine": "moonshine-base-onnx",
+            "engine": "whisper-base.en-onnx",
         }
     except Exception as exc:
         log.error(f"Speech transcription failed: {exc}")
@@ -4301,11 +4445,11 @@ async def audio_transcribe_endpoint(file: UploadFile = File(...)):
     if not raw_bytes or len(raw_bytes) > 25 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Audio clip is empty or exceeds 25 MB limit.")
 
-    # Decode standard PCM/WAV/FLAC/OGG directly in memory using built-in soundfile + Moonshine ONNX
+    # Decode standard PCM/WAV/FLAC/OGG directly in memory using built-in soundfile + Whisper ONNX
     try:
         samples, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
         text = _get_stt_engine().transcribe_float32(samples, sample_rate=int(sr))
-        return {"text": text, "engine": "moonshine-base-onnx"}
+        return {"text": text, "engine": "whisper-base.en-onnx"}
     except Exception as sf_exc:
         try:
             from faster_whisper import WhisperModel
