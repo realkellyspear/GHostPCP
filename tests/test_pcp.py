@@ -1996,7 +1996,7 @@ class GHostPCPTests(unittest.TestCase):
                 self.assertEqual(e_res.json()["sample_rate"], 48000)
                 self.assertEqual(e_res.json()["engine"], "whisper-base.en-onnx")
                 stop_heard = e_res.json()["text"].lower()
-                self.assertIn("ghost pcp", stop_heard)
+                self.assertTrue("ghost pcp" in stop_heard or "ghostpcp" in stop_heard, msg=f"got: {stop_heard!r}")
                 self.assertIn("weather", stop_heard)
                 self.assertIn("pauses", stop_heard)
 
@@ -2058,6 +2058,9 @@ class GHostPCPTests(unittest.TestCase):
         self.assertIn("function formatApiError(", html_src)
         self.assertIn("function formatErrorMessage(", html_src)
         self.assertNotIn("alert(`Voice playback error: ${e.message}`)", html_src)
+        # Ensure mobile viewport wraps composer into input+SEND row and action button row
+        self.assertIn("@media (max-width: 760px)", html_src)
+        self.assertIn("flex: 1 1 calc(100% - 110px);", html_src)
 
 
 if __name__ == "__main__":

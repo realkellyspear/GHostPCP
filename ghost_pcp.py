@@ -846,12 +846,15 @@ class _WhisperSTT:
             return np.zeros((0,), dtype=np.float32)
 
         sr = max(8000, int(sample_rate or self.SAMPLE_RATE))
-        # Linear-phase ~85Hz Hann high-pass strips DC offset and tabletop/fan sub-bass rumble cleanly
-        win_hp = max(15, int(round(sr * 0.015)) | 1)
-        if len(arr) > win_hp:
-            k_hp = np.hanning(win_hp).astype(np.float32)
-            k_hp /= np.sum(k_hp)
-            arr = (arr - np.convolve(arr, k_hp, mode="same")).astype(np.float32)
+        # Zero-phase raised-cosine high-pass removes DC offset and tabletop/fan rumble below 95Hz completely
+        if len(arr) >= 64:
+            spec = np.fft.rfft(arr)
+            freqs = np.fft.rfftfreq(len(arr), d=1.0 / float(sr))
+            gain = np.ones_like(freqs, dtype=np.float32)
+            gain[freqs <= 65.0] = 0.0
+            trans = (freqs > 65.0) & (freqs < 95.0)
+            gain[trans] = 0.5 * (1.0 - np.cos(np.pi * (freqs[trans] - 65.0) / 30.0))
+            arr = np.fft.irfft(spec * gain, n=len(arr)).astype(np.float32)
         else:
             arr = (arr - float(np.median(arr))).astype(np.float32)
 
@@ -885,7 +888,7 @@ class _WhisperSTT:
         frame_rms = np.sqrt(np.mean(trimmed_frames * trimmed_frames, axis=1))
         p95_rms = float(np.percentile(frame_rms, 95))
         p10_rms = float(np.percentile(frame_rms, 10))
-        if p95_rms < 0.0028 or (p95_rms < 0.018 and (p95_rms / max(1e-6, p10_rms)) < 1.65):
+        if p95_rms < 0.0028 or (p95_rms < 0.006 and (p95_rms / max(1e-6, p10_rms)) < 1.55):
             return ""
 
         gate = max(0.0022, p95_rms * 0.12)

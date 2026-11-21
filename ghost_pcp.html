@@ -47,6 +47,7 @@
             font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
             margin: 0;
             height: 100vh;
+            height: 100dvh;
             display: flex;
             flex-direction: column;
             font-size: 14px;
@@ -416,6 +417,10 @@
             gap: 10px;
             align-items: flex-end;
         }
+        #input-area button {
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
         input[type="text"], input[type="number"], textarea, select {
             background: var(--panel-raised);
             color: var(--text);
@@ -432,6 +437,7 @@
         }
         #user-input {
             flex: 1;
+            min-width: 140px;
             min-height: 44px;
             max-height: 160px;
             resize: vertical;
@@ -704,21 +710,66 @@
             color: var(--text);
             cursor: pointer;
         }
-        @media (max-width: 680px) {
+        @media (max-width: 760px) {
             header {
-                padding: 10px 14px;
+                padding: 8px 12px;
+                gap: 8px;
+            }
+            .brand img {
+                width: 150px;
             }
             .subtitle {
                 display: none;
             }
+            .header-controls {
+                gap: 6px;
+            }
+            .header-controls button,
+            .header-controls .badge {
+                font-size: 11.5px;
+                padding: 5px 8px;
+            }
             .control-grid {
                 grid-template-columns: 1fr;
             }
+            #chat-container {
+                width: calc(100% - 20px);
+                padding: 12px 0;
+            }
+            #chat-attachments-bar {
+                width: calc(100% - 20px);
+            }
             .message {
-                max-width: 94%;
+                max-width: 96%;
             }
             .message-actions {
                 opacity: 0.9;
+            }
+            #input-area {
+                width: calc(100% - 20px);
+                flex-wrap: wrap;
+                gap: 8px;
+                padding: 8px 0 calc(10px + env(safe-area-inset-bottom, 0px));
+            }
+            #user-input {
+                order: 1;
+                flex: 1 1 calc(100% - 110px);
+                min-width: 0;
+                min-height: 44px;
+                font-size: 16px;
+                padding: 10px 12px;
+            }
+            #send-button {
+                order: 2;
+                min-height: 44px;
+                padding: 10px 16px;
+            }
+            #input-area .secondary {
+                order: 3;
+                flex: 1 1 auto;
+                font-size: 11.5px;
+                padding: 7px 6px;
+                text-align: center;
             }
         }
         .web-pill {
