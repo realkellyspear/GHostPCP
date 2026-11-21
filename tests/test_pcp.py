@@ -1932,21 +1932,24 @@ class GHostPCPTests(unittest.TestCase):
             self.assertIn("weather", heard)
             self.assertIn("midnight", heard)
 
-            # Local host loopback recording flow using mocked sounddevice.InputStream
+            # Local host loopback recording flow using mocked sounddevice.InputStream at native 48kHz
             class FakeStream:
                 def __init__(self, **kwargs):
                     self.cb = kwargs.get("callback")
+                    self.sr = int(kwargs.get("samplerate") or 48000)
 
                 def start(self):
                     audio_f32, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
-                    n_out = max(1, int(round(len(audio_f32) * 16000 / sr)))
+                    n_out = max(1, int(round(len(audio_f32) * self.sr / sr)))
                     resampled = np.interp(
                         np.linspace(0, len(audio_f32) - 1, n_out),
                         np.arange(len(audio_f32)),
                         audio_f32,
                     ).astype(np.float32)
+                    # Simulate quiet USB mic (0.04x gain + slight DC bias) to verify normalization
+                    quiet = (resampled * 0.04 + 0.015).astype(np.float32)
                     if self.cb:
-                        self.cb(resampled[:, None], len(resampled), None, None)
+                        self.cb(quiet[:, None], len(quiet), None, None)
 
                 def stop(self):
                     pass
@@ -1954,18 +1957,88 @@ class GHostPCPTests(unittest.TestCase):
                 def close(self):
                     pass
 
+            fake_devs = [
+                {"name": "Test USB Mic", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 48000.0, "hostapi": 0},
+            ]
             with patch.object(ghost_pcp, "_is_local_loopback_request", return_value=True), patch.object(
                 ghost_pcp.sd, "InputStream", side_effect=lambda **kw: FakeStream(**kw)
             ), patch.object(
-                ghost_pcp.sd, "query_devices", return_value={"name": "Test USB Mic"}
+                ghost_pcp.sd, "query_devices", side_effect=lambda kind=None: fake_devs[0] if kind else fake_devs
+            ), patch.object(
+                ghost_pcp.sd, "query_hostapis", return_value=[{"name": "MME"}]
             ):
+                dev_res = client.get("/v1/audio/devices")
+                self.assertEqual(dev_res.status_code, 200)
+                self.assertTrue(any(d["name"] == "Test USB Mic" for d in dev_res.json()["devices"]))
+
                 s_res = client.post("/v1/audio/record/start")
                 self.assertEqual(s_res.status_code, 200)
                 self.assertEqual(s_res.json()["status"], "recording")
+                self.assertEqual(s_res.json()["sample_rate"], 48000)
 
                 e_res = client.post("/v1/audio/record/stop")
                 self.assertEqual(e_res.status_code, 200)
+                self.assertEqual(e_res.json()["sample_rate"], 48000)
                 self.assertIn("weather", e_res.json()["text"].lower())
+
+    def test_smart_web_veto_and_tts_error_resilience(self):
+        import ghost_pcp
+        import pcp_web
+
+        # Casual / personal / device troubleshooting chat must NOT trigger Wikipedia or DuckDuckGo in smart mode
+        with patch.object(pcp_web, "search_web") as mock_search:
+            res1 = pcp_web.gather_web_context(
+                user_text="Alright well the microphone is still not working and voice playback broke!",
+                provider="auto",
+                search_mode="smart",
+            )
+            self.assertEqual(res1["search_results"], [])
+            self.assertEqual(res1["context_block"], "")
+            mock_search.assert_not_called()
+
+            res2 = pcp_web.gather_web_context(
+                user_text="Today I feel sad and pissed off, why is everything acting weird?",
+                provider="auto",
+                search_mode="smart",
+                query_rewriter=lambda _q: "",
+            )
+            self.assertEqual(res2["search_results"], [])
+            mock_search.assert_not_called()
+
+        # Qwen3 rewriter injects /no_think and converts think-only output into explicit NONE veto
+        captured = {}
+
+        class FakeThinkLLM:
+            def create_chat_completion(self, **kwargs):
+                captured.update(kwargs)
+                return {"choices": [{"message": {"content": "<think>thinking about mic"}}]}
+
+        with patch.object(ghost_pcp.STATE, "llm", FakeThinkLLM()), patch.object(
+            ghost_pcp.STATE, "loaded_model", "Qwen3-14B-Q5_K_M.gguf"
+        ):
+            out = ghost_pcp._llm_web_query_rewriter("my microphone still does not work")
+            self.assertEqual(out, "NONE")
+            self.assertIn("/no_think", captured["messages"][0]["content"])
+
+        # TTS host playback resampling + fallback header X-Played-On-Host=false when sounddevice fails
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ghost_pcp, "SETTINGS_PATH", Path(tmp) / "settings.json"
+        ), patch.object(
+            ghost_pcp, "PCP_DATA_DIR", Path(tmp) / "pcp_data"
+        ), TestClient(ghost_pcp.app) as client:
+            with patch.object(ghost_pcp, "_is_local_loopback_request", return_value=True), patch.object(
+                ghost_pcp, "_play_wav_on_host", return_value=False
+            ):
+                tts_fail_host = client.post("/v1/tts", json={"text": "Fallback to browser audio.", "voice": "silas"})
+                self.assertEqual(tts_fail_host.status_code, 200)
+                self.assertEqual(tts_fail_host.headers.get("X-Played-On-Host"), "false")
+                self.assertTrue(len(tts_fail_host.content) > 1000)
+
+        # Ensure UI formats FastAPI 422 arrays cleanly and never falls back to [object Object]
+        html_src = (ROOT / "ghost_pcp.html").read_text(encoding="utf-8")
+        self.assertIn("function formatApiError(", html_src)
+        self.assertIn("function formatErrorMessage(", html_src)
+        self.assertNotIn("alert(`Voice playback error: ${e.message}`)", html_src)
 
 
 if __name__ == "__main__":

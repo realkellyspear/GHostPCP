@@ -1069,6 +1069,14 @@
                     <option value="kara">Kara</option>
                 </select>
                 <small>Drop any Piper `.onnx` + `.onnx.json` pair into `./piper_models` to add voices.</small>
+                <label for="mic-device" style="margin-top: 8px;">Microphone Input (`[ MIC ]`)</label>
+                <div style="display: flex; gap: 6px; align-items: center;">
+                    <select id="mic-device" style="flex: 1;">
+                        <option value="auto">Auto (Windows Default)</option>
+                    </select>
+                    <button type="button" class="secondary" onclick="testSelectedMic()" style="white-space: nowrap;">TEST MIC</button>
+                </div>
+                <small id="mic-test-result">Offline Moonshine-Base ONNX speech recognition (0 GB VRAM).</small>
             </div>
         </div>
 
@@ -1616,14 +1624,19 @@
                 const res = await api("/audio/record/stop", { method: "POST" });
                 appendDictatedText(res.text);
                 if (!res.text) {
-                    setStatus("NO SPEECH DETECTED IN CLIP", "var(--warn)");
-                    setTimeout(restoreOnlineStatusBadge, 1800);
+                    const devLabel = res.device ? ` on ${res.device}` : "";
+                    if (typeof res.peak === "number" && res.peak < 0.002) {
+                        setStatus(`MIC QUIET/MUTED${devLabel} — CHECK [ CONFIG ]`, "var(--warn)");
+                    } else {
+                        setStatus(`NO WORDS DETECTED (${res.duration_sec || 0}s${devLabel})`, "var(--warn)");
+                    }
+                    setTimeout(restoreOnlineStatusBadge, 4000);
                 } else {
                     restoreOnlineStatusBadge();
                 }
             } catch (e) {
                 restoreOnlineStatusBadge();
-                alert(`Speech transcription failed: ${e.message}`);
+                alert(`Speech transcription failed: ${formatErrorMessage(e)}`);
             } finally {
                 micMode = null;
                 micTranscribing = false;
@@ -1649,13 +1662,13 @@
                 appendDictatedText(res.text);
                 if (!res.text) {
                     setStatus("NO SPEECH DETECTED IN CLIP", "var(--warn)");
-                    setTimeout(restoreOnlineStatusBadge, 1800);
+                    setTimeout(restoreOnlineStatusBadge, 3000);
                 } else {
                     restoreOnlineStatusBadge();
                 }
             } catch (e) {
                 restoreOnlineStatusBadge();
-                alert(`Speech transcription failed: ${e.message}`);
+                alert(`Speech transcription failed: ${formatErrorMessage(e)}`);
             } finally {
                 micTranscribing = false;
                 setMicButtonState("[ MIC ]", false, false);
@@ -1673,6 +1686,7 @@
         }
 
         // 2. Start recording: Desktop host (sounddevice + local Moonshine ONNX) takes priority locally
+        let hostMicError = "";
         if (isLocalClient) {
             try {
                 const started = await api("/audio/record/start", { method: "POST" });
@@ -1681,8 +1695,8 @@
                 setStatus(`LISTENING (${started.device || "PC MIC"})...`, "var(--danger)");
                 return;
             } catch (hostErr) {
-                // Fall through cleanly to browser capture if host mic unavailable
-                console.warn("Host mic fallback:", hostErr);
+                hostMicError = formatErrorMessage(hostErr);
+                console.warn("Host mic fallback:", hostMicError);
             }
         }
 
@@ -1712,12 +1726,14 @@
                 return;
             } catch (browserErr) {
                 cleanupRemoteRecorder();
-                const msg = browserErr?.message || String(browserErr || "Microphone permission denied");
+                const msg = formatErrorMessage(browserErr, "Microphone permission denied");
                 if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
                     alert(
-                        `Could not access microphone (${msg}).\n\n` +
+                        `Could not access microphone (${msg}).` +
+                        (hostMicError ? `\nDesktop mic detail: ${hostMicError}` : "") +
+                        "\n\n" +
                         (isLocalClient
-                            ? "Check that your Windows microphone is plugged in and enabled in Windows Privacy Settings."
+                            ? "Check your selected microphone in [ CONFIG ] and Windows Privacy Settings."
                             : "Phone browsers require an HTTPS connection for mic access—use the Cloudflare Tunnel URL in [ PHONE / TUNNEL ].")
                     );
                     return;
@@ -1729,9 +1745,11 @@
         const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (!SpeechRec) {
             alert(
-                "Microphone could not be opened on this device.\n" +
+                "Microphone could not be opened on this device." +
+                (hostMicError ? `\nDesktop mic error: ${hostMicError}` : "") +
+                "\n" +
                 (isLocalClient
-                    ? "Check Windows microphone permissions and default recording device."
+                    ? "Check Windows microphone permissions and pick your mic in [ CONFIG ]."
                     : "Phone browsers require HTTPS (Cloudflare Tunnel) for microphone access.")
             );
             return;
@@ -1778,8 +1796,53 @@
             setMicButtonState("STOP MIC", true, false);
         } catch (e) {
             micMode = null;
-            alert(`Could not start microphone: ${e.message}`);
+            alert(`Could not start microphone: ${formatErrorMessage(e)}`);
         }
+    }
+
+    function formatErrorDetail(detail, fallback = "Unknown error") {
+        if (detail === null || detail === undefined || detail === "") return fallback;
+        if (typeof detail === "string") return detail;
+        if (Array.isArray(detail)) {
+            const parts = detail.map(item => {
+                if (typeof item === "string") return item;
+                if (item && typeof item === "object") {
+                    const loc = Array.isArray(item.loc) ? item.loc.slice(1).join(".") : "";
+                    const msg = item.msg || item.message || item.detail || JSON.stringify(item);
+                    return loc ? `${loc}: ${msg}` : String(msg);
+                }
+                return String(item);
+            }).filter(Boolean);
+            return parts.length ? parts.join("; ") : fallback;
+        }
+        if (typeof detail === "object") {
+            if (typeof detail.message === "string" && detail.message) return detail.message;
+            if (typeof detail.msg === "string" && detail.msg) return detail.msg;
+            if (detail.detail !== undefined && detail.detail !== detail) return formatErrorDetail(detail.detail, fallback);
+            try { return JSON.stringify(detail); } catch (_) { return fallback; }
+        }
+        return String(detail);
+    }
+
+    function formatApiError(data, fallback) {
+        if (!data || typeof data !== "object") return fallback;
+        if (data.detail !== undefined && data.detail !== null && data.detail !== "") {
+            return formatErrorDetail(data.detail, fallback);
+        }
+        if (data.error !== undefined && data.error !== null && data.error !== "") {
+            return formatErrorDetail(data.error, fallback);
+        }
+        return fallback;
+    }
+
+    function formatErrorMessage(err, fallback = "Unexpected error") {
+        if (!err) return fallback;
+        if (typeof err === "string") return err;
+        if (err.message !== undefined && err.message !== null && err.message !== "") {
+            if (typeof err.message === "string" && err.message !== "[object Object]") return err.message;
+            return formatErrorDetail(err.message, fallback);
+        }
+        return formatErrorDetail(err, fallback);
     }
 
     async function api(path, options = {}) {
@@ -1791,7 +1854,7 @@
         const response = await fetch(`${API}${path}`, { ...options, headers });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.detail || data.error || `Request failed (${response.status})`);
+            throw new Error(formatApiError(data, `Request failed (${response.status})`));
         }
         return data;
     }
@@ -1835,6 +1898,7 @@
             pcp_enabled: document.getElementById("pcp-enabled").checked,
             pcp_top_k: Math.trunc(Number(document.getElementById("pcp-top-k").value)) || 4,
             tts_voice: document.getElementById("tts-voice").value || "silas",
+            mic_device: document.getElementById("mic-device")?.value || "auto",
             blocked_phrases: document.getElementById("blocked-phrases").value,
             protected_words: document.getElementById("protected-words").value,
             show_reasoning: document.getElementById("show-reasoning").checked,
@@ -1868,7 +1932,16 @@
         document.getElementById("pcp-enabled").checked = settings.pcp_enabled !== false;
         document.getElementById("pcp-top-k").value = settings.pcp_top_k || 4;
         if (settings.tts_voice) {
-            document.getElementById("tts-voice").value = settings.tts_voice;
+            const voiceSel = document.getElementById("tts-voice");
+            if (voiceSel && Array.from(voiceSel.options).some(o => o.value === settings.tts_voice)) {
+                voiceSel.value = settings.tts_voice;
+            }
+        }
+        if (settings.mic_device) {
+            const micSel = document.getElementById("mic-device");
+            if (micSel && Array.from(micSel.options).some(o => o.value === settings.mic_device)) {
+                micSel.value = settings.mic_device;
+            }
         }
         document.getElementById("blocked-phrases").value = settings.blocked_phrases ?? "";
         document.getElementById("protected-words").value = settings.protected_words ?? "";
@@ -1960,6 +2033,55 @@
                 }
             }
         } catch (e) {}
+    }
+
+    async function fetchMicDevices() {
+        try {
+            const data = await api("/audio/devices");
+            const select = document.getElementById("mic-device");
+            if (!select) return;
+            const currentVal = select.value || lastSettings?.mic_device || data.selected || "auto";
+            select.innerHTML = "";
+            const autoOpt = document.createElement("option");
+            autoOpt.value = "auto";
+            autoOpt.innerText = "Auto (Windows Default)";
+            select.appendChild(autoOpt);
+            (data.devices || []).forEach(dev => {
+                const opt = document.createElement("option");
+                opt.value = dev.name;
+                opt.innerText = dev.default ? `${dev.name} (Default)` : dev.name;
+                select.appendChild(opt);
+            });
+            if (Array.from(select.options).some(o => o.value === currentVal)) {
+                select.value = currentVal;
+            }
+        } catch (e) {}
+    }
+
+    async function testSelectedMic() {
+        const out = document.getElementById("mic-test-result");
+        const dev = document.getElementById("mic-device")?.value || "auto";
+        if (out) {
+            out.style.color = "var(--warn)";
+            out.innerText = "Listening briefly (0.8s)... say 'testing' or tap the mic.";
+        }
+        try {
+            const res = await api(`/audio/test?device=${encodeURIComponent(dev)}`, { method: "POST" });
+            if (out) {
+                if (res.heard_signal) {
+                    out.style.color = "var(--ok)";
+                    out.innerText = `Signal OK on "${res.device}" (${res.sample_rate} Hz, peak ${res.peak}).`;
+                } else {
+                    out.style.color = "var(--danger)";
+                    out.innerText = `No sound detected on "${res.device}" (peak ${res.peak}). Try another mic or check mute.`;
+                }
+            }
+        } catch (e) {
+            if (out) {
+                out.style.color = "var(--danger)";
+                out.innerText = `Mic test failed: ${formatErrorMessage(e)}`;
+            }
+        }
     }
 
     function sourceTypeLabel(sourceType) {
@@ -2131,7 +2253,7 @@
             const resp = await fetch(`${API}/personas/${encodeURIComponent(personaId)}/export`, { headers });
             if (!resp.ok) {
                 const err = await resp.json().catch(() => ({}));
-                throw new Error(err.detail || `Export failed (${resp.status})`);
+                throw new Error(formatApiError(err, `Export failed (${resp.status})`));
             }
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
@@ -3043,9 +3165,21 @@
         }
         resetActiveVoiceButton();
 
-        const voiceName = document.getElementById("tts-voice")?.value || lastSettings?.tts_voice || "silas";
+        const voiceName = String(
+            document.getElementById("tts-voice")?.value
+            || activePersona?.tts_voice
+            || lastSettings?.tts_voice
+            || "silas"
+        ).trim() || "silas";
         const plain = extractPlainText(msg.content);
-        const clean = msg.role === "assistant" ? stripThinkBlocks(plain) : plain;
+        let clean = (msg.role === "assistant" ? stripThinkBlocks(plain) : plain).trim();
+        if (!clean) {
+            alert("This message has no spoken text to read aloud.");
+            return;
+        }
+        if (clean.length > 95000) {
+            clean = clean.slice(0, 95000).trim();
+        }
         const controller = new AbortController();
         activeTtsController = controller;
         // Instantiate Audio synchronously during the click event so mobile browsers keep playback gesture rights
@@ -3069,7 +3203,7 @@
             });
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
-                throw new Error(err.detail || `TTS failed (${res.status})`);
+                throw new Error(formatApiError(err, `TTS failed (${res.status})`));
             }
 
             const playedOnHost = res.headers.get("X-Played-On-Host") === "true";
@@ -3089,6 +3223,9 @@
                     URL.revokeObjectURL(audioUrl);
                     if (activeAudioPlayer === clientAudio) activeAudioPlayer = null;
                     if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
+                    if (!controller.signal.aborted) {
+                        alert("Voice playback error: Could not decode audio stream.");
+                    }
                 };
                 await clientAudio.play();
             } else {
@@ -3103,7 +3240,7 @@
                 return;
             }
             if (activeVoiceBtn === buttonEl) resetActiveVoiceButton();
-            alert(`Voice playback error: ${e.message}`);
+            alert(`Voice playback error: ${formatErrorMessage(e)}`);
         } finally {
             if (activeTtsController === controller) {
                 activeTtsController = null;
@@ -3321,7 +3458,7 @@
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({}));
-                throw new Error(error.detail || error.error || `Request failed (${response.status})`);
+                throw new Error(formatApiError(error, `Request failed (${response.status})`));
             }
             if (!response.body) throw new Error("The server did not provide a streaming response.");
             const reader = response.body.getReader();
@@ -3849,7 +3986,7 @@
                 if (token) headers["Authorization"] = `Bearer ${token}`;
                 const res = await fetch(`${API}/pcp/ingest`, { method: "POST", headers, body: formData });
                 const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || "Upload failed");
+                if (!res.ok) throw new Error(formatApiError(data, "Upload failed"));
             } else if (stagedLocalPath) {
                 document.getElementById("archive-message").innerText = "Scanning source folder and detecting Google vs OpenAI format...";
                 await api("/pcp/ingest-local", {
@@ -4099,6 +4236,7 @@
         fetchModels();
         fetchModelCatalog();
         fetchVoices();
+        fetchMicDevices();
     }
     function closeSettings() {
         document.getElementById("settings-modal").style.display = "none";
@@ -4522,6 +4660,7 @@
         await fetchModels();
         await fetchModelCatalog();
         await fetchVoices();
+        await fetchMicDevices();
         await fetchPersonas();
         if (lastSettings) writeSettings(lastSettings);
         if (activePersona) applyActivePersonaToUi(activePersona);

@@ -285,6 +285,7 @@ DEFAULT_SETTINGS = {
     "pcp_enabled": True,
     "pcp_top_k": 4,
     "tts_voice": "silas",
+    "mic_device": "auto",
     "blocked_phrases": "\n".join(DEFAULT_BLOCKED_PHRASES),
     "protected_words": "\n".join(DEFAULT_PROTECTED_WORDS),
     "show_reasoning": False,
@@ -527,6 +528,47 @@ def _resolve_piper_model_path(voice_name: str) -> Path:
     raise FileNotFoundError(f"Piper voice model '{safe_voice}.onnx' not found in {PIPER_MODEL_DIR}")
 
 
+def _play_wav_on_host(wav_bytes: bytes) -> bool:
+    """Play WAV bytes on the host default output device, resampling to native rate if needed."""
+    try:
+        import numpy as np
+
+        sd.stop()
+        data, fs = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+        try:
+            sd.play(data, fs)
+            return True
+        except Exception as rate_exc:
+            out_dev = sd.query_devices(kind="output") or {}
+            native_fs = int(round(float(out_dev.get("default_samplerate") or 48000)))
+            if native_fs > 0 and native_fs != int(fs):
+                n_out = max(1, int(round(len(data) * native_fs / fs)))
+                if data.ndim == 1:
+                    resampled = np.interp(
+                        np.linspace(0, len(data) - 1, n_out),
+                        np.arange(len(data)),
+                        data,
+                    ).astype(np.float32)
+                else:
+                    resampled = np.stack(
+                        [
+                            np.interp(
+                                np.linspace(0, len(data) - 1, n_out),
+                                np.arange(len(data)),
+                                data[:, ch],
+                            )
+                            for ch in range(data.shape[1])
+                        ],
+                        axis=1,
+                    ).astype(np.float32)
+                sd.play(resampled, native_fs)
+                return True
+            raise rate_exc
+    except Exception as exc:
+        log.warning(f"sounddevice local playback warning: {exc}")
+        return False
+
+
 def read_aloud(text: str, voice_name: str = "silas", play_locally: bool = True) -> bytes:
     """
     Generates and plays TTS using the local Piper engine.
@@ -542,13 +584,18 @@ def read_aloud(text: str, voice_name: str = "silas", play_locally: bool = True) 
     with _PIPER_LOCK:
         wav_bytes: Optional[bytes] = None
         try:
+            import piper
             from piper import PiperVoice
 
             cache_key = str(model_path.resolve())
             voice = _PIPER_VOICES.get(cache_key)
             if voice is None:
-                espeak_dir = RESOURCE_DIR / "piper" / "espeak-ng-data"
-                if espeak_dir.is_dir():
+                espeak_candidates = [
+                    RESOURCE_DIR / "piper" / "espeak-ng-data",
+                    Path(piper.__file__).resolve().parent / "espeak-ng-data",
+                ]
+                espeak_dir = next((d for d in espeak_candidates if d.is_dir()), None)
+                if espeak_dir is not None:
                     voice = PiperVoice.load(model_path, espeak_data_dir=espeak_dir)
                 else:
                     voice = PiperVoice.load(model_path)
@@ -563,6 +610,8 @@ def read_aloud(text: str, voice_name: str = "silas", play_locally: bool = True) 
             except OSError:
                 pass
         except Exception as exc:
+            if IS_FROZEN:
+                raise RuntimeError(f"Piper voice synthesis failed: {exc}") from exc
             log.warning(f"In-process PiperVoice fallback to CLI: {exc}")
             command = [sys.executable, "-m", "piper", "-m", str(model_path), "-f", str(output_audio)]
             subprocess.run(
@@ -579,12 +628,7 @@ def read_aloud(text: str, voice_name: str = "silas", play_locally: bool = True) 
             raise RuntimeError("Piper did not produce audio output.")
 
         if play_locally:
-            try:
-                sd.stop()
-                data, fs = sf.read(io.BytesIO(wav_bytes), dtype="float32")
-                sd.play(data, fs)
-            except Exception as exc:
-                log.warning(f"sounddevice local playback warning: {exc}")
+            _play_wav_on_host(wav_bytes)
 
         return wav_bytes
 
@@ -710,11 +754,14 @@ class _MoonshineSTT:
 
         if len(arr) < int(0.12 * self.SAMPLE_RATE):
             return ""
+        # Remove DC bias so USB/analog mics don't fool VAD gating
+        arr = (arr - float(np.median(arr))).astype(np.float32)
         peak = float(np.max(np.abs(arr)))
-        if peak < 0.004:
+        if peak < 0.0015:
             return ""
 
-        active = np.where(np.abs(arr) >= 0.004)[0]
+        gate = max(0.0018, peak * 0.08)
+        active = np.where(np.abs(arr) >= gate)[0]
         if active.size == 0:
             return ""
         pad = int(0.25 * self.SAMPLE_RATE)
@@ -723,6 +770,12 @@ class _MoonshineSTT:
         trimmed = np.ascontiguousarray(arr[start:end], dtype=np.float32)
         if len(trimmed) < int(0.12 * self.SAMPLE_RATE):
             return ""
+
+        # Boost low-gain microphones gently toward healthy speech range for quantized ONNX encoder
+        seg_peak = float(np.max(np.abs(trimmed)))
+        if 0.0 < seg_peak < 0.35:
+            gain = min(14.0, 0.7 / seg_peak)
+            trimmed = np.ascontiguousarray(np.clip(trimmed * gain, -1.0, 1.0), dtype=np.float32)
 
         parts: List[str] = []
         for offset in range(0, len(trimmed), self.MAX_SEGMENT_SAMPLES):
@@ -743,9 +796,84 @@ def _get_stt_engine() -> _MoonshineSTT:
         return _STT_ENGINE
 
 
+def scan_input_devices() -> List[Dict[str, Any]]:
+    """Return available PC microphone input devices, deduped across host APIs."""
+    devices_out: List[Dict[str, Any]] = []
+    try:
+        all_devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        default_in = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+    except Exception as exc:
+        log.warning(f"Could not query audio input devices: {exc}")
+        return devices_out
+
+    seen_names: Set[str] = set()
+    # Prefer MME (0) then WASAPI / DirectSound over exotic WDM-KS raw endpoints
+    ordered: List[Tuple[int, int, Dict[str, Any]]] = []
+    for idx, dev in enumerate(all_devs):
+        if int(dev.get("max_input_channels") or 0) <= 0:
+            continue
+        api_idx = int(dev.get("hostapi") or 0)
+        api_name = str(hostapis[api_idx].get("name") or "") if 0 <= api_idx < len(hostapis) else ""
+        prio = 0 if idx == default_in else (1 if "MME" in api_name else (2 if "WASAPI" in api_name else 3))
+        ordered.append((prio, idx, dev))
+    ordered.sort(key=lambda t: (t[0], t[1]))
+
+    for _prio, idx, dev in ordered:
+        raw_name = re.sub(r"\s+", " ", str(dev.get("name") or f"Microphone {idx}")).strip()
+        if not raw_name or raw_name.lower() in ("input ()", "microsoft sound mapper - input", "primary sound capture driver"):
+            continue
+        key = raw_name.lower()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        devices_out.append({
+            "id": str(idx),
+            "name": raw_name,
+            "default": idx == default_in,
+            "default_samplerate": int(round(float(dev.get("default_samplerate") or 44100))),
+            "channels": int(dev.get("max_input_channels") or 1),
+        })
+    return devices_out
+
+
+def _resolve_input_device(device_pref: str = "auto") -> Tuple[Optional[int], Dict[str, Any]]:
+    """Resolve 'auto', numeric device index, or device name substring into (device_idx, info)."""
+    pref = str(device_pref or "auto").strip()
+    try:
+        all_devs = sd.query_devices()
+    except Exception:
+        return None, {"name": "Default Microphone", "default_samplerate": 16000, "max_input_channels": 1}
+
+    if pref and pref.lower() != "auto":
+        if pref.isdigit():
+            idx = int(pref)
+            if 0 <= idx < len(all_devs) and int(all_devs[idx].get("max_input_channels") or 0) > 0:
+                return idx, dict(all_devs[idx])
+        pref_low = pref.lower()
+        for idx, dev in enumerate(all_devs):
+            if int(dev.get("max_input_channels") or 0) > 0:
+                dname = str(dev.get("name") or "").strip().lower()
+                if dname == pref_low:
+                    return idx, dict(dev)
+        for idx, dev in enumerate(all_devs):
+            if int(dev.get("max_input_channels") or 0) > 0:
+                dname = str(dev.get("name") or "").strip().lower()
+                if pref_low in dname:
+                    return idx, dict(dev)
+
+    try:
+        dev = sd.query_devices(kind="input") or {}
+        default_idx = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        idx_val = int(default_idx) if isinstance(default_idx, int) and default_idx >= 0 else None
+        return idx_val, dict(dev)
+    except Exception:
+        return None, {"name": "Default Microphone", "default_samplerate": 16000, "max_input_channels": 1}
+
+
 class _HostAudioRecorder:
     SAMPLE_RATE = 16000
-    MAX_SAMPLES = 16000 * 90
+    MAX_SECONDS = 90
 
     def __init__(self):
         self._buf_lock = threading.Lock()
@@ -753,8 +881,10 @@ class _HostAudioRecorder:
         self._stream: Optional[Any] = None
         self._chunks: List[Any] = []
         self._total_samples = 0
+        self._max_samples = self.SAMPLE_RATE * self.MAX_SECONDS
         self.recording = False
         self.device_name = ""
+        self.capture_sample_rate = self.SAMPLE_RATE
 
     def _stop_and_close_stream(self) -> None:
         with self._stream_lock:
@@ -771,52 +901,76 @@ class _HostAudioRecorder:
             except Exception:
                 pass
 
-    def start(self) -> str:
+    def start(self, device_pref: str = "auto") -> str:
         import numpy as np
         self._stop_and_close_stream()
         with self._buf_lock:
             self._chunks = []
             self._total_samples = 0
 
-        try:
-            dev = sd.query_devices(kind="input")
-            dev_name = str((dev or {}).get("name") or "Default Microphone")
-        except Exception:
-            dev_name = "Default Microphone"
+        dev_idx, dev_info = _resolve_input_device(device_pref)
+        dev_name = str((dev_info or {}).get("name") or "Default Microphone").strip()
+        native_sr = int(round(float((dev_info or {}).get("default_samplerate") or 44100)))
+        max_ch = max(1, int((dev_info or {}).get("max_input_channels") or 1))
+
+        # Prefer device native sample rate first (avoids Windows MME 16kHz driver quirks), then standard rates
+        sr_candidates: List[int] = []
+        for sr in (native_sr, 48000, 44100, 16000):
+            if sr and sr >= 8000 and sr not in sr_candidates:
+                sr_candidates.append(sr)
+        ch_candidates = [1] + ([2] if max_ch >= 2 else [])
 
         def _callback(indata, frames, time_info, status):
             if not self.recording:
                 return
             with self._buf_lock:
-                if not self.recording or self._total_samples >= self.MAX_SAMPLES:
+                if not self.recording or self._total_samples >= self._max_samples:
                     return
-                take = min(frames, self.MAX_SAMPLES - self._total_samples)
+                take = min(frames, self._max_samples - self._total_samples)
                 if take > 0:
-                    self._chunks.append(np.array(indata[:take, 0], dtype=np.float32, copy=True))
+                    if indata.ndim > 1 and indata.shape[1] > 1:
+                        mono = np.mean(indata[:take], axis=1, dtype=np.float32)
+                    else:
+                        mono = np.array(indata[:take, 0], dtype=np.float32, copy=True)
+                    self._chunks.append(mono)
                     self._total_samples += take
 
         with self._stream_lock:
             self.device_name = dev_name
-            self.recording = True
-            try:
-                stream = sd.InputStream(
-                    samplerate=self.SAMPLE_RATE,
-                    channels=1,
-                    dtype="float32",
-                    callback=_callback,
-                )
-                self._stream = stream
-                stream.start()
-            except Exception as exc:
-                self.recording = False
-                bad_stream = self._stream
-                self._stream = None
-                if bad_stream is not None:
+            last_exc: Optional[Exception] = None
+            opened = False
+            for ch in ch_candidates:
+                if opened:
+                    break
+                for sr in sr_candidates:
+                    self.capture_sample_rate = sr
+                    self._max_samples = sr * self.MAX_SECONDS
+                    self.recording = True
                     try:
-                        bad_stream.close()
-                    except Exception:
-                        pass
-                raise RuntimeError(f"Could not open host microphone: {exc}") from exc
+                        stream = sd.InputStream(
+                            device=dev_idx,
+                            samplerate=sr,
+                            channels=ch,
+                            dtype="float32",
+                            callback=_callback,
+                        )
+                        self._stream = stream
+                        stream.start()
+                        opened = True
+                        log.info(f"Mic start: device={dev_name!r} sr={sr}Hz ch={ch}")
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        self.recording = False
+                        bad_stream = self._stream
+                        self._stream = None
+                        if bad_stream is not None:
+                            try:
+                                bad_stream.close()
+                            except Exception:
+                                pass
+            if not opened:
+                raise RuntimeError(f"Could not open host microphone ({dev_name}): {last_exc}") from last_exc
         return dev_name
 
     def stop_and_extract(self) -> Tuple[Any, float]:
@@ -826,10 +980,11 @@ class _HostAudioRecorder:
             chunks = list(self._chunks)
             self._chunks = []
             self._total_samples = 0
+        sr = int(self.capture_sample_rate or self.SAMPLE_RATE)
         if not chunks:
             return np.zeros((0,), dtype=np.float32), 0.0
         samples = np.concatenate(chunks).astype(np.float32)
-        return samples, round(len(samples) / self.SAMPLE_RATE, 2)
+        return samples, round(len(samples) / max(1, sr), 2)
 
     def cancel(self) -> None:
         self._stop_and_close_stream()
@@ -2643,6 +2798,7 @@ class LoaderSettings(BaseModel):
     pcp_enabled: bool = True
     pcp_top_k: StrictInt = Field(default=4, ge=1, le=12)
     tts_voice: StrictStr = Field(default="silas", min_length=1, max_length=64)
+    mic_device: StrictStr = Field(default="auto", max_length=200)
     blocked_phrases: StrictStr = Field(default=DEFAULT_SETTINGS["blocked_phrases"], max_length=8000)
     protected_words: StrictStr = Field(default=DEFAULT_SETTINGS["protected_words"], max_length=8000)
     show_reasoning: bool = False
@@ -2746,7 +2902,7 @@ class ModelDownloadRequest(BaseModel):
 
 
 class TTSRequest(BaseModel):
-    text: StrictStr = Field(min_length=1, max_length=20000)
+    text: StrictStr = Field(min_length=1, max_length=100000)
     voice: StrictStr = Field(default="silas", max_length=64)
     play_on_host: Optional[bool] = None
 
@@ -3988,7 +4144,7 @@ def tts_endpoint(req: TTSRequest, request: Request):
     play_locally = req.play_on_host if req.play_on_host is not None else is_local_loopback
 
     try:
-        wav_bytes = read_aloud(req.text, req.voice, play_locally=play_locally)
+        wav_bytes = read_aloud(req.text, req.voice, play_locally=False)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -3997,12 +4153,13 @@ def tts_endpoint(req: TTSRequest, request: Request):
         log.error(f"TTS error: {exc}")
         raise HTTPException(status_code=500, detail=f"TTS failed: {exc}") from exc
 
+    played_on_host = _play_wav_on_host(wav_bytes) if play_locally else False
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
         headers={
             "Cache-Control": "no-store",
-            "X-Played-On-Host": "true" if play_locally else "false",
+            "X-Played-On-Host": "true" if played_on_host else "false",
         },
     )
 
@@ -4013,6 +4170,52 @@ def tts_stop_endpoint():
     return {"status": "stopped"}
 
 
+@app.get("/v1/audio/devices", dependencies=[Depends(verify_access)])
+def audio_devices_endpoint():
+    settings = load_settings()
+    return {
+        "devices": scan_input_devices(),
+        "selected": settings.get("mic_device") or "auto",
+    }
+
+
+@app.post("/v1/audio/test", dependencies=[Depends(verify_access)])
+def audio_test_endpoint(request: Request, device: str = ""):
+    if not _is_local_loopback_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Host microphone test is restricted to local desktop sessions.",
+        )
+    if _AUDIO_REC.recording:
+        raise HTTPException(status_code=409, detail="Stop active microphone recording before testing.")
+    settings = load_settings()
+    pref = device.strip() or str(settings.get("mic_device") or "auto")
+    probe = _HostAudioRecorder()
+    try:
+        dev_name = probe.start(device_pref=pref)
+        time.sleep(0.75)
+        samples, duration_sec = probe.stop_and_extract()
+        import numpy as np
+
+        if samples.size > 0:
+            centered = samples - float(np.median(samples))
+            peak = round(float(np.max(np.abs(centered))), 5)
+            rms = round(float(np.sqrt(np.mean(centered * centered))), 5)
+        else:
+            peak, rms = 0.0, 0.0
+        return {
+            "device": dev_name,
+            "sample_rate": probe.capture_sample_rate,
+            "duration_sec": duration_sec,
+            "peak": peak,
+            "rms": rms,
+            "heard_signal": peak >= 0.002,
+        }
+    except Exception as exc:
+        probe.cancel()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/v1/audio/record/start", dependencies=[Depends(verify_access)])
 def audio_record_start_endpoint(request: Request):
     if not _is_local_loopback_request(request):
@@ -4020,10 +4223,17 @@ def audio_record_start_endpoint(request: Request):
             status_code=403,
             detail="Host microphone recording is restricted to local desktop sessions.",
         )
+    settings = load_settings()
+    mic_pref = str(settings.get("mic_device") or "auto")
     try:
-        device_name = _AUDIO_REC.start()
-        return {"status": "recording", "device": device_name}
+        device_name = _AUDIO_REC.start(device_pref=mic_pref)
+        return {
+            "status": "recording",
+            "device": device_name,
+            "sample_rate": _AUDIO_REC.capture_sample_rate,
+        }
     except Exception as exc:
+        log.error(f"Mic start error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -4034,13 +4244,46 @@ def audio_record_stop_endpoint(request: Request):
             status_code=403,
             detail="Host microphone recording is restricted to local desktop sessions.",
         )
+    capture_sr = int(_AUDIO_REC.capture_sample_rate or _AUDIO_REC.SAMPLE_RATE)
+    dev_name = _AUDIO_REC.device_name or "Default Microphone"
     samples, duration_sec = _AUDIO_REC.stop_and_extract()
+    import numpy as np
+
+    if samples.size > 0:
+        centered = samples - float(np.median(samples))
+        peak = round(float(np.max(np.abs(centered))), 5)
+        rms = round(float(np.sqrt(np.mean(centered * centered))), 5)
+    else:
+        peak, rms = 0.0, 0.0
+
     if duration_sec <= 0.05:
-        return {"text": "", "duration_sec": duration_sec, "engine": "moonshine-base-onnx"}
+        log.info(f"Mic stop: device={dev_name!r} too short ({duration_sec}s)")
+        return {
+            "text": "",
+            "duration_sec": duration_sec,
+            "device": dev_name,
+            "sample_rate": capture_sr,
+            "peak": peak,
+            "rms": rms,
+            "engine": "moonshine-base-onnx",
+        }
     try:
-        text = _get_stt_engine().transcribe_float32(samples, sample_rate=_AUDIO_REC.SAMPLE_RATE)
-        return {"text": text, "duration_sec": duration_sec, "engine": "moonshine-base-onnx"}
+        text = _get_stt_engine().transcribe_float32(samples, sample_rate=capture_sr)
+        log.info(
+            f"Mic stop: device={dev_name!r} sr={capture_sr}Hz dur={duration_sec}s "
+            f"peak={peak:.4f} rms={rms:.4f} chars={len(text)}"
+        )
+        return {
+            "text": text,
+            "duration_sec": duration_sec,
+            "device": dev_name,
+            "sample_rate": capture_sr,
+            "peak": peak,
+            "rms": rms,
+            "engine": "moonshine-base-onnx",
+        }
     except Exception as exc:
+        log.error(f"Speech transcription failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Speech transcription failed: {exc}") from exc
 
 
@@ -4383,30 +4626,37 @@ def _llm_web_query_rewriter(user_prompt: str) -> str:
     if llm is None or not hasattr(llm, "create_chat_completion"):
         return ""
     try:
+        is_qwen3 = bool(STATE.loaded_model and "qwen3" in STATE.loaded_model.lower())
+        sys_msg = (
+            "Decide whether the user's message requires looking up external public facts, news, weather, prices, or web pages on the internet. "
+            "Reply NONE for personal conversation, greetings, emotional venting, roleplay, device/app troubleshooting, or questions answerable without searching online. "
+            "Otherwise reply ONLY with a concise 2-7 word search query."
+        )
+        usr_msg = str(user_prompt or "")[:600]
+        if is_qwen3:
+            sys_msg += "\n/no_think"
+            usr_msg += "\n/no_think"
         resp = llm.create_chat_completion(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Convert the user's message into a short web search query (2-7 words). "
-                        "Reply ONLY with the search query, or reply NONE if no fresh external web lookup is needed."
-                    ),
-                },
-                {"role": "user", "content": str(user_prompt or "")[:600]},
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": usr_msg},
             ],
             temperature=0.0,
             top_p=0.9,
-            max_tokens=28,
+            max_tokens=48,
             stream=False,
         )
         raw = str(((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
         raw = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"[\r\n\"'`]+", " ", raw).strip()
-        if not raw or len(raw) > 120:
-            return ""
+        norm = re.sub(r"[\s.!?]+$", "", raw).upper()
+        if not raw or norm in ("NONE", "NO", "N/A", "NONE NEEDED", "NO SEARCH", "NO SEARCH NEEDED"):
+            return "NONE"
+        if len(raw) > 120:
+            return "NONE"
         return raw
     except Exception:
-        return ""
+        return "NONE"
 
 
 def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]:

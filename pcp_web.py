@@ -30,6 +30,21 @@ _CASUAL_NO_SEARCH_RE = re.compile(
 
 _WEB_COMMAND_RE = re.compile(r"^(?:/web|/search|search:|web:)\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
+_EXTERNAL_WEB_CUE_RE = re.compile(
+    r"(?:\b(?:search(?:\s+for|\s+the\s+web|\s+online)?|look\s+up|google\b|find\s+out|"
+    r"check\s+online|on\s+the\s+internet|latest|news|weather|forecast|stock\s+price|"
+    r"price\s+of|score\s+of|standings|schedule|release\s+date|version\s+history|"
+    r"what(?:'s|\s+is)\s+new|right\s+now|today(?:'s)?|this\s+week|current\s+|"
+    r"who\s+is|who\s+won|when\s+did|when\s+was|where\s+is|how\s+many|how\s+tall|"
+    r"population\s+of|definition\s+of|wikipedia)\b)",
+    re.IGNORECASE,
+)
+
+_PERSONAL_CONVO_RE = re.compile(
+    r"^(?:i|i'm|i’ve|i'd|im|we|you|you're|my|our|alright|well|okay|ok|sorry|please|hey|hi|lol|lmao|ugh)\b",
+    re.IGNORECASE,
+)
+
 
 class UnsafeURLError(ValueError):
     """Raised when a URL targets a disallowed scheme, loopback, or private network address."""
@@ -218,6 +233,30 @@ def extract_urls_from_text(text: str, limit: int = 2) -> List[str]:
         if len(found) >= limit:
             break
     return found
+
+
+def has_external_web_intent(user_text: str) -> bool:
+    """Return True only when user text asks for external/public/current info or an explicit web lookup."""
+    cleaned = re.sub(
+        r"\[Attached File:\s*([^\]]+)\][\s\S]*?(?:\[/Attached File\]|\Z)",
+        "",
+        str(user_text or ""),
+    )
+    cleaned = _URL_RE.sub("", cleaned).strip()
+    if not cleaned or _CASUAL_NO_SEARCH_RE.match(cleaned):
+        return False
+    if _WEB_COMMAND_RE.match(cleaned):
+        return True
+    if _EXTERNAL_WEB_CUE_RE.search(cleaned):
+        # Do not mistake emotional/self chatter like "today I feel tired" or "are you ok today" for a web query
+        if _PERSONAL_CONVO_RE.match(cleaned) and not re.search(
+            r"\b(?:search(?:\s+for|\s+online)?|look\s+up|google|wikipedia|weather|news|price\s+of|stock|score|release\s+date)\b",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+    return False
 
 
 def derive_heuristic_web_query(user_text: str) -> str:
@@ -428,10 +467,13 @@ def search_web(
     if prov == "tavily":
         return _search_tavily(clean_query, api_key=api_key, limit=max_results)
 
-    # Free zero-key auto chain: DuckDuckGo -> Wikipedia fallback
+    # Free zero-key auto chain: DuckDuckGo -> targeted Wikipedia fallback
     results = _search_ddg(clean_query, limit=max_results)
     if results:
         return results
+    words = clean_query.split()
+    if len(words) > 7:
+        return []
     return _search_wikipedia(clean_query, limit=min(3, max_results))
 
 
@@ -460,27 +502,40 @@ def gather_web_context(
         except Exception as exc:
             warnings.append(f"Could not read {url}: {exc}")
 
-    # Only search if no URL satisfied the prompt, or if user explicitly asked/triggered search
+    # Only search if no URL satisfied the prompt and mode permits search
     query = ""
-    if not pages_read:
+    if not pages_read and search_mode != "url_only":
         explicit_cmd = _WEB_COMMAND_RE.match(str(user_text or "").strip())
         if explicit_cmd:
             query = explicit_cmd.group(1).strip()[:160]
-        else:
-            rewriter_vetoed = False
+        elif search_mode == "always":
             if query_rewriter is not None:
                 try:
                     rewritten = str(query_rewriter(user_text) or "").strip()
-                    if rewritten.upper() == "NONE":
-                        rewriter_vetoed = True
-                    elif rewritten:
+                    if rewritten.upper().rstrip(".!") not in ("NONE", "NO", "N/A", "NONE NEEDED", ""):
                         query = rewritten[:160]
                 except Exception:
                     query = ""
-            if not query and not rewriter_vetoed:
+            if not query:
                 query = derive_heuristic_web_query(user_text)
-            if not query and search_mode == "always":
+            if not query:
                 query = re.sub(r"\s+", " ", str(user_text or "")).strip()[:160]
+        else:
+            # Smart mode: strictly require explicit external-web intent AND clean query
+            if has_external_web_intent(user_text):
+                rewriter_vetoed = False
+                if query_rewriter is not None:
+                    try:
+                        rewritten = str(query_rewriter(user_text) or "").strip()
+                        norm_veto = re.sub(r"[\s.!?\"'`]+$", "", rewritten).upper()
+                        if not rewritten or norm_veto in ("NONE", "NO", "N/A", "NONE NEEDED", "NO SEARCH", "NO SEARCH NEEDED"):
+                            rewriter_vetoed = True
+                        else:
+                            query = rewritten[:160]
+                    except Exception:
+                        rewriter_vetoed = True
+                if not query and not rewriter_vetoed and query_rewriter is None:
+                    query = derive_heuristic_web_query(user_text)
 
         if query:
             try:
