@@ -2179,6 +2179,174 @@ class GHostPCPTests(unittest.TestCase):
             self.assertTrue(ansi_line.endswith("\033[0m"))
         self.assertEqual(ghost_pcp._select_startup_banner(FakeCp1252Tty()), ghost_pcp.GHOST_BANNER)
 
+    def test_temporal_grounding_ingest_retrieval_and_prompt_anchor(self):
+        from datetime import datetime
+        import ghost_pcp
+        from pcp_retrieval import format_temporal_label
+
+        # 1. Ingestion preserves timestamps from ChatGPT (epoch), Claude (ISO), and Gemini HTML (Takeout)
+        chatgpt_export = [
+            {
+                "title": "Coffee Shop Memory",
+                "create_time": 1749093120,  # 2025-06-05 UTC
+                "mapping": {
+                    "root": {"id": "root", "parent": None, "children": ["n1"]},
+                    "n1": {
+                        "id": "n1",
+                        "parent": "root",
+                        "children": ["n2"],
+                        "message": {
+                            "author": {"role": "user"},
+                            "create_time": 1749093120,
+                            "content": {"content_type": "text", "parts": ["Remember our conversation about the cabin keys?"]},
+                        },
+                    },
+                    "n2": {
+                        "id": "n2",
+                        "parent": "n1",
+                        "children": [],
+                        "message": {
+                            "author": {"role": "assistant"},
+                            "create_time": 1749093140,
+                            "content": {"content_type": "text", "parts": ["Yes, under the third cedar step on the porch."]},
+                        },
+                    },
+                },
+            }
+        ]
+        claude_export = [
+            {
+                "uuid": "c1",
+                "chat_messages": [
+                    {
+                        "sender": "human",
+                        "created_at": "2026-11-20T18:30:00Z",
+                        "text": "Today I painted the kitchen bookshelf matte black.",
+                    },
+                    {
+                        "sender": "assistant",
+                        "created_at": "2026-11-20T18:31:00Z",
+                        "text": "Matte black frames the mug collection nicely.",
+                    },
+                ],
+            }
+        ]
+        gemini_html = """<!DOCTYPE html><html><body>
+        <div class="outer-cell">
+          <div class="header-cell">Gemini Apps</div>
+          <div class="content-cell">Prompted We adopted the stray orange tabby today.<br>Jul 4, 2025, 2:15:00 PM<br>That tabby picked you the second it stepped onto the porch.</div>
+        </div>
+        </body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "pcp_data"
+            summary = ingest_files(
+                [
+                    ("chatgpt.json", json.dumps(chatgpt_export).encode("utf-8")),
+                    ("claude.json", json.dumps(claude_export).encode("utf-8")),
+                    ("MyActivity.html", gemini_html.encode("utf-8")),
+                ],
+                output_dir=out_dir,
+            )
+            self.assertEqual(summary["interactions_kept"], 3)
+            vol_text = (out_dir / "ghost_pcp_01.md").read_text(encoding="utf-8")
+            self.assertIn("**USER [2025-06-", vol_text)
+            self.assertIn("**AI [2026-11-20", vol_text)
+            self.assertIn("**USER [2025-07-04 14:15:00]:**", vol_text)
+
+        # 2. Exact calendar arithmetic (catches year off-by-one bugs cleanly) + undated fallback
+        ref_now = datetime(2026, 11, 22, 12, 0, 0)
+        lbl_old, days_old = format_temporal_label(datetime(2025, 6, 5, 3, 12, 0), now=ref_now)
+        self.assertEqual(lbl_old, "1 year, 5 months ago · 2025-06-05")
+        self.assertGreater(days_old, 500)
+
+        lbl_yest, days_yest = format_temporal_label(datetime(2026, 11, 21, 9, 15, 0), now=ref_now)
+        self.assertEqual(lbl_yest, "Yesterday · 2026-11-21 09:15")
+        self.assertEqual(days_yest, 1)
+
+        lbl_today, days_today = format_temporal_label(datetime(2026, 11, 22, 10, 0, 0), now=ref_now)
+        self.assertIn("2 hours ago · Today 2026-11-22 10:00", lbl_today)
+        self.assertEqual(days_today, 0)
+
+        lbl_undated, days_undated = format_temporal_label(None, now=ref_now, kind="archive")
+        self.assertIn("exact date not recorded", lbl_undated)
+        self.assertIsNone(days_undated)
+
+        # 3. Date-aware recency ranking + long split chunk timestamp inheritance + prompt injection
+        class TopicEmbedder:
+            def encode(self, texts, normalize_embeddings=True, **kwargs):
+                vecs = []
+                for t in texts:
+                    tl = t.lower()
+                    v = np.array([
+                        1.0 if ("bookshelf" in tl or "general" in tl) else 0.0,
+                        1.0 if ("cabin" in tl or "cedar" in tl) else 0.0,
+                        0.5,
+                    ], dtype=np.float32)
+                    n = float(np.linalg.norm(v))
+                    vecs.append(v / max(n, 1e-6))
+                return np.vstack(vecs)
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            pdir = Path(tmp2) / "pcp_data"
+            pdir.mkdir()
+            long_tail = " ".join(["Detail sentence about cedar porch latch."] * 45)
+            (pdir / "ghost_pcp_01.md").write_text(
+                "# **ARCHIVE VOLUME 1**\n\n"
+                "**USER [2024-05-10 08:00:00]:** General update about bookshelf paint.\n\n"
+                "**AI [2024-05-10 08:00:05]:** Old bookshelf finish held up ok.\n\n"
+                "**USER:** Undated nostalgic memory.\n\n"
+                "**AI:** Completely timeless undated exchange.\n\n"
+                f"{SESSION_BOUNDARY}\n\n"
+                "## **[SESSION LOG: 2026-11-21 20:00:00]**\n\n"
+                "**USER [2026-11-21 20:00:00]:** General update about bookshelf paint.\n\n"
+                "**AI [2026-11-21 20:00:05]:** Recent bookshelf finish looks sleek.\n\n"
+                f"{SESSION_BOUNDARY}\n\n"
+                "## **[SESSION LOG: 2025-06-05 03:12:00]**\n\n"
+                "**USER [2025-06-05 03:12:00]:** Tell me about the cabin keys.\n\n"
+                f"**AI [2025-06-05 03:12:05]:** Hidden under the cedar step.\n\n{long_tail}\n",
+                encoding="utf-8",
+            )
+            idx = PCPIndex(pdir, cache_dir=pdir, model=TopicEmbedder())
+            self.assertTrue(idx.ready)
+
+            # Tied semantic topic ("bookshelf"): yesterday's session beats 2024 session cleanly
+            rec_hits = idx.search_detailed("bookshelf update", limit=2, now=ref_now)
+            self.assertIn("Recent bookshelf finish", rec_hits[0]["text"])
+            self.assertEqual(rec_hits[0]["temporal_label"], "Yesterday · 2026-11-21 20:00")
+
+            # Specific older query ("cabin"): older 2025 memory still wins on relevance and reports exact age
+            old_hits = idx.search_detailed("Where are the cabin keys?", limit=2, now=ref_now)
+            self.assertIn("cabin", old_hits[0]["text"].lower())
+            self.assertEqual(old_hits[0]["temporal_label"], "1 year, 5 months ago · 2025-06-05")
+
+            # Multi-chunk split continuation inherits 2025-06-05 without modifying raw chunk text
+            self.assertTrue(all(ts == datetime(2025, 6, 5, 3, 12, 5) for ts in idx._chunk_timestamps[-2:]))
+
+            formatted = idx.search_formatted("bookshelf update", limit=1, now=ref_now)
+            self.assertTrue(formatted[0].startswith("[Memory timing: Yesterday · 2026-11-21 20:00]\n"))
+
+            # Verify _prepare_pcp_messages injects Current local date + [Memory timing: ...] cleanly
+            orig_idx = ghost_pcp.PCP_INDEX
+            ghost_pcp.PCP_INDEX = idx
+            try:
+                with patch.object(ghost_pcp, "PCP_DATA_DIR", pdir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", Path(tmp2) / "settings.json"
+                ):
+                    req = ghost_pcp.ChatRequest(
+                        model="Qwen3-14B-Q5_K_M.gguf",
+                        messages=[ghost_pcp.Message(role="user", content="bookshelf update")],
+                        use_pcp=True,
+                    )
+                    prepared, _ = ghost_pcp._prepare_pcp_messages(req)
+            finally:
+                ghost_pcp.PCP_INDEX = orig_idx
+
+            sys_prompt = prepared[0]["content"]
+            self.assertIn("TEMPORAL ANCHOR:\nCurrent local date:", sys_prompt)
+            self.assertIn("ARCHIVE EXCERPTS:\n[Memory timing:", sys_prompt)
+            self.assertLess(sys_prompt.index("STRICT SOURCE-TRUTH RULES"), sys_prompt.index("TEMPORAL ANCHOR:"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5219,6 +5219,14 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
     else:
         raw_messages.insert(0, {"role": "system", "content": effective_sys})
 
+    # Inject date-only wall-clock anchor after static persona/rules to preserve intra-day KV prefix reuse
+    if "Current local date:" not in raw_messages[0]["content"]:
+        date_anchor = datetime.now().strftime("%Y-%m-%d (%A)")
+        raw_messages[0]["content"] = (
+            raw_messages[0]["content"].rstrip()
+            + f"\n\nTEMPORAL ANCHOR:\nCurrent local date: {date_anchor}"
+        )
+
     # Inject structured Core Facts & Relationships for the active/target persona
     facts_dir = (
         _resolve_persona_folder(target_persona["folder"])
@@ -5231,7 +5239,7 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
         if facts_block:
             raw_messages[0]["content"] = (
                 raw_messages[0]["content"].rstrip()
-                + "\n\nCORE FACTS & RELATIONSHIPS:\n"
+                + "\n\n"
                 + facts_block
             )
 
@@ -5243,7 +5251,10 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
         except Exception:
             can_search_index = False
     if can_search_index and PCP_INDEX is not None:
-        excerpts = PCP_INDEX.search(retrieval_query, limit=top_k)
+        if hasattr(PCP_INDEX, "search_formatted"):
+            excerpts = PCP_INDEX.search_formatted(retrieval_query, limit=top_k)
+        else:
+            excerpts = PCP_INDEX.search(retrieval_query, limit=top_k)
         if excerpts and "ARCHIVE EXCERPTS:" not in raw_messages[0]["content"]:
             archive_block = "\n\n---\n\n".join(excerpts)
             raw_messages[0]["content"] = raw_messages[0]["content"].rstrip() + "\n\nARCHIVE EXCERPTS:\n" + archive_block

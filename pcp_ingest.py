@@ -11,7 +11,7 @@ documents into clean, high-density Markdown volumes:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import html as html_lib
 from html.parser import HTMLParser
 import io
@@ -351,6 +351,114 @@ def extract_text_from_document(filename: str, raw_bytes: bytes) -> str:
     raise ValueError(f"Unsupported document format '{suffix}'. Supported: .pdf, .txt, .md, .csv, .log")
 
 
+_TIMESTAMP_FIELD_KEYS = (
+    "create_time",
+    "created_at",
+    "timestamp",
+    "time",
+    "date",
+    "sent_at",
+    "update_time",
+    "updated_at",
+)
+_TAKEOUT_TS_FORMATS = (
+    "%b %d, %Y, %I:%M:%S %p",
+    "%b %d, %Y, %I:%M %p",
+    "%b %d, %Y %I:%M:%S %p",
+    "%b %d, %Y %I:%M %p",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+)
+
+
+def _format_ingest_timestamp(raw: object) -> str:
+    """Normalize epoch seconds/ms, ISO-8601, or Takeout date strings to local 'YYYY-MM-DD HH:MM:SS'."""
+    if raw is None or isinstance(raw, bool):
+        return ""
+    if isinstance(raw, dict):
+        for key in ("$date", "$numberLong", "iso", "value", "seconds"):
+            if key in raw:
+                return _format_ingest_timestamp(raw.get(key))
+        return ""
+
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if not (val == val) or val <= 0:
+            return ""
+        if val > 1e14:
+            val /= 1e6
+        elif val > 1e11:
+            val /= 1000.0
+        if 946684800.0 <= val <= 4102444800.0:
+            try:
+                return datetime.fromtimestamp(val, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                return ""
+        return ""
+
+    txt = str(raw).strip()
+    if not txt:
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)?", txt):
+        try:
+            return _format_ingest_timestamp(float(txt))
+        except ValueError:
+            return ""
+
+    iso_candidate = txt[:-1] + "+00:00" if txt.endswith("Z") else txt
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        if dt.year < 2000 or dt.year > 2100:
+            return ""
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+    cleaned = re.sub(
+        r"\s+(?!(?:AM|PM)$)[A-Z]{2,5}(?:[+-]\d{1,2}(?::?\d{2})?)?$",
+        "",
+        txt.replace("\u202f", " ").replace("\xa0", " "),
+    ).strip()
+    for fmt in _TAKEOUT_TS_FORMATS:
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            if dt.year < 2000 or dt.year > 2100:
+                return ""
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return ""
+
+
+def _extract_raw_timestamp(*objs: object) -> object:
+    """Return the first non-empty timestamp-like field found across dicts."""
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for key in _TIMESTAMP_FIELD_KEYS:
+            val = obj.get(key)
+            if val not in (None, "", 0, 0.0):
+                return val
+    return None
+
+
+def _extract_role_text_and_time(msg_obj: dict, fallback_ts: object = None) -> Tuple[str, str, str]:
+    """Return (role, text, normalized_timestamp) from a message node or flat dict."""
+    role, text = _extract_text_from_message(msg_obj)
+    if not text or not isinstance(msg_obj, dict):
+        return role, text, ""
+    inner = msg_obj.get("message") if isinstance(msg_obj.get("message"), dict) else (
+        msg_obj.get("response") if isinstance(msg_obj.get("response"), dict) else msg_obj
+    )
+    raw_ts = _extract_raw_timestamp(inner, msg_obj)
+    if raw_ts is None:
+        raw_ts = fallback_ts
+    return role, text, _format_ingest_timestamp(raw_ts)
+
+
 def _extract_text_from_message(msg_obj: dict) -> Tuple[str, str]:
     """Return (role, text) from a ChatGPT/AI Studio mapping message or flat message dict."""
     if not isinstance(msg_obj, dict):
@@ -517,7 +625,8 @@ def _extract_gemini_entries_from_data(data: object) -> List[Tuple[str, str, str]
         elif title.strip().rstrip(":") == "Prompted":
             user_text = ""
 
-        ts = str(entry.get("time") or entry.get("date") or "").strip()
+        raw_ts = str(entry.get("time") or entry.get("date") or "").strip()
+        ts = _format_ingest_timestamp(raw_ts) or raw_ts
 
         ai_parts: List[str] = []
         safe_items = entry.get("safeHtmlItem")
@@ -669,15 +778,15 @@ class _TakeoutHTMLCardsParser(HTMLParser):
             self._body_buf.append(text)
 
 
-def extract_gemini_html_pairs(raw_html: str) -> List[Tuple[str, str]]:
-    """Extract (user_text, ai_markdown) pairs from a Google Takeout MyActivity.html file."""
+def _extract_gemini_html_entries(raw_html: str) -> List[Tuple[str, str, str]]:
+    """Extract (user_text, ai_markdown, normalized_ts) entries from Google Takeout MyActivity.html."""
     if not is_gemini_takeout_html(raw_html):
         return []
     parser = _TakeoutHTMLCardsParser()
     parser.feed(raw_html)
     parser.close()
 
-    pairs: List[Tuple[str, str]] = []
+    entries: List[Tuple[str, str, str]] = []
     ts_re = re.compile(
         r"^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?(?:\s+[A-Z]{2,5})?$"
     )
@@ -701,14 +810,22 @@ def extract_gemini_html_pairs(raw_html: str) -> List[Tuple[str, str]]:
             continue
         user_text = first[len("Prompted"):].lstrip(":").strip()
         rest = lines[1:]
+        raw_ts = ""
         while rest and (not rest[0] or ts_re.match(rest[0])):
+            if rest[0] and not raw_ts and ts_re.match(rest[0]):
+                raw_ts = rest[0]
             rest.pop(0)
         ai_text = "\n".join(rest).strip()
         if not user_text and ai_text:
             user_text = "[Attachment / non-text prompt]"
         if user_text and ai_text:
-            pairs.append((user_text, ai_text))
-    return pairs
+            entries.append((user_text, ai_text, _format_ingest_timestamp(raw_ts)))
+    return entries
+
+
+def extract_gemini_html_pairs(raw_html: str) -> List[Tuple[str, str]]:
+    """Extract (user_text, ai_markdown) pairs from a Google Takeout MyActivity.html file."""
+    return [(u, a) for u, a, _ in _extract_gemini_html_entries(raw_html)]
 
 
 def detect_json_source(data: object) -> str:
@@ -751,9 +868,9 @@ def detect_json_source(data: object) -> str:
     return "unknown"
 
 
-def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
-    """Extract (user_text, assistant_text) pairs from ChatGPT, Claude, Grok, Character.AI, or generic JSON."""
-    pairs: List[Tuple[str, str]] = []
+def _extract_chatgpt_or_generic_entries(data: object) -> List[Tuple[str, str, str]]:
+    """Extract (user_text, assistant_text, normalized_ts) tuples across JSON export schemas."""
+    entries: List[Tuple[str, str, str]] = []
     if isinstance(data, dict) and isinstance(data.get("conversations"), list) and "mapping" not in data:
         items = data["conversations"]
     elif isinstance(data, dict) and isinstance(data.get("histories"), list):
@@ -771,6 +888,7 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
     ):
         user_bucket: List[str] = []
         ai_bucket: List[str] = []
+        turn_ts = ""
         for entry in items:
             if not isinstance(entry, dict):
                 continue
@@ -778,30 +896,37 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
                 u = str(entry.get("instruction") or "").strip()
                 a = str(entry.get("response") or "").strip()
                 if u and a:
-                    pairs.append((u, a))
+                    ts = _format_ingest_timestamp(_extract_raw_timestamp(entry))
+                    entries.append((u, a, ts))
                 continue
-            role, text = _extract_text_from_message(entry)
+            role, text, msg_ts = _extract_role_text_and_time(entry)
             if not text:
                 continue
             if role == "user":
                 if user_bucket and ai_bucket:
-                    pairs.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip()))
+                    entries.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip(), turn_ts))
                     user_bucket.clear()
                     ai_bucket.clear()
+                    turn_ts = ""
                 user_bucket.append(text)
+                if msg_ts and not turn_ts:
+                    turn_ts = msg_ts
             elif role in ("assistant", "model", "bot"):
                 if user_bucket:
                     ai_bucket.append(text)
+                    if msg_ts and not turn_ts:
+                        turn_ts = msg_ts
         if user_bucket and ai_bucket:
-            pairs.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip()))
-        if pairs:
-            return pairs
+            entries.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip(), turn_ts))
+        if entries:
+            return entries
 
     # Case 2: Nested conversation objects (ChatGPT mapping, Claude chat_messages, Grok responses, Character.AI msgs)
     for entry in items:
         if not isinstance(entry, dict):
             continue
 
+        conv_raw_ts = _extract_raw_timestamp(entry.get("conversation") if isinstance(entry.get("conversation"), dict) else None, entry)
         mapping = entry.get("mapping")
         if isinstance(mapping, dict):
             msg_nodes = _ordered_nodes_from_mapping(mapping)
@@ -834,47 +959,66 @@ def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
 
         user_bucket = []
         ai_bucket = []
+        turn_ts = ""
+        conv_ts = _format_ingest_timestamp(conv_raw_ts)
         for node in msg_nodes:
-            role, text = _extract_text_from_message(node)
+            role, text, msg_ts = _extract_role_text_and_time(node, fallback_ts=conv_raw_ts)
             if not text:
                 continue
+            effective_ts = msg_ts or conv_ts
             if role == "user":
                 if user_bucket and ai_bucket:
-                    pairs.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip()))
+                    entries.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip(), turn_ts or conv_ts))
                     user_bucket.clear()
                     ai_bucket.clear()
+                    turn_ts = ""
                 user_bucket.append(text)
+                if effective_ts and not turn_ts:
+                    turn_ts = effective_ts
             elif role in ("assistant", "model", "bot"):
                 if user_bucket:
                     ai_bucket.append(text)
+                    if effective_ts and not turn_ts:
+                        turn_ts = effective_ts
         if user_bucket and ai_bucket:
-            pairs.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip()))
+            entries.append(("\n".join(user_bucket).strip(), "\n".join(ai_bucket).strip(), turn_ts or conv_ts))
 
-    return pairs
+    return entries
 
 
-def extract_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str]], str]:
-    """Detect source provider and return (pairs, source)."""
+def _extract_chatgpt_or_generic_pairs(data: object) -> List[Tuple[str, str]]:
+    """Extract (user_text, assistant_text) pairs from ChatGPT, Claude, Grok, Character.AI, or generic JSON."""
+    return [(u, a) for u, a, _ in _extract_chatgpt_or_generic_entries(data)]
+
+
+def _extract_timed_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str, str]], str]:
+    """Detect source provider and return ((user, ai, normalized_ts) entries, source)."""
     source = detect_json_source(data)
     if source == "google":
         gemini_entries = _extract_gemini_entries_from_data(data)
         if gemini_entries:
-            return [(u, a) for u, a, _ in gemini_entries], "google"
-        aistudio_pairs = _extract_chatgpt_or_generic_pairs(data)
-        if aistudio_pairs:
-            return aistudio_pairs, "google"
+            return [(u, a, _format_ingest_timestamp(ts)) for u, a, ts in gemini_entries], "google"
+        aistudio_entries = _extract_chatgpt_or_generic_entries(data)
+        if aistudio_entries:
+            return aistudio_entries, "google"
         return [], "google"
 
-    pairs = _extract_chatgpt_or_generic_pairs(data)
-    if pairs:
+    timed_entries = _extract_chatgpt_or_generic_entries(data)
+    if timed_entries:
         if source in ("openai", "claude", "grok", "character_ai"):
-            return pairs, source
-        return pairs, "unknown"
+            return timed_entries, source
+        return timed_entries, "unknown"
 
     gemini_entries = _extract_gemini_entries_from_data(data)
     if gemini_entries:
-        return [(u, a) for u, a, _ in gemini_entries], "google"
+        return [(u, a, _format_ingest_timestamp(ts)) for u, a, ts in gemini_entries], "google"
     return [], source
+
+
+def extract_pairs_with_source(data: object) -> Tuple[List[Tuple[str, str]], str]:
+    """Detect source provider and return (pairs, source)."""
+    timed, source = _extract_timed_pairs_with_source(data)
+    return [(u, a) for u, a, _ in timed], source
 
 
 def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
@@ -883,20 +1027,21 @@ def extract_pairs_from_data(data: object) -> List[Tuple[str, str]]:
     return pairs
 
 
-def filter_pairs(
-    pairs: Sequence[Tuple[str, str]],
+def _filter_timed_entries(
+    entries: Sequence[Tuple[str, ...]],
     blocked_phrases: Optional[Sequence[str]] = None,
     protected_words: Optional[Sequence[str]] = None,
-) -> Tuple[List[Tuple[str, str]], int]:
-    """Filter out corporate boilerplate responses unless protected words appear."""
+) -> Tuple[List[Tuple[str, str, str]], int]:
+    """Filter corporate boilerplate from timed or untimed interaction entries."""
     blocked = [p.strip().lower() for p in (blocked_phrases if blocked_phrases is not None else DEFAULT_BLOCKED_PHRASES) if p and p.strip()]
     protected = [w.strip().lower() for w in (protected_words if protected_words is not None else DEFAULT_PROTECTED_WORDS) if w and w.strip()]
 
-    kept: List[Tuple[str, str]] = []
+    kept: List[Tuple[str, str, str]] = []
     stripped_count = 0
-    for user_text, ai_text in pairs:
-        u = user_text.strip()
-        a = ai_text.strip()
+    for item in entries:
+        u = str(item[0]).strip()
+        a = str(item[1]).strip()
+        ts = str(item[2]).strip() if len(item) >= 3 and item[2] else ""
         if not u or not a:
             continue
         ai_lower = a.lower()
@@ -905,8 +1050,22 @@ def filter_pairs(
         if is_blocked and not is_protected:
             stripped_count += 1
             continue
-        kept.append((u, a))
+        kept.append((u, a, ts))
     return kept, stripped_count
+
+
+def filter_pairs(
+    pairs: Sequence[Tuple[str, str]],
+    blocked_phrases: Optional[Sequence[str]] = None,
+    protected_words: Optional[Sequence[str]] = None,
+) -> Tuple[List[Tuple[str, str]], int]:
+    """Filter out corporate boilerplate responses unless protected words appear."""
+    kept_timed, stripped_count = _filter_timed_entries(
+        pairs,
+        blocked_phrases=blocked_phrases,
+        protected_words=protected_words,
+    )
+    return [(u, a) for u, a, _ in kept_timed], stripped_count
 
 
 def _clean_text(text: str) -> str:
@@ -954,24 +1113,28 @@ def _backup_existing_volumes(output_dir: Path) -> Optional[Path]:
 
 
 def write_pcp_volumes(
-    pairs: Sequence[Tuple[str, str]],
+    pairs: Sequence[Tuple[str, ...]],
     output_dir: Path,
     interactions_per_volume: int = INTERACTIONS_PER_VOLUME,
     replace_existing: bool = False,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> List[Path]:
-    """Write interaction pairs into ghost_pcp_01.md, ghost_pcp_02.md, ... safely."""
+    """Write interaction pairs (optionally timestamped) into ghost_pcp_01.md, ghost_pcp_02.md, ... safely."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cleaned_pairs: List[Tuple[str, str]] = []
-    for u_raw, a_raw in pairs:
+    cleaned_entries: List[Tuple[str, str, str]] = []
+    for item in pairs:
+        u_raw = item[0]
+        a_raw = item[1]
+        ts_raw = item[2] if len(item) >= 3 else ""
         u_clean = _clean_text(u_raw)
         a_clean = _clean_text(a_raw)
+        ts_clean = _format_ingest_timestamp(ts_raw) if ts_raw else ""
         if u_clean and a_clean:
-            cleaned_pairs.append((u_clean, a_clean))
+            cleaned_entries.append((u_clean, a_clean, ts_clean))
 
-    total = len(cleaned_pairs)
+    total = len(cleaned_entries)
     if total == 0:
         raise ValueError("No valid conversation interactions were found in the uploaded file(s).")
     if interactions_per_volume <= 0:
@@ -990,12 +1153,17 @@ def write_pcp_volumes(
         vol_idx = start_vol_idx + offset
         filename = f"ghost_pcp_{vol_idx:02d}.md"
         out_path = output_dir / filename
-        batch = cleaned_pairs[start : start + interactions_per_volume]
+        batch = cleaned_entries[start : start + interactions_per_volume]
         lines = [f"# **ARCHIVE VOLUME {vol_idx}**", ""]
-        for u_clean, a_clean in batch:
-            lines.append(f"**USER:** {u_clean}")
-            lines.append("")
-            lines.append(f"**AI:** {a_clean}")
+        for u_clean, a_clean, ts_clean in batch:
+            if ts_clean:
+                lines.append(f"**USER [{ts_clean}]:** {u_clean}")
+                lines.append("")
+                lines.append(f"**AI [{ts_clean}]:** {a_clean}")
+            else:
+                lines.append(f"**USER:** {u_clean}")
+                lines.append("")
+                lines.append(f"**AI:** {a_clean}")
             lines.append("")
         with out_path.open("x", encoding="utf-8") as output:
             output.write("\n".join(lines))
@@ -1280,12 +1448,12 @@ def ingest_files(
     if progress_callback:
         progress_callback("Inspecting archive files...", 0.05)
 
-    all_pairs: List[Tuple[str, str]] = []
+    all_pairs: List[Tuple[str, str, str]] = []
     md_payloads: List[Tuple[str, bytes]] = []
     detected_sources: Set[str] = set()
 
     def _consume_json_data(label: str, data_obj: object) -> None:
-        pairs, src = extract_pairs_with_source(data_obj)
+        pairs, src = _extract_timed_pairs_with_source(data_obj)
         if pairs:
             if src in _SOURCE_META:
                 detected_sources.add(src)
@@ -1329,10 +1497,10 @@ def ingest_files(
                     if progress_callback:
                         progress_callback(f"Parsing {Path(hm).name}...", 0.15)
                     html_text = zf.read(hm).decode("utf-8-sig", errors="replace")
-                    html_pairs = extract_gemini_html_pairs(html_text)
-                    if html_pairs:
+                    html_entries = _extract_gemini_html_entries(html_text)
+                    if html_entries:
                         detected_sources.add("google")
-                        all_pairs.extend(html_pairs)
+                        all_pairs.extend(html_entries)
 
                 for jlm in jsonl_members:
                     if progress_callback:
@@ -1384,10 +1552,10 @@ def ingest_files(
             if is_gemini_takeout_html(html_text):
                 if progress_callback:
                     progress_callback(f"Parsing Google Takeout HTML {safe_name}...", 0.15)
-                html_pairs = extract_gemini_html_pairs(html_text)
-                if html_pairs:
+                html_entries = _extract_gemini_html_entries(html_text)
+                if html_entries:
                     detected_sources.add("google")
-                    all_pairs.extend(html_pairs)
+                    all_pairs.extend(html_entries)
         elif lower_name.endswith(".md"):
             md_payloads.append((safe_name, raw_bytes))
         elif Path(lower_name).suffix in (".txt", ".pdf"):
@@ -1410,21 +1578,27 @@ def ingest_files(
         }
         return summary
 
-    # Deduplicate identical interaction pairs within the imported batch while preserving order
-    deduped_pairs: List[Tuple[str, str]] = []
-    seen_pairs: Set[Tuple[str, str]] = set()
-    for u, a in all_pairs:
+    # Deduplicate identical interaction pairs while preserving valid timestamps
+    deduped_entries: List[Tuple[str, str, str]] = []
+    seen_index: Dict[Tuple[str, str], int] = {}
+    for u, a, ts in all_pairs:
         key = (u.strip(), a.strip())
-        if key[0] and key[1] and key not in seen_pairs:
-            seen_pairs.add(key)
-            deduped_pairs.append((u, a))
-    duplicates_skipped = len(all_pairs) - len(deduped_pairs)
-    all_pairs = deduped_pairs
+        if not key[0] or not key[1]:
+            continue
+        existing_idx = seen_index.get(key)
+        if existing_idx is None:
+            seen_index[key] = len(deduped_entries)
+            deduped_entries.append((u, a, ts))
+        elif ts and not deduped_entries[existing_idx][2]:
+            u0, a0, _ = deduped_entries[existing_idx]
+            deduped_entries[existing_idx] = (u0, a0, ts)
+    duplicates_skipped = len(all_pairs) - len(deduped_entries)
+    all_pairs = deduped_entries
 
     if progress_callback:
         progress_callback("Filtering corporate refusals and boilerplate...", 0.22)
 
-    kept_pairs, stripped_count = filter_pairs(
+    kept_pairs, stripped_count = _filter_timed_entries(
         all_pairs,
         blocked_phrases=blocked_phrases,
         protected_words=protected_words,

@@ -361,6 +361,107 @@ def _extract_message_plain_text(content: object) -> str:
     return str(content or "").strip()
 
 
+_SESSION_TS_RE = re.compile(r"\[SESSION LOG:\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)\]")
+_DOC_TS_RE = re.compile(r"#\s+\*\*DOCUMENT:[^\n]*?\[(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)\]\*\*")
+_TURN_TS_RE = re.compile(
+    r"\*\*(?:USER|AI|User|Assistant|CONTINUITY NOTE)\s+\[(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)\]:\*\*"
+)
+_CONV_TS_RE = re.compile(
+    r"#{1,6}\s+(?:CONVERSATION|NOTE)[^\n]*\[(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)\]"
+)
+_DOC_CHUNK_RE = re.compile(r"^\[Document:\s*(.+?)\s*\|\s*Passage\s+\d+\s+of\s+\d+\s+\([^)]+\)\]")
+_NEW_UNDATED_SECTION_RE = re.compile(
+    r"^\s*(?:#\s+\*\*ARCHIVE VOLUME|#{1,6}\s+(?:CONVERSATION|NOTE)|\*\*USER(?:\s+\[[^\]]+\])?:\*\*|\[Document:)"
+)
+
+
+def _parse_canonical_ts(raw: str) -> Optional[datetime]:
+    txt = str(raw or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_chunk_timestamp(chunk: str) -> Optional[datetime]:
+    """Extract the most recent explicit conversation/session/document timestamp from a chunk."""
+    text = str(chunk or "")
+    for pattern in (_TURN_TS_RE, _SESSION_TS_RE, _CONV_TS_RE, _DOC_TS_RE):
+        matches = pattern.findall(text)
+        for cand in reversed(matches):
+            parsed = _parse_canonical_ts(cand)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _build_chunk_timestamps(chunks: Sequence[str]) -> List[Optional[datetime]]:
+    """Compute per-chunk timestamps in memory, inheriting across direct split continuations."""
+    out: List[Optional[datetime]] = []
+    for idx, chunk in enumerate(chunks):
+        dt = _extract_chunk_timestamp(chunk)
+        if dt is None and idx > 0 and out[idx - 1] is not None:
+            cur_doc = _DOC_CHUNK_RE.match(chunk)
+            prev_doc = _DOC_CHUNK_RE.match(chunks[idx - 1])
+            if cur_doc and prev_doc and cur_doc.group(1) == prev_doc.group(1):
+                dt = out[idx - 1]
+            elif not _NEW_UNDATED_SECTION_RE.match(chunk):
+                probe = chunk.lstrip()[:40].strip()
+                if len(probe) >= 24 and probe in chunks[idx - 1][-260:]:
+                    dt = out[idx - 1]
+        out.append(dt)
+    return out
+
+
+def format_temporal_label(
+    dt: Optional[datetime],
+    now: Optional[datetime] = None,
+    kind: str = "archive",
+) -> Tuple[str, Optional[int]]:
+    """Return a human-readable relative age label plus age in calendar days."""
+    if dt is None:
+        if kind == "document":
+            return "Uploaded document — exact date not recorded", None
+        return "Historical archive — exact date not recorded", None
+
+    ref = now or datetime.now()
+    delta_secs = (ref - dt).total_seconds()
+    cal_days = (ref.date() - dt.date()).days
+    if delta_secs < -300 or cal_days < 0:
+        return f"Recorded {dt.strftime('%Y-%m-%d %H:%M')}", 0
+    if cal_days == 0:
+        if delta_secs < 3600:
+            mins = max(1, int(delta_secs // 60))
+            unit = "minute" if mins == 1 else "minutes"
+            return f"{mins} {unit} ago · Today {dt.strftime('%Y-%m-%d %H:%M')}", 0
+        hours = max(1, int(delta_secs // 3600))
+        unit = "hour" if hours == 1 else "hours"
+        return f"{hours} {unit} ago · Today {dt.strftime('%Y-%m-%d %H:%M')}", 0
+    if cal_days == 1:
+        return f"Yesterday · {dt.strftime('%Y-%m-%d %H:%M')}", 1
+    if cal_days < 14:
+        return f"{cal_days} days ago · {dt.strftime('%Y-%m-%d')}", cal_days
+    if cal_days < 45:
+        weeks = max(2, round(cal_days / 7))
+        return f"{weeks} weeks ago · {dt.strftime('%Y-%m-%d')}", cal_days
+
+    months = (ref.year - dt.year) * 12 + (ref.month - dt.month) - (1 if ref.day < dt.day else 0)
+    if cal_days < 365:
+        months = max(1, min(11, months))
+        unit = "month" if months == 1 else "months"
+        return f"{months} {unit} ago · {dt.strftime('%Y-%m-%d')}", cal_days
+
+    total_months = max(12, months)
+    years, rem_months = divmod(total_months, 12)
+    y_unit = "year" if years == 1 else "years"
+    if rem_months == 0:
+        return f"{years} {y_unit} ago · {dt.strftime('%Y-%m-%d')}", cal_days
+    m_unit = "month" if rem_months == 1 else "months"
+    return f"{years} {y_unit}, {rem_months} {m_unit} ago · {dt.strftime('%Y-%m-%d')}", cal_days
+
+
 class PCPIndex:
     """In-memory hybrid (BGE semantic + BM25 lexical) index backed by cached embeddings.npz."""
 
@@ -378,6 +479,7 @@ class PCPIndex:
         self.model_dir = model_dir
         self._model = model
         self.chunks: List[str] = []
+        self._chunk_timestamps: List[Optional[datetime]] = []
         self.vectors: Optional[np.ndarray] = None
         self.file_count: int = 0
         self.fingerprint: str = ""
@@ -479,6 +581,7 @@ class PCPIndex:
         files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
         if not files:
             self.chunks = []
+            self._chunk_timestamps = []
             self.vectors = None
             self.file_count = 0
             self.fingerprint = ""
@@ -486,6 +589,7 @@ class PCPIndex:
             return False
 
         self.chunks, self.fingerprint, self.file_count = load_pcp_chunks(self.data_dir)
+        self._chunk_timestamps = _build_chunk_timestamps(self.chunks)
         self._invalidate_lexical_index()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_path = self.cache_dir / "embeddings.npz"
@@ -690,6 +794,7 @@ class PCPIndex:
             self.chunks.extend(new_chunks)
             self.vectors = np.vstack([self.vectors, new_vecs]).astype(np.float32, copy=False)
 
+        self._chunk_timestamps = _build_chunk_timestamps(self.chunks)
         all_files = sorted(self.data_dir.glob("ghost_pcp_*.md"))
         self.file_count = len(all_files)
         self.fingerprint = _compute_files_fingerprint(all_files)
@@ -763,10 +868,16 @@ class PCPIndex:
         result["filename"] = safe_name
         return result
 
-    def search_detailed(self, query: str, limit: int = 4) -> List[Dict[str, object]]:
-        """Return top-k matching archive passages using hybrid semantic (BGE) + lexical (BM25) ranking."""
+    def search_detailed(
+        self,
+        query: str,
+        limit: int = 4,
+        now: Optional[datetime] = None,
+    ) -> List[Dict[str, object]]:
+        """Return top-k matching archive passages using hybrid BGE + BM25 + temporal grounding."""
         if not self.ready or self.vectors is None:
             return []
+        ref = now or datetime.now()
         model = self._get_model()
         prompted = "Represent this sentence for searching relevant passages: " + query
         q_vec = model.encode([prompted], normalize_embeddings=True)[0]
@@ -778,21 +889,38 @@ class PCPIndex:
         scores = raw_scores + np.float32(0.14) * bm25_norm
 
         n_total = len(self.chunks)
-        # Exported archive volumes place newest conversations first (index 0) and oldest last;
-        # apply a gentle chronological prior so recent persona chapters break close ties.
-        scores += np.linspace(0.035, 0.0, n_total, dtype=np.float32)
+        if len(self._chunk_timestamps) != n_total:
+            self._chunk_timestamps = _build_chunk_timestamps(self.chunks)
+        chunk_ts = self._chunk_timestamps
+        any_dated = any(t is not None for t in chunk_ts)
 
-        # Prioritize uploaded documents (# **DOCUMENT: / [Document:) and recent saved sessions in the tail
-        # when their semantic similarity actually clears a relevance threshold.
+        if not any_dated:
+            # Exported undated volumes place newest conversations first (index 0) and oldest last;
+            # apply a gentle chronological prior when no inline timestamps exist.
+            scores += np.linspace(0.035, 0.0, n_total, dtype=np.float32)
+
         tail_window = min(n_total, 2000)
         tail_start = n_total - tail_window
-        for idx in range(n_total - 1, tail_start - 1, -1):
+        for idx in range(n_total):
             chunk = self.chunks[idx]
-            if ("[Document:" in chunk or "# **DOCUMENT:" in chunk) and raw_scores[idx] >= 0.55:
-                scores[idx] += np.float32(0.075)
-            elif "[SESSION LOG:" in chunk and raw_scores[idx] >= 0.58:
-                recency_rank = (idx - tail_start + 1) / max(1, tail_window)
-                scores[idx] += np.float32(0.05 * max(0.25, recency_rank))
+            dt = chunk_ts[idx]
+            if dt is not None and raw_scores[idx] >= 0.45:
+                age_days = max(0, (ref.date() - dt.date()).days)
+                if age_days <= 1:
+                    scores[idx] += np.float32(0.075)
+                elif age_days <= 14:
+                    scores[idx] += np.float32(0.05)
+                elif age_days <= 45:
+                    scores[idx] += np.float32(0.03)
+                elif age_days <= 180:
+                    scores[idx] += np.float32(0.015)
+
+            if idx >= tail_start:
+                if ("[Document:" in chunk or "# **DOCUMENT:" in chunk) and raw_scores[idx] >= 0.55:
+                    scores[idx] += np.float32(0.075)
+                elif dt is None and "[SESSION LOG:" in chunk and raw_scores[idx] >= 0.58:
+                    recency_rank = (idx - tail_start + 1) / max(1, tail_window)
+                    scores[idx] += np.float32(0.05 * max(0.25, recency_rank))
 
         k = max(1, int(limit))
         best_indices = [int(i) for i in np.argsort(-scores)[:k]]
@@ -802,15 +930,32 @@ class PCPIndex:
             kind = "document" if ("[Document:" in text or "# **DOCUMENT:" in text) else (
                 "session" if "[SESSION LOG:" in text else "archive"
             )
+            dt = chunk_ts[i]
+            temporal_label, age_days = format_temporal_label(dt, now=ref, kind=kind)
             out.append({
                 "index": i,
                 "score": round(float(scores[i]), 4),
                 "semantic": round(float(raw_scores[i]), 4),
                 "lexical": round(float(bm25_norm[i]), 4),
                 "kind": kind,
+                "timestamp": dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else None,
+                "temporal_label": temporal_label,
+                "age_days": age_days,
                 "text": text,
             })
         return out
+
+    def search_formatted(
+        self,
+        query: str,
+        limit: int = 4,
+        now: Optional[datetime] = None,
+    ) -> List[str]:
+        """Return top-k matching archive excerpts prefixed with deterministic temporal context tags."""
+        return [
+            f"[Memory timing: {item['temporal_label']}]\n{item['text']}"
+            for item in self.search_detailed(query, limit=limit, now=now)
+        ]
 
     def search(self, query: str, limit: int = 4) -> List[str]:
         """Return top-k matching archive excerpts, prioritizing newer timestamped sessions."""
