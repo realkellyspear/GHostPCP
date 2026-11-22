@@ -522,31 +522,34 @@ class GHostPCPTests(unittest.TestCase):
             )
             self.assertEqual(auth.status_code, 200)
 
-            # Test Piper TTS Read-Aloud voices list and synthesis (if local .onnx voice models are installed)
-            voices_res = client.get("/v1/tts/voices")
-            self.assertEqual(voices_res.status_code, 200)
-            voice_ids = [v["id"] for v in voices_res.json().get("voices", [])]
-            self.assertIn("silas", voice_ids)
-            self.assertIn("kara", voice_ids)
+            # Test Piper TTS Read-Aloud voices list and synthesis (isolated from local user settings)
+            with tempfile.TemporaryDirectory() as tts_tmp, patch.object(
+                ghost_pcp, "SETTINGS_PATH", Path(tts_tmp) / "settings.json"
+            ):
+                voices_res = client.get("/v1/tts/voices")
+                self.assertEqual(voices_res.status_code, 200)
+                voice_ids = [v["id"] for v in voices_res.json().get("voices", [])]
+                self.assertIn("silas", voice_ids)
+                self.assertIn("kara", voice_ids)
 
-            if (ghost_pcp.PIPER_MODEL_DIR / "silas.onnx").is_file():
-                tts_silas = client.post(
-                    "/v1/tts",
-                    json={"text": "Hey. *You're here.* **That's enough for now.**", "voice": "silas", "play_on_host": False},
-                )
-                self.assertEqual(tts_silas.status_code, 200)
-                self.assertEqual(tts_silas.headers["content-type"], "audio/wav")
-                self.assertTrue(tts_silas.content.startswith(b"RIFF"))
-                self.assertGreater(len(tts_silas.content), 10000)
+                if (ghost_pcp.PIPER_MODEL_DIR / "silas.onnx").is_file():
+                    tts_silas = client.post(
+                        "/v1/tts",
+                        json={"text": "Hey. *You're here.* **That's enough for now.**", "voice": "silas", "play_on_host": False},
+                    )
+                    self.assertEqual(tts_silas.status_code, 200)
+                    self.assertEqual(tts_silas.headers["content-type"], "audio/wav")
+                    self.assertTrue(tts_silas.content.startswith(b"RIFF"))
+                    self.assertGreater(len(tts_silas.content), 10000)
 
-            if (ghost_pcp.PIPER_MODEL_DIR / "kara.onnx").is_file():
-                tts_kara = client.post(
-                    "/v1/tts",
-                    json={"text": "Testing Kara voice output.", "voice": "kara", "play_on_host": False},
-                )
-                self.assertEqual(tts_kara.status_code, 200)
-                self.assertTrue(tts_kara.content.startswith(b"RIFF"))
-                self.assertGreater(len(tts_kara.content), 10000)
+                if (ghost_pcp.PIPER_MODEL_DIR / "kara.onnx").is_file():
+                    tts_kara = client.post(
+                        "/v1/tts",
+                        json={"text": "Testing Kara voice output.", "voice": "kara", "play_on_host": False},
+                    )
+                    self.assertEqual(tts_kara.status_code, 200)
+                    self.assertTrue(tts_kara.content.startswith(b"RIFF"))
+                    self.assertGreater(len(tts_kara.content), 10000)
 
     def test_release_staging_includes_corresponding_source(self):
         import package_release
@@ -2150,6 +2153,31 @@ class GHostPCPTests(unittest.TestCase):
             decoded, sr = sf.read(io.BytesIO(t_res.content), dtype="float32")
             self.assertEqual(sr, 24000)
             self.assertGreater(len(decoded), len(tone) * 2)
+
+    def test_startup_banner_ansi_and_ascii_fallback(self):
+        import ghost_pcp
+
+        non_tty = io.StringIO()
+        self.assertEqual(ghost_pcp._select_startup_banner(non_tty), ghost_pcp.GHOST_BANNER)
+
+        class FakeUtf8Tty(io.StringIO):
+            encoding = "utf-8"
+
+            def isatty(self):
+                return True
+
+        class FakeCp1252Tty(io.StringIO):
+            encoding = "cp1252"
+
+            def isatty(self):
+                return True
+
+        ansi_banner = ghost_pcp._select_startup_banner(FakeUtf8Tty())
+        self.assertEqual(ansi_banner, ghost_pcp.GHOST_ANSI_BANNER)
+        self.assertIn("▀", ansi_banner)
+        for ansi_line in [ln for ln in ansi_banner.splitlines() if "\033[" in ln]:
+            self.assertTrue(ansi_line.endswith("\033[0m"))
+        self.assertEqual(ghost_pcp._select_startup_banner(FakeCp1252Tty()), ghost_pcp.GHOST_BANNER)
 
 
 if __name__ == "__main__":
