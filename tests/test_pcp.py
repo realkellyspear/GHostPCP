@@ -487,7 +487,8 @@ class GHostPCPTests(unittest.TestCase):
 
             rem = client.get("/v1/remote/status")
             self.assertEqual(rem.status_code, 200)
-            self.assertIn("scanner_url", rem.json())
+            self.assertNotIn("scanner_url", rem.json())
+            self.assertIn("port", rem.json())
 
             qr = client.get("/v1/remote/qr.svg?target=lan")
             self.assertEqual(qr.status_code, 200)
@@ -2346,6 +2347,319 @@ class GHostPCPTests(unittest.TestCase):
             self.assertIn("TEMPORAL ANCHOR:\nCurrent local date:", sys_prompt)
             self.assertIn("ARCHIVE EXCERPTS:\n[Memory timing:", sys_prompt)
             self.assertLess(sys_prompt.index("STRICT SOURCE-TRUTH RULES"), sys_prompt.index("TEMPORAL ANCHOR:"))
+
+    def test_universal_preflight_ssm_swa_split_vram_credit_and_scan(self):
+        import ghost_pcp
+        from fastapi.testclient import TestClient
+        from gguf import GGUFWriter
+        import numpy as np
+
+        def write_tiny_gguf(path: Path, arch: str, layer_count: int, sliding_window: int = 0, ssm: bool = False):
+            w = GGUFWriter(str(path), arch)
+            w.add_block_count(layer_count)
+            w.add_embedding_length(512)
+            w.add_head_count(8)
+            w.add_head_count_kv(2)
+            w.add_key_length(64)
+            w.add_value_length(64)
+            w.add_file_type(2)  # F16/Q4 representative
+            if sliding_window > 0:
+                w.add_uint32(f"{arch}.attention.sliding_window", sliding_window)
+            if ssm:
+                w.add_uint32(f"{arch}.ssm.inner_size", 1024)
+                w.add_uint32(f"{arch}.ssm.state_size", 64)
+                w.add_uint32(f"{arch}.ssm.conv_kernel", 4)
+                w.add_uint32(f"{arch}.ssm.group_count", 8)
+            w.add_tensor("token_embd.weight", np.zeros((16, 16), dtype=np.float32))
+            w.add_tensor("output.weight", np.zeros((16, 16), dtype=np.float32))
+            for i in range(layer_count):
+                if ssm and i % 4 != 3:
+                    w.add_tensor(f"blk.{i}.ssm_in.weight", np.zeros((16, 16), dtype=np.float32))
+                else:
+                    w.add_tensor(f"blk.{i}.attn_k.weight", np.zeros((16, 16), dtype=np.float32))
+                    w.add_tensor(f"blk.{i}.attn_v.weight", np.zeros((16, 16), dtype=np.float32))
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_tensors_to_file()
+            w.close()
+
+        orig_llm = ghost_pcp.STATE.llm
+        orig_model = ghost_pcp.STATE.loaded_model
+        orig_vram = ghost_pcp.STATE.loaded_vram_bytes
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                mdir = Path(tmp) / "ghost_models"
+                mdir.mkdir()
+                write_tiny_gguf(mdir / "hybrid-ssm.gguf", "qwen35moe", 8, ssm=True)
+                write_tiny_gguf(mdir / "swa-model.gguf", "gpt-oss", 6, sliding_window=128)
+                write_tiny_gguf(mdir / "big-00001-of-00002.gguf", "qwen3", 4)
+                write_tiny_gguf(mdir / "big-00002-of-00002.gguf", "qwen3", 4)
+                (mdir / "not-a-model.gguf").write_text("renamed txt file", encoding="utf-8")
+
+                gpu_mock = [{"name": "Mock GPU 12G", "total_bytes": 12 * 1024**3, "free_bytes": 10 * 1024**3}]
+                with patch.object(ghost_pcp, "MODEL_DIR", mdir), patch.object(
+                    ghost_pcp, "BACKEND_NAME", "cuda"
+                ), patch.object(ghost_pcp, "_probe_gpu_devices", return_value=gpu_mock):
+                    scanned = {m["id"]: m for m in ghost_pcp.scan_models()}
+                    self.assertIn("big-00001-of-00002.gguf", scanned)
+                    self.assertNotIn("big-00002-of-00002.gguf", scanned)
+                    self.assertEqual(scanned["big-00001-of-00002.gguf"]["part_count"], 2)
+                    self.assertFalse(scanned["not-a-model.gguf"]["valid_gguf"])
+                    self.assertTrue(scanned["hybrid-ssm.gguf"]["valid_gguf"])
+
+                    ssm_plan = ghost_pcp.preflight_model("hybrid-ssm.gguf", 8192)
+                    self.assertEqual(ssm_plan["n_gpu_layers"], 8)
+                    self.assertEqual(ssm_plan["attention_layers"], 2)
+                    self.assertEqual(ssm_plan["ssm_layers"], 6)
+
+                    swa_plan = ghost_pcp.preflight_model("swa-model.gguf", 8192)
+                    self.assertEqual(swa_plan["n_gpu_layers"], 6)
+                    self.assertIn("swa_full_kv", swa_plan["kv_method"])
+
+                    split_plan = ghost_pcp.preflight_model("big-00001-of-00002.gguf", 4096)
+                    self.assertEqual(split_plan["part_count"], 2)
+                    self.assertEqual(split_plan["n_gpu_layers"], 4)
+
+                    # CHECK FIT credits resident VRAM via preflight_endpoint
+                    client = TestClient(ghost_pcp.app)
+                    headers = {"Authorization": f"Bearer {ghost_pcp.PAIRING_TOKEN}"} if ghost_pcp.PAIRING_TOKEN else {}
+                    low_vram_mock = [{"name": "Mock GPU 12G", "total_bytes": 12 * 1024**3, "free_bytes": 1 * 1024**3}]
+                    with patch.object(ghost_pcp, "_probe_gpu_devices", return_value=low_vram_mock):
+                        ghost_pcp.STATE.llm = object()
+                        ghost_pcp.STATE.loaded_model = "previous.gguf"
+                        ghost_pcp.STATE.loaded_vram_bytes = 9 * 1024**3
+                        resp = client.post("/v1/preflight", json={"model": "swa-model.gguf", "n_ctx": 8192}, headers=headers)
+                        self.assertEqual(resp.status_code, 200)
+                        data = resp.json()
+                        self.assertEqual(data["n_gpu_layers"], 6)
+                        self.assertTrue(any("Credited" in w for w in data["warnings"]))
+        finally:
+            ghost_pcp.STATE.llm = orig_llm
+            ghost_pcp.STATE.loaded_model = orig_model
+            ghost_pcp.STATE.loaded_vram_bytes = orig_vram
+
+    def test_load_model_automatic_oom_fallback_recovery(self):
+        import ghost_pcp
+
+        fake_llm = MagicMock()
+        orig_llm = ghost_pcp.STATE.llm
+        orig_model = ghost_pcp.STATE.loaded_model
+        orig_gpu = ghost_pcp.STATE.loaded_gpu_layers
+        orig_vram = ghost_pcp.STATE.loaded_vram_bytes
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                mdir = Path(tmp) / "ghost_models"
+                mdir.mkdir()
+                (mdir / "big.gguf").write_bytes(b"GGUF")
+                preflight_res = {
+                    "n_gpu_layers": 20,
+                    "total_layers": 20,
+                    "kv_type": int(ghost_pcp.llama_cpp.GGML_TYPE_Q8_0),
+                    "kv_cache_type": "Q8_0",
+                    "offload_kqv": True,
+                    "predicted_gpu_bytes": 9 * 1024**3,
+                    "mmproj_model": None,
+                    "vision_capable": False,
+                    "warnings": [],
+                }
+                calls = []
+
+                def llama_side_effect(**kwargs):
+                    calls.append((kwargs["n_gpu_layers"], kwargs["type_k"], kwargs["offload_kqv"]))
+                    if kwargs["n_gpu_layers"] > 10:
+                        raise RuntimeError("CUDA out of memory")
+                    return fake_llm
+
+                with patch.object(ghost_pcp, "MODEL_DIR", mdir), patch.object(
+                    ghost_pcp, "preflight_model", return_value=preflight_res
+                ), patch.object(ghost_pcp, "_measure_free_vram_bytes", side_effect=[10 * 1024**3, 3 * 1024**3]), patch.object(
+                    ghost_pcp, "Llama", side_effect=llama_side_effect
+                ):
+                    ghost_pcp.STATE.llm = None
+                    res = ghost_pcp.load_model("big.gguf", 8192)
+                    self.assertEqual(res["n_gpu_layers"], 10)
+                    self.assertEqual(ghost_pcp.STATE.loaded_gpu_layers, 10)
+                    self.assertGreaterEqual(len(calls), 2)
+                    self.assertTrue(any("Stepped down" in w for w in res["warnings"]))
+        finally:
+            ghost_pcp.STATE.llm = orig_llm
+            ghost_pcp.STATE.loaded_model = orig_model
+            ghost_pcp.STATE.loaded_gpu_layers = orig_gpu
+            ghost_pcp.STATE.loaded_vram_bytes = orig_vram
+
+    def test_harmony_channel_normalizer_across_chunk_boundaries(self):
+        import ghost_pcp
+
+        sample = (
+            "<|start|>assistant<|channel|>analysis<|message|>private thought"
+            "<|end|><|start|>assistant<|channel|>final<|message|>Final answer!<|return|>"
+        )
+        for width in range(1, len(sample) + 1):
+            norm = ghost_pcp._ChannelNormalizer()
+            gate_hide = ghost_pcp._ThinkGate(show_reasoning=False)
+            hidden_out = []
+            shown_out = []
+            for idx in range(0, len(sample), width):
+                chunk = norm.feed(sample[idx:idx + width])
+                if chunk:
+                    shown_out.append(chunk)
+                    hidden_out.append(gate_hide.feed(chunk))
+            tail = norm.flush()
+            if tail:
+                shown_out.append(tail)
+                hidden_out.append(gate_hide.feed(tail))
+            hidden_out.append(gate_hide.flush())
+            self.assertEqual("".join(shown_out), "<think>private thought</think>Final answer!")
+            self.assertEqual("".join(hidden_out), "Final answer!")
+
+        self.assertEqual(ghost_pcp._clean_text_for_speech(sample), "Final answer!")
+        self.assertEqual(
+            ghost_pcp._clean_text_for_speech("<thought>step</thought> [THINK]more[/THINK] Spoke."),
+            "Spoke.",
+        )
+
+    def test_physical_cores_disk_guard_auto_mount_overflow_and_telemetry(self):
+        import os
+        import ghost_pcp
+        from fastapi.testclient import TestClient
+
+        phys = ghost_pcp._detect_physical_cores()
+        self.assertGreaterEqual(phys, 1)
+        self.assertLessEqual(phys, os.cpu_count() or 64)
+
+        orig_idx = ghost_pcp.PCP_INDEX
+        orig_llm = ghost_pcp.STATE.llm
+        orig_vram = ghost_pcp.STATE.loaded_vram_bytes
+        orig_gpu = ghost_pcp.STATE.loaded_gpu_layers
+        orig_ctx = ghost_pcp.STATE.loaded_context_size
+        orig_sigs = set(ghost_pcp.STATE.auto_archived_signatures)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                mdir = base / "ghost_models"
+                mdir.mkdir()
+                (mdir / "alpha.gguf").write_bytes(b"GGUF")
+                (mdir / "beta.gguf").write_bytes(b"GGUF")
+                pdir = base / "pcp_data"
+                pdir.mkdir()
+                settings_file = base / "ghost_pcp_settings.json"
+                settings_file.write_text(json.dumps({"model": "alpha.gguf", "auto_mount_model": True}), encoding="utf-8")
+
+                # 1. Disk space guard rejects huge preset when free space is tiny
+                fake_usage = shutil._ntuple_diskusage(10 * 1024**3, 9 * 1024**3, 500 * 1024**2)
+                client = TestClient(ghost_pcp.app)
+                headers = {"Authorization": f"Bearer {ghost_pcp.PAIRING_TOKEN}"} if ghost_pcp.PAIRING_TOKEN else {}
+                with patch.object(ghost_pcp, "MODEL_DIR", mdir), patch.object(
+                    ghost_pcp.shutil, "disk_usage", return_value=fake_usage
+                ):
+                    dl_resp = client.post("/v1/models/download", json={"catalog_id": "qwen3-8b-q4km"}, headers=headers)
+                    self.assertEqual(dl_resp.status_code, 400)
+                    self.assertIn("Insufficient free disk space", dl_resp.json()["detail"])
+
+                # 2. Persona preferred_model wins over settings.model for auto-mount
+                with patch.object(ghost_pcp, "MODEL_DIR", mdir), patch.object(
+                    ghost_pcp, "SETTINGS_PATH", settings_file
+                ), patch.object(ghost_pcp, "PCP_DATA_DIR", pdir):
+                    ghost_pcp._save_persona_registry({
+                        "active_persona_id": "p1",
+                        "personas": [{
+                            "id": "p1",
+                            "name": "Max",
+                            "folder": ".",
+                            "preferred_model": "beta.gguf",
+                        }],
+                    })
+                    picked = ghost_pcp._pick_auto_mount_target()
+                    self.assertIsNotNone(picked)
+                    self.assertEqual(picked[0], "beta.gguf")
+
+                # 3. Overflow auto-archive saves evicted turns once and avoids duplicating on SAVE & CLEAR
+                appended_calls = []
+
+                class MockIdx:
+                    ready = True
+                    data_dir = pdir
+                    file_count = 1
+                    passage_count = 5
+
+                    def search_formatted(self, q, limit=4):
+                        return []
+
+                    def append_session(self, msgs, timestamp_str=None, continuity_note=None):
+                        appended_calls.append(list(msgs))
+                        return {
+                            "saved_to": "ghost_pcp_01.md",
+                            "timestamp": timestamp_str or "now",
+                            "turns_saved": len(msgs),
+                            "passages_added": len(msgs),
+                            "total_passages": 5 + len(appended_calls),
+                        }
+
+                ghost_pcp.PCP_INDEX = MockIdx()
+                ghost_pcp.STATE.auto_archived_signatures.clear()
+                long_turns = [
+                    ghost_pcp.Message(role="user" if i % 2 == 0 else "assistant", content=f"Turn {i} " + ("x" * 900))
+                    for i in range(10)
+                ]
+                with patch.object(ghost_pcp, "SETTINGS_PATH", settings_file), patch.object(
+                    ghost_pcp, "PCP_DATA_DIR", pdir
+                ):
+                    req = ghost_pcp.ChatRequest(
+                        model="alpha.gguf",
+                        messages=long_turns,
+                        max_tokens=256,
+                        use_pcp=True,
+                    )
+                    ghost_pcp.STATE.loaded_context_size = 1024
+                    ghost_pcp._prepare_pcp_messages(req)
+                    self.assertEqual(len(appended_calls), 1)
+                    evicted_count = len(appended_calls[0])
+                    self.assertGreater(evicted_count, 0)
+                    self.assertEqual(ghost_pcp.STATE.last_turn_meta["auto_archived_turns"], evicted_count)
+
+                    # Re-running with same prefix does NOT duplicate auto-archived turns
+                    ghost_pcp._prepare_pcp_messages(req)
+                    self.assertEqual(len(appended_calls), 1)
+
+                    # SAVE & CLEAR skips auto-archived turns and only persists remaining recent turns
+                    save_resp = client.post(
+                        "/v1/pcp/save-session",
+                        json={"messages": [m.model_dump() for m in long_turns], "capture_continuity": False},
+                        headers=headers,
+                    )
+                    self.assertEqual(save_resp.status_code, 200)
+                    self.assertEqual(len(appended_calls), 2)
+                    self.assertEqual(len(appended_calls[1]), len(long_turns) - evicted_count)
+                    self.assertEqual(len(ghost_pcp.STATE.auto_archived_signatures), 0)
+
+                # 4. Telemetry includes prefill_sec, vram_gb, and gpu_layers
+                class FakeStreamLLM:
+                    def create_chat_completion(self, **kwargs):
+                        return iter([{"choices": [{"delta": {"content": "hello"}}]}])
+
+                ghost_pcp.STATE.llm = FakeStreamLLM()
+                ghost_pcp.STATE.loaded_vram_bytes = int(8.5 * 1024**3)
+                ghost_pcp.STATE.loaded_gpu_layers = 40
+                gen_id = ghost_pcp.STATE.begin_generation(streaming=True)
+                with patch.object(ghost_pcp, "SETTINGS_PATH", settings_file):
+                    stream = ghost_pcp._stream_generator(
+                        ghost_pcp.ChatRequest(model="alpha.gguf", messages=[{"role": "user", "content": "hi"}], stream=True),
+                        [{"role": "user", "content": "hi"}],
+                        gen_id,
+                        show_reasoning=False,
+                        turn_meta={"prompt_tokens_est": 900, "n_ctx": 1024, "ctx_pct": 88},
+                    )
+                    joined = "".join(stream)
+                self.assertIn('"prefill_sec":', joined)
+                self.assertIn('"vram_gb": 8.5', joined)
+                self.assertIn('"gpu_layers": 40', joined)
+        finally:
+            ghost_pcp.PCP_INDEX = orig_idx
+            ghost_pcp.STATE.llm = orig_llm
+            ghost_pcp.STATE.loaded_vram_bytes = orig_vram
+            ghost_pcp.STATE.loaded_gpu_layers = orig_gpu
+            ghost_pcp.STATE.loaded_context_size = orig_ctx
+            ghost_pcp.STATE.auto_archived_signatures = orig_sigs
 
 
 if __name__ == "__main__":

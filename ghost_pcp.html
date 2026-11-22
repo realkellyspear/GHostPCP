@@ -1006,9 +1006,15 @@
                     <select id="edit-persona-voice"></select>
                 </div>
                 <div class="control-group">
-                    <label for="edit-persona-protected">Protected Words / Names (1 per line)</label>
-                    <textarea id="edit-persona-protected" rows="2" placeholder="Names or terms to never filter out"></textarea>
+                    <label for="edit-persona-model">Preferred GGUF Model (auto-mounted on switch)</label>
+                    <select id="edit-persona-model">
+                        <option value="">Default (Keep Current / Last Model)</option>
+                    </select>
                 </div>
+            </div>
+            <div class="control-group">
+                <label for="edit-persona-protected">Protected Words / Names (1 per line)</label>
+                <textarea id="edit-persona-protected" rows="2" placeholder="Names or terms to never filter out"></textarea>
             </div>
             <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                 <button type="button" onclick="savePersonaEditor()">SAVE PERSONA</button>
@@ -1109,6 +1115,7 @@
             <div class="control-group">
                 <label><input type="checkbox" id="pcp-enabled" checked> Enable PCP Archive Grounding</label>
                 <small>Hybrid semantic + lexical retrieval from `ghost_pcp_*.md` on every turn.</small>
+                <label style="margin-top: 6px;"><input type="checkbox" id="auto-mount-model" checked> Auto-Mount Preferred / Last Model on Startup &amp; Persona Switch</label>
                 <label style="margin-top: 6px;"><input type="checkbox" id="auto-continuity-summary" checked> Capture Continuity Summary on SAVE &amp; CLEAR</label>
                 <label for="pcp-top-k" style="margin-top: 6px;">Retrieved Archive Passages per Turn</label>
                 <input type="number" id="pcp-top-k" min="1" max="12" step="1" value="4">
@@ -1466,7 +1473,7 @@
         </div>
 
         <p style="margin: 0; color: var(--muted); line-height: 1.5;">
-            Scan the QR code below with your phone camera (or via <strong>wildemindpress.com/scanner.html</strong>) to open GHostPCP over an encrypted <strong>Cloudflare HTTPS Tunnel</strong>. Works seamlessly on both Wi-Fi and cellular with zero firewall or router setup—and keeps your active conversation synced between your computer and phone.
+            Scan the QR code below with your phone camera (or copy the pairing link) to open GHostPCP over local Wi-Fi, Tailscale, or an encrypted <strong>Cloudflare HTTPS Tunnel</strong>. Works seamlessly on both Wi-Fi and cellular with zero firewall or router setup—and keeps your active conversation synced between your computer and phone.
         </p>
 
         <div id="tunnel-controls" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
@@ -1506,6 +1513,8 @@
     let pendingAttachments = [];
     let editingIndex = null;
     let isGenerating = false;
+    let isSyncingHistory = false;
+    let localHistoryEpoch = 0;
     let lastSavedBanner = "";
     let lastSettings = null;
     let remoteInfo = null;
@@ -1928,9 +1937,11 @@
     }
 
     async function loadConversationFromServer(scrollToBottom = false) {
-        if (isGenerating || editingIndex !== null) return;
+        if (isGenerating || editingIndex !== null || isSyncingHistory) return;
+        const epochBefore = localHistoryEpoch;
         try {
             const data = await api("/chat/history");
+            if (isGenerating || editingIndex !== null || isSyncingHistory || epochBefore !== localHistoryEpoch) return;
             const serverMsgs = Array.isArray(data.messages) ? data.messages : [];
             const same = serverMsgs.length === conversation.length && serverMsgs.every(
                 (m, i) => m.role === conversation[i]?.role && JSON.stringify(m.content) === JSON.stringify(conversation[i]?.content)
@@ -1945,6 +1956,8 @@
     }
 
     async function syncConversationToServer() {
+        localHistoryEpoch += 1;
+        isSyncingHistory = true;
         try {
             const payload = conversation
                 .filter(m => m && (m.role === "user" || m.role === "assistant") && (typeof m.content === "string" || Array.isArray(m.content)))
@@ -1954,7 +1967,10 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ messages: payload })
             });
-        } catch (e) {}
+        } catch (e) {
+        } finally {
+            isSyncingHistory = false;
+        }
     }
 
     function readSettings() {
@@ -1962,6 +1978,7 @@
             model: document.getElementById("model-select").value || (lastSettings?.model ?? "Qwen3-14B-Q5_K_M.gguf"),
             mmproj_model: document.getElementById("mmproj-select")?.value || (lastSettings?.mmproj_model ?? "auto"),
             chat_format: document.getElementById("chat-format").value,
+            auto_mount_model: document.getElementById("auto-mount-model")?.checked !== false,
             system_prompt: document.getElementById("system-prompt").value,
             pcp_enabled: document.getElementById("pcp-enabled").checked,
             pcp_top_k: Math.trunc(Number(document.getElementById("pcp-top-k").value)) || 4,
@@ -2038,6 +2055,7 @@
         if (document.getElementById("web-search-mode")) document.getElementById("web-search-mode").value = settings.web_search_mode || "smart";
         if (document.getElementById("web-cite-sources")) document.getElementById("web-cite-sources").checked = settings.web_cite_sources !== false;
         if (document.getElementById("auto-continuity-summary")) document.getElementById("auto-continuity-summary").checked = settings.auto_continuity_summary !== false;
+        if (document.getElementById("auto-mount-model")) document.getElementById("auto-mount-model").checked = settings.auto_mount_model !== false;
         updateWebProviderFields();
         const temperature = settings.temperature ?? 0.7;
         const topP = settings.top_p ?? 0.95;
@@ -2296,6 +2314,7 @@
             const lines = [];
             if (p.user_name) lines.push(`Calls you: ${p.user_name}`);
             lines.push(`Voice: ${p.tts_voice || "silas"} · ${p.volumes || 0} vol · ${(p.passages || 0).toLocaleString()} passages`);
+            if (p.preferred_model) lines.push(`Model: ${p.preferred_model}`);
             if (p.never_forget) {
                 const preview = p.never_forget.length > 90 ? `${p.never_forget.slice(0, 90)}...` : p.never_forget;
                 lines.push(`Never forget: ${preview}`);
@@ -2451,9 +2470,18 @@
             renderConversation(false);
             closePersonaModal();
             if (msgEl) msgEl.innerText = "";
-            if (!currentModel) {
+            const preferred = res.persona?.preferred_model || "";
+            const autoMount = document.getElementById("auto-mount-model")?.checked !== false;
+            const preferredInstalled = preferred && modelsMetadata.some(m => m.id === preferred && m.valid_gguf !== false);
+            if (autoMount && preferredInstalled && currentModel !== preferred) {
+                const sel = document.getElementById("model-select");
+                if (sel) sel.value = preferred;
+                updateMmprojHint();
+                await loadSelectedModel();
+            } else if (!currentModel) {
                 openSettings();
-            } else {
+            }
+            if (currentModel) {
                 document.getElementById("user-input").focus();
             }
         } catch (e) {
@@ -2471,6 +2499,26 @@
         sessionStorage.setItem("ghost_pcp_persona_chosen", "1");
         document.getElementById("persona-modal").style.display = "none";
         closePersonaEditor();
+    }
+
+    function populatePersonaModelSelect(selectedModel) {
+        const modelSel = document.getElementById("edit-persona-model");
+        if (!modelSel) return;
+        modelSel.innerHTML = `<option value="">Default (Keep Current / Last Model)</option>`;
+        modelsMetadata.forEach(m => {
+            if (m.valid_gguf === false) return;
+            const opt = document.createElement("option");
+            opt.value = m.id;
+            opt.innerText = `${m.id} (${m.file_size_gib} GiB)`;
+            modelSel.appendChild(opt);
+        });
+        if (selectedModel && !Array.from(modelSel.options).some(o => o.value === selectedModel)) {
+            const missingOpt = document.createElement("option");
+            missingOpt.value = selectedModel;
+            missingOpt.innerText = `${selectedModel} (not in ./ghost_models)`;
+            modelSel.appendChild(missingOpt);
+        }
+        modelSel.value = selectedModel || "";
     }
 
     function openPersonaEditor(personaId) {
@@ -2491,6 +2539,7 @@
         if (voiceSel && target?.tts_voice && Array.from(voiceSel.options).some(o => o.value === target.tts_voice)) {
             voiceSel.value = target.tts_voice;
         }
+        populatePersonaModelSelect(target ? (target.preferred_model || "") : "");
         editor.style.display = "flex";
         document.getElementById("edit-persona-name").focus();
     }
@@ -2516,6 +2565,7 @@
             notes: document.getElementById("edit-persona-notes").value.trim(),
             continuity_notes: document.getElementById("edit-persona-continuity")?.value.trim() || "",
             tts_voice: document.getElementById("edit-persona-voice").value || "silas",
+            preferred_model: document.getElementById("edit-persona-model")?.value || "",
             protected_words: document.getElementById("edit-persona-protected").value.trim()
         };
         try {
@@ -2591,19 +2641,32 @@
 
             const select = document.getElementById("model-select");
             select.innerHTML = "";
-            modelsMetadata.forEach(m => {
-                const opt = document.createElement("option");
-                opt.value = m.id;
-                const visTag = m.auto_mmproj ? " [VISION]" : "";
-                opt.innerText = `${m.id} (${m.file_size_gib} GiB)${visTag}`;
-                select.appendChild(opt);
-            });
+            if (modelsMetadata.length === 0) {
+                const placeholder = document.createElement("option");
+                placeholder.value = "";
+                placeholder.innerText = "No local .gguf models yet — download below or drop into ./ghost_models";
+                select.appendChild(placeholder);
+            } else {
+                modelsMetadata.forEach(m => {
+                    const opt = document.createElement("option");
+                    opt.value = m.id;
+                    const visTag = m.auto_mmproj ? " [VISION]" : "";
+                    const splitTag = m.part_count > 1 ? ` [SPLIT x${m.part_count}]` : "";
+                    const badTag = m.valid_gguf === false ? " [INVALID GGUF]" : "";
+                    opt.innerText = `${m.id} (${m.file_size_gib} GiB)${splitTag}${visTag}${badTag}`;
+                    select.appendChild(opt);
+                });
+            }
             if (currentModel && modelsMetadata.some(m => m.id === currentModel)) {
                 select.value = currentModel;
             } else if (lastSettings?.model && modelsMetadata.some(m => m.id === lastSettings.model)) {
                 select.value = lastSettings.model;
             }
             select.disabled = modelsMetadata.length === 0;
+            const dlSection = document.getElementById("model-downloader-section");
+            if (dlSection && modelsMetadata.length === 0) {
+                dlSection.open = true;
+            }
 
             const mmSel = document.getElementById("mmproj-select");
             if (mmSel) {
@@ -2787,6 +2850,11 @@
                     msg.innerText = `Downloaded ${st.filename}${st.mmproj_filename ? ` + ${st.mmproj_filename}` : ""}. Ready to MOUNT above!`;
                     await fetchModels();
                     await fetchModelCatalog();
+                    const sel = document.getElementById("model-select");
+                    if (!currentModel && sel && Array.from(sel.options).some(o => o.value === st.filename)) {
+                        sel.value = st.filename;
+                        updateMmprojHint();
+                    }
                 } else if (st.error) {
                     msg.innerText = `${st.stage}: ${st.error}`;
                 }
@@ -2833,6 +2901,17 @@
         }
     }
 
+    function formatOffloadSummary(plan) {
+        if (!plan) return "";
+        const ngl = Number(plan.n_gpu_layers || 0);
+        const total = Number(plan.total_layers || 0);
+        if (ngl <= 0) return "CPU + RAM offload";
+        const base = ngl >= total
+            ? `${ngl}/${total} layers (100% GPU)`
+            : `${ngl}/${total} layers on GPU + RAM hybrid`;
+        return plan.offload_kqv === false ? `${base} · KV in RAM` : base;
+    }
+
     async function checkFit() {
         const report = document.getElementById("fit-report");
         const settings = readSettings();
@@ -2840,7 +2919,7 @@
             report.innerText = "Choose a GGUF model first.";
             return;
         }
-        report.innerText = "Reading GGUF tensor index and probing available NVIDIA VRAM...";
+        report.innerText = "Reading GGUF tensor index and probing GPU VRAM & system RAM...";
         try {
             const plan = await api("/preflight", {
                 method: "POST",
@@ -2851,9 +2930,7 @@
                     mmproj_model: settings.mmproj_model || "auto"
                 })
             });
-            const offload = plan.n_gpu_layers === 0
-                ? "CPU-only fallback"
-                : `${plan.n_gpu_layers}/${plan.total_layers} layers on GPU`;
+            const offload = formatOffloadSummary(plan);
             const details = [
                 `${plan.architecture} · ${plan.quantization} · ${plan.parameter_count.toLocaleString()} params`,
                 `${plan.weight_gib.toFixed(2)} GiB weights · ${(plan.kv_cache_estimate_bytes / (1024 ** 3)).toFixed(2)} GiB KV (${plan.kv_cache_type})`,
@@ -2870,9 +2947,21 @@
         const model = document.getElementById("model-select").value;
         if (!model) return;
         const mountBtn = document.getElementById("mount-btn");
+        const unloadBtn = document.getElementById("unload-btn");
+        const modelSel = document.getElementById("model-select");
+        const loaderMsg = document.getElementById("loader-message");
         mountBtn.disabled = true;
+        if (unloadBtn) unloadBtn.disabled = true;
+        if (modelSel) modelSel.disabled = true;
         setStatus("MOUNTING MODEL...", "var(--warn)");
-        document.getElementById("loader-message").innerText = `Mounting ${model} into VRAM...`;
+        const t0 = Date.now();
+        const updateTimer = () => {
+            const secs = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+            mountBtn.innerText = `MOUNTING (${secs}s)...`;
+            loaderMsg.innerText = `Mounting ${model} (reading weights & allocating KV cache — ${secs}s)...`;
+        };
+        updateTimer();
+        const mountTimer = setInterval(updateTimer, 500);
         try {
             const settings = readSettings();
             settings.model = model;
@@ -2898,16 +2987,24 @@
             setStatus(`ONLINE: ${model}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
             updateMmprojHint();
             const plan = loaded.preflight;
-            const offload = plan.n_gpu_layers === 0 ? "CPU-only" : `${plan.n_gpu_layers}/${plan.total_layers} GPU layers`;
-            document.getElementById("fit-report").innerText = `${plan.architecture} · ${plan.quantization} · ${offload} · KV: ${plan.kv_cache_type} (${loaded.load_seconds}s)${currentVisionCapable ? ` · Vision: ${currentMmproj}` : ""}`;
-            document.getElementById("loader-message").innerText = `Mounted ${model}${currentVisionCapable ? ` with vision (${currentMmproj})` : ""}. Ready to chat.`;
+            const offload = formatOffloadSummary(plan);
+            const reportLines = [
+                `${plan.architecture} · ${plan.quantization} · ${offload} · KV: ${plan.kv_cache_type} (${loaded.load_seconds}s)${currentVisionCapable ? ` · Vision: ${currentMmproj}` : ""}`
+            ];
+            if (Array.isArray(plan.warnings) && plan.warnings.length) reportLines.push(...plan.warnings);
+            document.getElementById("fit-report").innerText = reportLines.join("\n");
+            loaderMsg.innerText = `Mounted ${model}${currentVisionCapable ? ` with vision (${currentMmproj})` : ""} in ${loaded.load_seconds}s. Ready to chat.`;
             document.getElementById("user-input").disabled = false;
             document.getElementById("send-button").disabled = false;
         } catch (e) {
             setStatus("LOAD FAILED", "var(--danger)");
-            document.getElementById("loader-message").innerText = e.message;
+            loaderMsg.innerText = e.message;
         } finally {
+            clearInterval(mountTimer);
+            mountBtn.innerText = "MOUNT";
             mountBtn.disabled = false;
+            if (unloadBtn) unloadBtn.disabled = false;
+            if (modelSel) modelSel.disabled = modelsMetadata.length === 0;
         }
     }
 
@@ -3039,6 +3136,9 @@
             const personaHtml = activePersona
                 ? `<div style="margin-bottom: 10px; font-size: 13px; color: var(--purple); font-weight: 650;">Active AI: ${escapeHtml(activePersona.name)}${activePersona.user_name ? ` · Calls you ${escapeHtml(activePersona.user_name)}` : ""}</div>`
                 : "";
+            const mountButtonHtml = !currentModel
+                ? `<button type="button" onclick="openSettings()">DOWNLOAD / MOUNT MODEL</button>`
+                : "";
             empty.innerHTML = `
                 ${bannerHtml}
                 <img src="/assets/ghost_logo_portrait.png" alt="GHostPCP — GPU Hosted Pure Concentrated Personality">
@@ -3047,6 +3147,7 @@
                 <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 14px;">
                     <button type="button" class="secondary" onclick="openPersonaModal()">CHOOSE / SWITCH AI</button>
                     <button type="button" onclick="openNewPersonaImport()">+ IMPORT NEW AI</button>
+                    ${mountButtonHtml}
                 </div>
             `;
             container.appendChild(empty);
@@ -3543,12 +3644,27 @@
                 const tPill = document.getElementById("telemetry-pill");
                 if (tPill && turnMeta) {
                     const bits = [];
+                    if (turnMeta.prefill_sec > 0) bits.push(`prefill ${turnMeta.prefill_sec}s`);
                     if (turnMeta.tok_per_sec) bits.push(`${turnMeta.tok_per_sec} tok/s`);
+                    let ctxPct = 0;
                     if (turnMeta.prompt_tokens_est && turnMeta.n_ctx) {
-                        const pct = Math.min(100, Math.round((turnMeta.prompt_tokens_est / turnMeta.n_ctx) * 100));
-                        bits.push(`ctx ${pct}%`);
+                        ctxPct = typeof turnMeta.ctx_pct === "number"
+                            ? turnMeta.ctx_pct
+                            : Math.min(100, Math.round((turnMeta.prompt_tokens_est / turnMeta.n_ctx) * 100));
+                        bits.push(`ctx ${ctxPct}%`);
                     }
+                    if (turnMeta.vram_gb > 0) bits.push(`VRAM ${turnMeta.vram_gb} GB`);
+                    if (turnMeta.auto_archived_turns > 0) bits.push(`+${turnMeta.auto_archived_turns} saved`);
                     if (bits.length) tPill.innerText = bits.join(" · ");
+                    if (ctxPct >= 85) {
+                        tPill.style.borderColor = "var(--warn)";
+                        tPill.style.color = "var(--warn)";
+                        tPill.title = "Context window is nearing limit; older overflowing turns auto-save to PCP memory. Click SAVE & CLEAR anytime for a fresh window.";
+                    } else {
+                        tPill.style.borderColor = "";
+                        tPill.style.color = "";
+                        tPill.title = "Live prefill, decode speed, context window, and VRAM usage";
+                    }
                 }
             }
             const delta = chunk.choices?.[0]?.delta;
@@ -3937,6 +4053,8 @@
         newChatBtn.disabled = true;
         const originalText = saveBtn.innerText;
         saveBtn.innerText = "SAVING...";
+        localHistoryEpoch += 1;
+        isSyncingHistory = true;
         try {
             const res = await api("/pcp/save-session", {
                 method: "POST",
@@ -3954,6 +4072,7 @@
         } catch (error) {
             alert(`Save & Clear failed: ${error.message}`);
         } finally {
+            isSyncingHistory = false;
             saveBtn.innerText = originalText;
             saveBtn.disabled = false;
             newChatBtn.disabled = false;
@@ -3961,19 +4080,27 @@
     }
 
     async function startNewChat() {
-        if (conversation.length > 0 && !window.confirm("Clear this conversation without saving it to the archive? (Use SAVE & CLEAR if you want to keep these memories.)")) return;
+        isSyncingHistory = true;
+        const confirmed = conversation.length === 0 || window.confirm("Clear this conversation without saving it to the archive? (Use SAVE & CLEAR if you want to keep these memories.)");
+        if (!confirmed) {
+            isSyncingHistory = false;
+            return;
+        }
         const button = document.getElementById("new-chat-button");
         button.disabled = true;
+        localHistoryEpoch += 1;
         try {
-            if (currentModel) await api("/reset", {method: "POST"});
             conversation.length = 0;
             editingIndex = null;
             lastSavedBanner = "";
             renderConversation(false);
             await syncConversationToServer();
+            isSyncingHistory = true;
+            if (currentModel) await api("/reset", {method: "POST"});
         } catch (error) {
             alert(error.message);
         } finally {
+            isSyncingHistory = false;
             button.disabled = false;
         }
     }
@@ -4799,28 +4926,50 @@
         if (activePersona) applyActivePersonaToUi(activePersona);
         const pcp = await refreshPCPStatus();
         try {
-            const st = await api("/status");
-            currentModel = st.resident_model || "";
-            currentMmproj = st.mmproj_model || null;
-            currentVisionCapable = Boolean(st.vision_capable);
-            if (typeof st.is_local_client === "boolean") isLocalClient = st.is_local_client;
-            if (typeof st.web_enabled === "boolean") syncWebToggleUi(st.web_enabled);
-            updateMmprojHint();
-            const chosenBefore = sessionStorage.getItem("ghost_pcp_persona_chosen") === "1";
-            if (currentModel) {
-                setStatus(`ONLINE: ${currentModel}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
-                document.getElementById("user-input").disabled = false;
-                document.getElementById("send-button").disabled = false;
-                if (!chosenBefore && personasList.length > 0) {
-                    openPersonaModal();
-                }
-            } else {
-                setStatus("NO MODEL MOUNTED", "#888");
-                if (!chosenBefore && personasList.length > 0) {
-                    openPersonaModal();
-                } else if (pcp && !pcp.ready) {
-                    openArchiveModal();
+            let st = await api("/status");
+            const applyStatusSnapshot = (snap) => {
+                currentModel = snap.resident_model || "";
+                currentMmproj = snap.mmproj_model || null;
+                currentVisionCapable = Boolean(snap.vision_capable);
+                if (typeof snap.is_local_client === "boolean") isLocalClient = snap.is_local_client;
+                if (typeof snap.web_enabled === "boolean") syncWebToggleUi(snap.web_enabled);
+                updateMmprojHint();
+                if (currentModel) {
+                    setStatus(`ONLINE: ${currentModel}${currentVisionCapable ? " (VISION)" : ""}`, "var(--purple)");
+                    document.getElementById("user-input").disabled = false;
+                    document.getElementById("send-button").disabled = false;
+                    if (conversation.length === 0) renderConversation(false);
+                } else if (snap.loading) {
+                    setStatus(`AUTO-MOUNTING ${snap.loading_model || "MODEL"}...`, "var(--warn)");
                 } else {
+                    setStatus("NO MODEL MOUNTED", "#888");
+                }
+            };
+            applyStatusSnapshot(st);
+            if (!currentModel && st.loading) {
+                const startupTimer = setInterval(async () => {
+                    try {
+                        const nextSt = await api("/status");
+                        applyStatusSnapshot(nextSt);
+                        if (!nextSt.loading) {
+                            clearInterval(startupTimer);
+                            if (nextSt.resident_model) {
+                                const sel = document.getElementById("model-select");
+                                if (sel) sel.value = nextSt.resident_model;
+                            }
+                        }
+                    } catch (e) {
+                        clearInterval(startupTimer);
+                    }
+                }, 750);
+            }
+            const chosenBefore = sessionStorage.getItem("ghost_pcp_persona_chosen") === "1";
+            if (!chosenBefore && personasList.length > 0) {
+                openPersonaModal();
+            } else if (!currentModel && !st.loading) {
+                if (pcp && !pcp.ready) {
+                    openArchiveModal();
+                } else if (modelsMetadata.length === 0 || !st.loading) {
                     openSettings();
                 }
             }

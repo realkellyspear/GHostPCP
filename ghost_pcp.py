@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import gc
+import hashlib
 import importlib.util
 import io
 import ipaddress
@@ -95,6 +97,7 @@ def _probe_nvidia_runtime() -> bool:
             capture_output=True,
             text=True,
             timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         return bool(result.stdout.strip())
     except (OSError, subprocess.SubprocessError):
@@ -102,8 +105,21 @@ def _probe_nvidia_runtime() -> bool:
 
 
 def _probe_vulkan_runtime() -> bool:
-    executable = shutil.which("vulkaninfo")
-    return executable is not None and bool(os.environ.get("VULKAN_SDK"))
+    """Detect Vulkan driver/runtime availability without requiring the developer SDK."""
+    if os.name == "nt":
+        try:
+            ctypes.WinDLL("vulkan-1.dll")
+            return True
+        except OSError:
+            pass
+    elif sys.platform.startswith("linux"):
+        for lib_name in ("libvulkan.so.1", "libvulkan.so"):
+            try:
+                ctypes.CDLL(lib_name)
+                return True
+            except OSError:
+                continue
+    return shutil.which("vulkaninfo") is not None
 
 
 def _cuda_runtime_dlls() -> List[Path]:
@@ -273,7 +289,57 @@ DEFAULT_N_CTX = 8192
 GIB = 1024 ** 3
 GPU_SAFETY_RESERVE_BYTES = 768 * 1024 ** 2
 GPU_MAX_UTILIZATION = 0.95
-N_THREADS = os.cpu_count() or 8
+def _detect_physical_cores() -> int:
+    """Return physical CPU core count (avoiding SMT thread oversubscription in llama.cpp)."""
+    if os.name == "nt":
+        try:
+            k32 = ctypes.windll.kernel32
+            size = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
+            if size.value > 0:
+                buf = ctypes.create_string_buffer(size.value)
+                if k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(size)):
+                    count = 0
+                    offset = 0
+                    raw = buf.raw[:size.value]
+                    while offset + 8 <= len(raw):
+                        rel = ctypes.c_uint32.from_buffer_copy(raw, offset).value
+                        entry_size = ctypes.c_uint32.from_buffer_copy(raw, offset + 4).value
+                        if entry_size == 0:
+                            break
+                        if rel == 0:
+                            count += 1
+                        offset += entry_size
+                    if count > 0:
+                        return max(1, min(64, count))
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            pairs: Set[Tuple[str, str]] = set()
+            phys_id = "0"
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("physical id"):
+                    phys_id = line.split(":", 1)[1].strip()
+                elif line.startswith("core id"):
+                    pairs.add((phys_id, line.split(":", 1)[1].strip()))
+            if pairs:
+                return max(1, min(64, len(pairs)))
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(["sysctl", "-n", "hw.physicalcpu"], text=True, timeout=2).strip()
+            val = int(out)
+            if val > 0:
+                return max(1, min(64, val))
+        except Exception:
+            pass
+    logical = os.cpu_count() or 8
+    return max(1, min(64, (logical // 2) if logical >= 4 else logical))
+
+
+N_THREADS = _detect_physical_cores()
 FLASH_ATTN = True
 N_BATCH = 512
 
@@ -281,6 +347,7 @@ DEFAULT_SETTINGS = {
     "model": "Qwen3-14B-Q5_K_M.gguf",
     "mmproj_model": "auto",
     "chat_format": "auto",
+    "auto_mount_model": True,
     "system_prompt": "",
     "pcp_enabled": True,
     "pcp_top_k": 4,
@@ -409,6 +476,8 @@ class EngineState:
         self.loaded_chat_format: Optional[str] = None
         self.loaded_mmproj: Optional[str] = None
         self.loaded_vision_capable: bool = False
+        self.loaded_vram_bytes: int = 0
+        self.loading_model: Optional[str] = None
         self.locked = False
         self.busy = False
         self.streaming = False
@@ -419,6 +488,7 @@ class EngineState:
         self._history_lock = threading.Lock()
         self.prior_assistant_tokens: List[int] = []
         self.last_turn_meta: Dict[str, Any] = {}
+        self.auto_archived_signatures: Set[str] = set()
 
     def begin_generation(self, streaming: bool) -> int:
         with self._lease:
@@ -522,10 +592,53 @@ _PIPER_VOICES: Dict[str, Any] = {}
 _PIPER_LOCK = threading.Lock()
 
 
-def _clean_text_for_speech(text: str) -> str:
-    """Strip <think> blocks, code blocks, and Markdown asterisks so Piper speaks naturally."""
-    cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", str(text), flags=re.IGNORECASE)
+_HARMONY_OPEN_RE = re.compile(
+    r"(?:<\|start\|>[a-z0-9_:-]*)?<\|channel\|>(analysis|commentary)(?:<\|constrain\|>[^\s<]+)?(?:<\|message\|>)?",
+    re.IGNORECASE,
+)
+_HARMONY_FINAL_RE = re.compile(
+    r"(?:<\|end\|>)?(?:<\|start\|>[a-z0-9_:-]*)?<\|channel\|>final(?:<\|message\|>)?",
+    re.IGNORECASE,
+)
+_HARMONY_CLOSE_RE = re.compile(r"<\|end\|>|<\|return\|>|<\|start\|>[a-z0-9_:-]*|<\|message\|>", re.IGNORECASE)
+
+
+def _normalize_reasoning_tags(text: str) -> str:
+    """Normalize Harmony (<|channel|>), <thought>, and [THINK] markers into standard <think> blocks."""
+    out = str(text or "")
+    if not out:
+        return ""
+    out = re.sub(r"<thought>|\[THINK\]", "<think>", out, flags=re.IGNORECASE)
+    out = re.sub(r"</thought>|\[/THINK\]", "</think>", out, flags=re.IGNORECASE)
+    if "<|" in out:
+        out = _HARMONY_OPEN_RE.sub("<think>", out)
+        out = _HARMONY_FINAL_RE.sub("</think>", out)
+        out = _HARMONY_CLOSE_RE.sub("", out)
+        # Ensure balanced </think> only if preceded by <think> (drop orphan leading </think> from direct final channel)
+        parts = out.split("<think>")
+        if len(parts) == 1:
+            out = out.replace("</think>", "")
+        else:
+            rebuilt = [parts[0].replace("</think>", "")]
+            for idx, seg in enumerate(parts[1:], start=1):
+                if idx < len(parts) - 1 and "</think>" not in seg:
+                    seg = seg + "</think>"
+                rebuilt.append("<think>" + seg)
+            out = "".join(rebuilt)
+    return out
+
+
+def _strip_reasoning_blocks(text: str) -> str:
+    """Remove complete or unclosed reasoning blocks across all model formats."""
+    normalized = _normalize_reasoning_tags(text)
+    cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", normalized, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _clean_text_for_speech(text: str) -> str:
+    """Strip reasoning blocks, code blocks, and Markdown asterisks so Piper speaks naturally."""
+    cleaned = _strip_reasoning_blocks(str(text))
     cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
     cleaned = re.sub(r"\*+", "", cleaned)
@@ -2077,6 +2190,7 @@ def _activate_persona(persona_id: str) -> dict:
             loaded_msgs = _load_persona_chat_history(target_dir)
             with STATE._history_lock:
                 STATE.conversation = loaded_msgs
+            STATE.auto_archived_signatures.clear()
             STATE.prior_assistant_tokens = []
             if STATE.llm is not None:
                 try:
@@ -2102,6 +2216,7 @@ def _activate_persona(persona_id: str) -> dict:
     finally:
         with STATE._lease:
             STATE.locked = False
+            STATE.loading_model = None
 
 
 def _init_pcp_index() -> None:
@@ -2423,17 +2538,106 @@ def _find_paired_mmproj(
     return best_name
 
 
+_SPLIT_GGUF_RE = re.compile(r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+
+
+def _parse_split_gguf_name(filename: str) -> Optional[Tuple[str, int, int]]:
+    match = _SPLIT_GGUF_RE.match(Path(str(filename or "")).name)
+    if not match:
+        return None
+    part = int(match.group("part"))
+    total = int(match.group("total"))
+    if part < 1 or total < 2 or part > total:
+        return None
+    return match.group("prefix"), part, total
+
+
+def _resolve_model_parts(filename: str) -> Tuple[List[Path], int]:
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    path = MODEL_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Model '{filename}' not found in ./ghost_models.")
+    split_info = _parse_split_gguf_name(path.name)
+    if not split_info:
+        return [path], 1
+    prefix, part, total = split_info
+    if part != 1:
+        first_name = f"{prefix}-00001-of-{total:05d}.gguf"
+        if (MODEL_DIR / first_name).is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Select the first file '{first_name}' to load this split GGUF.",
+            )
+    parts: List[Path] = []
+    missing: List[str] = []
+    for idx in range(1, total + 1):
+        part_name = f"{prefix}-{idx:05d}-of-{total:05d}.gguf"
+        part_path = MODEL_DIR / part_name
+        if part_path.is_file():
+            parts.append(part_path)
+        else:
+            missing.append(part_name)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Incomplete split GGUF ({len(parts)}/{total} parts found). Missing: {', '.join(missing[:3])}",
+        )
+    return parts, total
+
+
 def scan_models() -> List[Dict[str, Any]]:
     if not MODEL_DIR.exists():
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    models = []
-    for f in sorted(MODEL_DIR.glob("*.gguf")):
+    all_files = sorted(MODEL_DIR.glob("*.gguf"))
+    split_groups: Dict[Tuple[str, int], Dict[int, Path]] = {}
+    for f in all_files:
         if _is_mmproj_filename(f.name):
             continue
-        try:
-            file_size_bytes = f.stat().st_size
-        except OSError:
+        split_info = _parse_split_gguf_name(f.name)
+        if split_info:
+            prefix, part, total = split_info
+            split_groups.setdefault((prefix.lower(), total), {})[part] = f
+
+    models = []
+    seen_splits: Set[Tuple[str, int]] = set()
+    for f in all_files:
+        if _is_mmproj_filename(f.name):
+            continue
+        split_info = _parse_split_gguf_name(f.name)
+        part_count = 1
+        missing_parts = 0
+        if split_info:
+            prefix, part, total = split_info
+            key = (prefix.lower(), total)
+            if key in seen_splits:
+                continue
+            parts_map = split_groups.get(key, {})
+            # Only represent a split GGUF once (via part 00001, or lowest present part)
+            first_part = min(parts_map.keys()) if parts_map else part
+            if part != first_part:
+                continue
+            seen_splits.add(key)
+            part_count = total
+            missing_parts = max(0, total - len(parts_map))
             file_size_bytes = 0
+            for part_path in parts_map.values():
+                try:
+                    file_size_bytes += part_path.stat().st_size
+                except OSError:
+                    pass
+        else:
+            try:
+                file_size_bytes = f.stat().st_size
+            except OSError:
+                file_size_bytes = 0
+
+        try:
+            with open(f, "rb") as hdr:
+                valid_gguf = hdr.read(4) == b"GGUF"
+        except OSError:
+            valid_gguf = False
+
         auto_mmproj = _find_paired_mmproj(f.name, "auto", strict=False)
         models.append({
             "id": f.name,
@@ -2445,6 +2649,9 @@ def scan_models() -> List[Dict[str, Any]]:
             "file_size_gib": round(file_size_bytes / GIB, 3),
             "auto_mmproj": auto_mmproj,
             "vision_likely": bool(auto_mmproj) or _looks_like_vision_model(f.name),
+            "part_count": part_count,
+            "missing_parts": missing_parts,
+            "valid_gguf": valid_gguf,
         })
     return models
 
@@ -2462,6 +2669,47 @@ def _gguf_value(reader: GGUFReader, key: str) -> Any:
     if isinstance(value, (list, tuple)) and len(value) == 1:
         return value[0]
     return value
+
+
+def _has_nvidia_smi() -> bool:
+    if shutil.which("nvidia-smi") is not None:
+        return True
+    return Path(r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe").is_file()
+
+
+def _probe_system_ram() -> Tuple[int, int]:
+    """Return (total_ram_bytes, avail_ram_bytes) across Windows, macOS, and Linux."""
+    if os.name == "nt":
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        try:
+            ms = _MEMORYSTATUSEX(dwLength=ctypes.sizeof(_MEMORYSTATUSEX))
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.ullTotalPhys), int(ms.ullAvailPhys)
+        except Exception:
+            return 0, 0
+    if hasattr(os, "sysconf"):
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+            total = page_size * total_pages
+            avail = total
+            if "SC_AVPHYS_PAGES" in os.sysconf_names:
+                avail = page_size * int(os.sysconf("SC_AVPHYS_PAGES"))
+            return total, avail
+        except Exception:
+            pass
+    return 0, 0
 
 
 def _probe_nvidia_gpus() -> List[Dict[str, Any]]:
@@ -2504,12 +2752,119 @@ def _probe_nvidia_gpus() -> List[Dict[str, Any]]:
     return devices
 
 
-def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto") -> dict:
-    if "/" in filename or "\\" in filename or ".." in filename:
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = MODEL_DIR / filename
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"Model '{filename}' not found in ./ghost_models.")
+def _probe_ggml_gpu_devices() -> List[Dict[str, Any]]:
+    """Probe Vulkan, CUDA, or Metal GPU devices directly via loaded ggml backend APIs."""
+    try:
+        ext = ".dll" if os.name == "nt" else (".dylib" if sys.platform == "darwin" else ".so")
+        base_candidates = [
+            RUNTIME_LLAMA_LIB_DIR / f"ggml-base{ext}",
+            RUNTIME_LLAMA_LIB_DIR / f"libggml-base{ext}",
+        ]
+        ggml_candidates = [
+            RUNTIME_LLAMA_LIB_DIR / f"ggml{ext}",
+            RUNTIME_LLAMA_LIB_DIR / f"libggml{ext}",
+        ]
+        base_path = next((p for p in base_candidates if p.is_file()), None)
+        ggml_path = next((p for p in ggml_candidates if p.is_file()), None)
+        if base_path is None or ggml_path is None:
+            return []
+        gb = ctypes.CDLL(str(base_path))
+        gg = ctypes.CDLL(str(ggml_path))
+        if hasattr(gg, "ggml_backend_load_all_from_path"):
+            gg.ggml_backend_load_all_from_path(str(RUNTIME_LLAMA_LIB_DIR).encode("utf-8"))
+        gg.ggml_backend_dev_count.restype = ctypes.c_size_t
+        gg.ggml_backend_dev_get.argtypes = [ctypes.c_size_t]
+        gg.ggml_backend_dev_get.restype = ctypes.c_void_p
+        gb.ggml_backend_dev_name.argtypes = [ctypes.c_void_p]
+        gb.ggml_backend_dev_name.restype = ctypes.c_char_p
+        gb.ggml_backend_dev_description.argtypes = [ctypes.c_void_p]
+        gb.ggml_backend_dev_description.restype = ctypes.c_char_p
+        gb.ggml_backend_dev_type.argtypes = [ctypes.c_void_p]
+        gb.ggml_backend_dev_type.restype = ctypes.c_int
+        gb.ggml_backend_dev_memory.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        devices: List[Dict[str, Any]] = []
+        count = int(gg.ggml_backend_dev_count())
+        for idx in range(count):
+            dev = gg.ggml_backend_dev_get(idx)
+            if not dev:
+                continue
+            dev_type = int(gb.ggml_backend_dev_type(dev))
+            # ggml_backend_dev_type: 0=CPU, 1=GPU, 2=ACCEL, 3=IGPU
+            if dev_type not in (1, 3):
+                continue
+            free_mem = ctypes.c_size_t(0)
+            total_mem = ctypes.c_size_t(0)
+            gb.ggml_backend_dev_memory(dev, ctypes.byref(free_mem), ctypes.byref(total_mem))
+            if int(total_mem.value) <= 0:
+                continue
+            desc = gb.ggml_backend_dev_description(dev) or gb.ggml_backend_dev_name(dev) or b"GPU"
+            devices.append({
+                "name": desc.decode("utf-8", errors="replace").strip() or "GPU",
+                "total_bytes": int(total_mem.value),
+                "free_bytes": int(free_mem.value),
+                "is_igpu": dev_type == 3,
+            })
+        if len(devices) > 1 and any(d["total_bytes"] >= 4 * GIB for d in devices):
+            filtered = [d for d in devices if not d.get("is_igpu") and d["total_bytes"] >= 2 * GIB]
+            if filtered:
+                devices = filtered
+        return devices
+    except Exception:
+        return []
+
+
+def _probe_gpu_devices() -> List[Dict[str, Any]]:
+    if BACKEND_NAME == "cpu" or not llama_cpp.llama_supports_gpu_offload():
+        return []
+    if BACKEND_NAME == "cuda":
+        devices = _probe_nvidia_gpus()
+        if devices or _has_nvidia_smi():
+            return devices
+        return _probe_ggml_gpu_devices()
+    devices = _probe_ggml_gpu_devices()
+    if devices:
+        return devices
+    if sys.platform == "darwin":
+        total_ram, avail_ram = _probe_system_ram()
+        if total_ram > 0:
+            return [{"name": "Apple Metal Unified Memory", "total_bytes": int(total_ram * 0.75), "free_bytes": int(avail_ram * 0.85)}]
+    return []
+
+
+def _measure_free_vram_bytes() -> int:
+    try:
+        return sum(max(0, int(d.get("free_bytes") or 0)) for d in _probe_gpu_devices())
+    except Exception:
+        return 0
+
+
+def _compute_ssm_state_reserve(reader: GGUFReader, architecture: str, ssm_layer_count: int) -> int:
+    """Estimate conservative VRAM state reserve for Mamba / Gated-DeltaNet / hybrid SSM layers."""
+    if ssm_layer_count <= 0:
+        return 0
+    inner_size = int(_gguf_value(reader, f"{architecture}.ssm.inner_size") or 4096)
+    state_size = int(_gguf_value(reader, f"{architecture}.ssm.state_size") or 128)
+    conv_kernel = int(_gguf_value(reader, f"{architecture}.ssm.conv_kernel") or 4)
+    group_count = int(_gguf_value(reader, f"{architecture}.ssm.group_count") or 16)
+    recurrent_bytes = inner_size * state_size * 4
+    conv_bytes = max(0, conv_kernel - 1) * (inner_size + 2 * group_count * state_size) * 4
+    # Include workspace / scratch headroom per recurrent layer without over-blocking GPU offload
+    per_layer_bytes = max(20 * 1024 ** 2, min(64 * 1024 ** 2, (recurrent_bytes + conv_bytes) * 4 + 12 * 1024 ** 2))
+    return ssm_layer_count * per_layer_bytes
+
+
+def preflight_model(
+    filename: str,
+    context_size: int,
+    mmproj_model: str = "auto",
+    credit_vram_bytes: int = 0,
+) -> dict:
+    model_parts, part_count = _resolve_model_parts(filename)
+    path = model_parts[0]
     if STATE.loaded_model is None:
         _release_peer_ghost_anchor_vram()
 
@@ -2541,9 +2896,10 @@ def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto"
             sliding_window = None
         file_type = _gguf_value(reader, "general.file_type")
         metadata_parameter_count = _gguf_value(reader, "general.parameter_count")
-        tensor_parameter_count = sum(int(tensor.n_elements) for tensor in reader.tensors)
+        part_readers = [reader] + [GGUFReader(s) for s in model_parts[1:]]
+        tensor_parameter_count = sum(int(tensor.n_elements) for pr in part_readers for tensor in pr.tensors)
         parameter_count = int(metadata_parameter_count or tensor_parameter_count)
-        weight_bytes = sum(int(tensor.n_bytes) for tensor in reader.tensors)
+        weight_bytes = sum(int(tensor.n_bytes) for pr in part_readers for tensor in pr.tensors)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not read GGUF metadata: {exc}") from exc
 
@@ -2562,124 +2918,200 @@ def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto"
 
     layer_weight_bytes = [0] * layer_count
     non_layer_bytes = 0
-    key_layers = set()
-    value_layers = set()
-    fused_qkv_layers = set()
+    token_embd_bytes = 0
+    key_layers: Set[int] = set()
+    value_layers: Set[int] = set()
+    fused_qkv_layers: Set[int] = set()
+    attn_other_layers: Set[int] = set()
+    ssm_layers: Set[int] = set()
     has_ssm_state = any(key.startswith(f"{architecture}.ssm.") for key in reader.fields)
-    for tensor in reader.tensors:
-        parts = tensor.name.split(".")
-        if len(parts) >= 3 and parts[0] == "blk":
-            try:
-                index = int(parts[1])
-            except ValueError:
-                non_layer_bytes += int(tensor.n_bytes)
-                continue
-            if 0 <= index < layer_count:
-                layer_weight_bytes[index] += int(tensor.n_bytes)
-                if len(parts) >= 4 and parts[2] == "attn_k" and parts[3] == "weight":
-                    key_layers.add(index)
-                if len(parts) >= 4 and parts[2] == "attn_v" and parts[3] == "weight":
-                    value_layers.add(index)
-                if len(parts) >= 4 and parts[2] == "attn_qkv" and parts[3] == "weight":
-                    fused_qkv_layers.add(index)
+    for pr in part_readers:
+        for tensor in pr.tensors:
+            parts = tensor.name.split(".")
+            n_bytes = int(tensor.n_bytes)
+            if len(parts) >= 3 and parts[0] == "blk":
+                try:
+                    index = int(parts[1])
+                except ValueError:
+                    non_layer_bytes += n_bytes
+                    continue
+                if 0 <= index < layer_count:
+                    layer_weight_bytes[index] += n_bytes
+                    if len(parts) >= 4:
+                        comp = parts[2]
+                        if comp == "attn_k" and parts[3] == "weight":
+                            key_layers.add(index)
+                        elif comp == "attn_v" and parts[3] == "weight":
+                            value_layers.add(index)
+                        elif comp == "attn_qkv" and parts[3] == "weight":
+                            fused_qkv_layers.add(index)
+                        elif comp.startswith("attn_"):
+                            attn_other_layers.add(index)
+                        elif "ssm" in comp:
+                            ssm_layers.add(index)
+                            has_ssm_state = True
+                else:
+                    non_layer_bytes += n_bytes
             else:
-                non_layer_bytes += int(tensor.n_bytes)
-        else:
-            non_layer_bytes += int(tensor.n_bytes)
+                non_layer_bytes += n_bytes
+                if "token_embd" in tensor.name:
+                    token_embd_bytes += n_bytes
+
+    # llama.cpp keeps token_embd mapped on CPU RAM rather than VRAM unless row-split forced
+    gpu_non_layer_bytes = max(0, non_layer_bytes - token_embd_bytes)
+    if gpu_non_layer_bytes == 0 and non_layer_bytes > 0:
+        gpu_non_layer_bytes = int(non_layer_bytes * 0.5)
 
     attention_layers = key_layers & value_layers
-    if not attention_layers and architecture in {"qwen2", "qwen3"}:
-        attention_layers = set(range(layer_count))
-    if not attention_layers and architecture == "phi3" and len(fused_qkv_layers) == layer_count:
+    if not attention_layers and fused_qkv_layers:
         attention_layers = fused_qkv_layers
-    kv_supported = (
-        kv_metadata_supported
-        and bool(attention_layers)
-        and len(attention_layers) == layer_count
-        and sliding_window is None
-        and not has_ssm_state
+    if not attention_layers:
+        inferred = attn_other_layers - ssm_layers
+        if inferred:
+            attention_layers = inferred
+        elif not has_ssm_state:
+            attention_layers = set(range(layer_count))
+
+    ssm_layer_count = len(ssm_layers) if ssm_layers else (max(0, layer_count - len(attention_layers)) if has_ssm_state else 0)
+    ssm_state_bytes = _compute_ssm_state_reserve(reader, architecture, ssm_layer_count) if has_ssm_state else 0
+
+    warnings: List[str] = []
+    if part_count > 1:
+        warnings.append(f"Split GGUF model ({part_count} parts summed for total weights).")
+
+    if kv_metadata_supported and attention_layers:
+        eff_attn_layers = len(attention_layers)
+        eff_kv_heads = kv_head_count
+        eff_k_len = key_length
+        eff_v_len = value_length
+        kv_method = "hybrid_ssm_kv" if has_ssm_state else ("swa_full_kv" if sliding_window else "dense_gqa_fp16")
+    else:
+        eff_attn_layers = len(attention_layers) or (0 if has_ssm_state and not attention_layers else layer_count)
+        eff_kv_heads = kv_head_count or head_count or 8
+        eff_k_len = key_length or ((embedding_length // max(1, head_count)) if (embedding_length and head_count) else 128)
+        eff_v_len = value_length or eff_k_len
+        kv_method = "conservative_estimate_fp16"
+        warnings.append("Attention KV metadata is partial; using conservative VRAM sizing.")
+
+    kv_f16_bytes = (
+        eff_attn_layers
+        * context_size
+        * eff_kv_heads
+        * (eff_k_len + eff_v_len)
+        * 2
     )
-    kv_f16_bytes = 0
-    kv_q8_bytes = 0
-    kv_method = "unsupported_cpu_fallback"
-    if kv_supported:
-        kv_f16_bytes = (
-            len(attention_layers)
-            * context_size
-            * kv_head_count
-            * (key_length + value_length)
-            * 2
-        )
-        kv_q8_bytes = (kv_f16_bytes * 34 + 63) // 64
-        kv_method = "dense_gqa_fp16"
+    kv_q8_bytes = (kv_f16_bytes * 34 + 63) // 64
+    kv_q4_bytes = (kv_f16_bytes * 18 + 63) // 64
+
     mmproj_reserve_bytes = int(mmproj_bytes * 1.15) if paired_mmproj else 0
-    compute_reserve_bytes = int(0.5 * GIB + 0.04 * weight_bytes) + mmproj_reserve_bytes
-    devices = _probe_nvidia_gpus() if BACKEND_NAME == "cuda" else []
-    warnings = []
+    compute_reserve_bytes = int(0.5 * GIB + 0.04 * weight_bytes) + mmproj_reserve_bytes + ssm_state_bytes
+    devices = _probe_gpu_devices()
     if paired_mmproj:
         warnings.append(f"Paired vision projector '{paired_mmproj}' (+{round(mmproj_reserve_bytes / GIB, 2)} GiB VRAM reserve).")
+    if has_ssm_state:
+        warnings.append(
+            f"Hybrid SSM/recurrent layout ({eff_attn_layers} attention + {ssm_layer_count} SSM layers; "
+            f"+{round(ssm_state_bytes / GIB, 2)} GiB state reserve)."
+        )
+    if sliding_window is not None:
+        warnings.append(f"Sliding-window attention ({sliding_window}); budgeting full KV cache for stability.")
+
     gpu_layers = 0
     gpu_weight_bytes = 0
     kv_cache_bytes = kv_f16_bytes
     kv_type = int(llama_cpp.GGML_TYPE_F16)
     kv_cache_type = "F16"
+    offload_kqv = True
     usable_bytes = 0
     gpu_name = None
     total_bytes = 0
     free_bytes = 0
+    ram_total_bytes, ram_avail_bytes = _probe_system_ram()
 
-    if BACKEND_NAME == "vulkan":
-        warnings.append("CPU backend selected; GPU layer offload is disabled.")
-    elif len(devices) == 1:
-        gpu = devices[0]
-        gpu_name = gpu["name"]
-        total_bytes = gpu["total_bytes"]
-        free_bytes = gpu["free_bytes"]
+    if BACKEND_NAME == "cpu" or not llama_cpp.llama_supports_gpu_offload():
+        offload_kqv = False
+        warnings.append("CPU backend selected; model will run in system RAM.")
+    elif not devices:
+        offload_kqv = False
+        warnings.append("No compatible GPU reported; selecting CPU + system RAM loading.")
+    else:
+        total_bytes = sum(int(d["total_bytes"]) for d in devices)
+        raw_free_bytes = sum(int(d["free_bytes"]) for d in devices)
+        free_bytes = min(total_bytes, raw_free_bytes + max(0, int(credit_vram_bytes or 0)))
+        if len(devices) == 1:
+            gpu_name = devices[0]["name"]
+        else:
+            gpu_name = f"{devices[0]['name']} (+{len(devices) - 1} more GPUs)"
+        safety_reserve = GPU_SAFETY_RESERVE_BYTES * len(devices)
         usable_bytes = min(
             int(total_bytes * GPU_MAX_UTILIZATION),
-            max(0, free_bytes - GPU_SAFETY_RESERVE_BYTES),
+            max(0, free_bytes - safety_reserve),
         )
-        if not kv_supported:
-            if not kv_metadata_supported or not attention_layers:
-                warnings.append("GGUF attention metadata is incomplete; GPU offload disabled for safety.")
-            elif sliding_window is not None:
-                warnings.append("Sliding-window KV allocation is not modeled; GPU offload disabled for safety.")
-            elif has_ssm_state or len(attention_layers) != layer_count:
-                warnings.append("Hybrid SSM/recurrent KV state is not modeled; GPU offload disabled for safety.")
-            else:
-                warnings.append("KV cache layout is not supported by preflight; GPU offload disabled for safety.")
-        else:
-            def fitting_layers(kv_bytes: int) -> tuple[int, int]:
-                available = usable_bytes - kv_bytes - compute_reserve_bytes - non_layer_bytes
-                for candidate in range(layer_count, 0, -1):
-                    candidate_bytes = sum(layer_weight_bytes[layer_count - candidate:])
-                    if candidate_bytes <= available:
-                        return candidate, candidate_bytes
-                return 0, 0
 
-            f16_layers, f16_weight_bytes = fitting_layers(kv_f16_bytes)
-            q8_layers, q8_weight_bytes = fitting_layers(kv_q8_bytes)
-            if q8_layers > f16_layers:
-                kv_cache_bytes = kv_q8_bytes
-                kv_type = int(llama_cpp.GGML_TYPE_Q8_0)
-                kv_cache_type = "Q8_0"
-                kv_method = "dense_gqa_q8_0"
-                gpu_layers = q8_layers
-                gpu_weight_bytes = q8_weight_bytes
-                warnings.append("KV cache reduced from FP16 to Q8_0 before reducing GPU layer count.")
+        def fitting_layers(kv_bytes: int, include_kqv: bool = True) -> Tuple[int, int]:
+            kv_vram = kv_bytes if include_kqv else 0
+            available = usable_bytes - kv_vram - compute_reserve_bytes - gpu_non_layer_bytes
+            for candidate in range(layer_count, 0, -1):
+                candidate_bytes = sum(layer_weight_bytes[layer_count - candidate:])
+                if candidate_bytes <= available:
+                    return candidate, candidate_bytes
+            return 0, 0
+
+        f16_layers, f16_weight_bytes = fitting_layers(kv_f16_bytes, include_kqv=True)
+        q8_layers, q8_weight_bytes = fitting_layers(kv_q8_bytes, include_kqv=True)
+        q4_layers, q4_weight_bytes = fitting_layers(kv_q4_bytes, include_kqv=True)
+
+        gpu_layers = f16_layers
+        gpu_weight_bytes = f16_weight_bytes
+        if q8_layers > gpu_layers:
+            kv_cache_bytes = kv_q8_bytes
+            kv_type = int(llama_cpp.GGML_TYPE_Q8_0)
+            kv_cache_type = "Q8_0"
+            kv_method = f"{kv_method}_q8"
+            gpu_layers = q8_layers
+            gpu_weight_bytes = q8_weight_bytes
+            warnings.append("KV cache set to Q8_0 to fit more layers in VRAM.")
+        if gpu_layers < layer_count and q4_layers > gpu_layers:
+            kv_cache_bytes = kv_q4_bytes
+            kv_type = int(llama_cpp.GGML_TYPE_Q4_0)
+            kv_cache_type = "Q4_0"
+            kv_method = f"{kv_method}_q4"
+            gpu_layers = q4_layers
+            gpu_weight_bytes = q4_weight_bytes
+            warnings.append("KV cache stepped down to Q4_0 to fit more layers in VRAM.")
+        if gpu_layers == 0:
+            ram_kv_layers, ram_kv_weight_bytes = fitting_layers(0, include_kqv=False)
+            if ram_kv_layers > 0:
+                offload_kqv = False
+                kv_cache_bytes = kv_f16_bytes
+                kv_type = int(llama_cpp.GGML_TYPE_F16)
+                kv_cache_type = "F16"
+                kv_method = f"{kv_method}_ram_kv"
+                gpu_layers = ram_kv_layers
+                gpu_weight_bytes = ram_kv_weight_bytes
+                warnings.append("VRAM is tight; keeping KV cache in system RAM to maximize GPU layer offload.")
             else:
-                gpu_layers = f16_layers
-                gpu_weight_bytes = f16_weight_bytes
-            if gpu_layers == 0:
-                warnings.append("Model weights, KV estimate, overhead, and safety reserve leave no layer budget for GPU offload.")
-    elif not devices:
-        warnings.append("nvidia-smi did not report a GPU; selecting CPU-only loading.")
-    else:
-        warnings.append("Multiple GPUs are detected; selecting single-GPU conservative fallback.")
+                offload_kqv = False
+                warnings.append("Weights and runtime overhead exceed free VRAM; falling back to system RAM (CPU offload).")
+
+        other_app_vram = max(0, total_bytes - free_bytes)
+        if gpu_layers < layer_count and other_app_vram > 2 * GIB:
+            warnings.append(
+                f"~{other_app_vram / GIB:.2f} GiB VRAM is used by other apps; remaining layers will use hybrid RAM offload."
+            )
+
+    if ram_total_bytes > 0 and gpu_layers < layer_count:
+        ram_weights = max(0, weight_bytes - gpu_weight_bytes)
+        ram_kv = 0 if offload_kqv else kv_cache_bytes
+        if (ram_weights + ram_kv) > int(ram_total_bytes * 0.90):
+            warnings.append(
+                f"Model requires ~{(ram_weights + ram_kv) / GIB:.1f} GiB system RAM beyond VRAM (system total: {ram_total_bytes / GIB:.1f} GiB); loading may swap heavily."
+            )
 
     predicted_gpu_bytes = 0
-    if gpu_layers:
-        predicted_gpu_bytes = non_layer_bytes + gpu_weight_bytes + kv_cache_bytes + compute_reserve_bytes
+    if gpu_layers > 0:
+        kv_vram_used = kv_cache_bytes if offload_kqv else 0
+        predicted_gpu_bytes = gpu_non_layer_bytes + gpu_weight_bytes + kv_vram_used + compute_reserve_bytes
 
     return {
         "model": filename,
@@ -2692,7 +3124,11 @@ def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto"
         "context_size": context_size,
         "total_layers": layer_count,
         "attention_layers": len(attention_layers),
+        "ssm_layers": ssm_layer_count,
+        "part_count": part_count,
         "n_gpu_layers": gpu_layers,
+        "gpu_count": len(devices),
+        "offload_kqv": offload_kqv,
         "kv_cache_type": kv_cache_type,
         "kv_type": kv_type,
         "kv_method": kv_method,
@@ -2705,11 +3141,13 @@ def preflight_model(filename: str, context_size: int, mmproj_model: str = "auto"
         "non_layer_weight_bytes": non_layer_bytes,
         "gpu_layer_weight_bytes": gpu_weight_bytes,
         "predicted_gpu_bytes": predicted_gpu_bytes,
+        "system_ram_total_bytes": ram_total_bytes,
+        "system_ram_avail_bytes": ram_avail_bytes,
         "mmproj_model": paired_mmproj,
         "mmproj_bytes": mmproj_bytes,
         "vision_capable": bool(paired_mmproj),
         "warnings": warnings,
-        "estimate_note": "Tensor bytes are read from the GGUF index. Dense KV is an FP16 upper-bound estimate.",
+        "estimate_note": "Tensor bytes read across all GGUF files; KV & SSM reserves scaled to hardware VRAM + RAM.",
     }
 
 
@@ -2737,11 +3175,102 @@ def unload_current_model() -> None:
         STATE.loaded_chat_format = None
         STATE.loaded_mmproj = None
         STATE.loaded_vision_capable = False
+        STATE.loaded_vram_bytes = 0
 
         for _ in range(3):
             gc.collect()
         time.sleep(0.4)
         log.info("Resident model flushed. VRAM released.")
+
+
+def _is_vram_oom_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(
+        tok in msg
+        for tok in ("out of memory", "oom", "cudamalloc", "vk_error_out_of", "failed to allocate", "not enough memory")
+    )
+
+
+def _build_load_attempts(preflight: Dict[str, Any], context_size: int) -> List[Dict[str, Any]]:
+    """Build primary attempt plus automatic progressive fallbacks if allocation or arch compat fails."""
+    init_ngl = max(0, int(preflight.get("n_gpu_layers") or 0))
+    init_kv_type = int(preflight.get("kv_type") or llama_cpp.GGML_TYPE_F16)
+    init_kv_name = str(preflight.get("kv_cache_type") or "F16")
+    init_offload_kqv = bool(preflight.get("offload_kqv", init_ngl > 0))
+    f16_type = int(llama_cpp.GGML_TYPE_F16)
+    q8_type = int(llama_cpp.GGML_TYPE_Q8_0)
+
+    attempts: List[Dict[str, Any]] = [
+        {
+            "n_gpu_layers": init_ngl,
+            "kv_type": init_kv_type,
+            "kv_cache_type": init_kv_name,
+            "flash_attn": bool(FLASH_ATTN and init_ngl > 0),
+            "offload_kqv": bool(init_offload_kqv and init_ngl > 0),
+            "mmproj_gpu": init_ngl > 0,
+            "n_ctx": context_size,
+            "reason": None,
+        }
+    ]
+    seen = {
+        (init_ngl, init_kv_type, bool(FLASH_ATTN and init_ngl > 0), bool(init_offload_kqv and init_ngl > 0), init_ngl > 0, context_size)
+    }
+
+    def add(ngl: int, kv_t: int, kv_n: str, fa: bool, okqv: bool, mm_gpu: bool, ctx: int, reason: str) -> None:
+        key = (ngl, kv_t, fa, okqv, mm_gpu, ctx)
+        if key not in seen:
+            seen.add(key)
+            attempts.append({
+                "n_gpu_layers": ngl,
+                "kv_type": kv_t,
+                "kv_cache_type": kv_n,
+                "flash_attn": fa,
+                "offload_kqv": okqv,
+                "mmproj_gpu": mm_gpu,
+                "n_ctx": ctx,
+                "reason": reason,
+            })
+
+    if init_ngl > 0:
+        if init_kv_type != f16_type or FLASH_ATTN:
+            add(
+                init_ngl,
+                f16_type,
+                "F16",
+                False,
+                init_offload_kqv,
+                True,
+                context_size,
+                "Retried with F16 KV and flash-attn disabled for architecture compatibility.",
+            )
+        for frac, tag in ((0.75, "75%"), (0.50, "50%"), (0.25, "25%")):
+            step_ngl = max(1, int(init_ngl * frac))
+            if step_ngl < init_ngl:
+                add(
+                    step_ngl,
+                    q8_type if init_kv_type == f16_type else init_kv_type,
+                    "Q8_0" if init_kv_type == f16_type else init_kv_name,
+                    bool(FLASH_ATTN),
+                    True,
+                    False if frac <= 0.50 else True,
+                    context_size,
+                    f"Stepped down GPU offload to {step_ngl} layers ({tag}) due to tight VRAM.",
+                )
+                add(
+                    step_ngl,
+                    f16_type,
+                    "F16",
+                    False,
+                    False,
+                    False,
+                    context_size,
+                    f"Stepped down to {step_ngl} GPU layers with KV cache in system RAM.",
+                )
+
+    add(0, f16_type, "F16", False, False, False, context_size, "Automatically fell back to CPU + system RAM loading.")
+    if context_size > 4096:
+        add(0, f16_type, "F16", False, False, False, 4096, "Automatically lowered context length to 4096 for system RAM fit.")
+    return attempts
 
 
 def load_model(
@@ -2759,53 +3288,98 @@ def load_model(
         if STATE.locked or STATE.busy:
             raise HTTPException(status_code=409, detail="A model change is already in progress.")
         STATE.locked = True
+        STATE.loading_model = filename
     try:
         unload_current_model()
         preflight = preflight_model(filename, context_size, mmproj_model=mmproj_model)
-        gpu_layers = int(preflight["n_gpu_layers"])
         paired_mmproj = preflight.get("mmproj_model")
+        vram_before = _measure_free_vram_bytes()
         log.info(
-            f"Loading '{filename}' (preflight n_gpu_layers={gpu_layers}, n_ctx={context_size}, mmproj={paired_mmproj or 'none'}) ..."
+            f"Loading '{filename}' (preflight n_gpu_layers={preflight['n_gpu_layers']}, n_ctx={context_size}, mmproj={paired_mmproj or 'none'}) ..."
         )
         t0 = time.perf_counter()
+        attempts = _build_load_attempts(preflight, context_size)
+        last_exc: Optional[Exception] = None
+        chosen: Optional[Dict[str, Any]] = None
+        last_oom_failed_ngl: Optional[int] = None
+        cached_handlers: Dict[bool, Any] = {}
+
         try:
-            chat_handler = None
-            effective_chat_format = None if chat_format == "auto" else chat_format
-            if paired_mmproj:
-                if MTMDChatHandler is None:
-                    msg = f"Vision projector '{paired_mmproj}' found, but MTMDChatHandler is unavailable in llama-cpp-python."
-                    log.warning(msg)
-                    preflight.setdefault("warnings", []).append(msg)
-                    preflight["mmproj_model"] = None
-                    preflight["vision_capable"] = False
-                    paired_mmproj = None
-                else:
-                    clip_path = MODEL_DIR / paired_mmproj
-                    chat_handler = MTMDChatHandler(
-                        clip_model_path=str(clip_path),
-                        use_gpu=gpu_layers > 0,
-                        verbose=False,
+            for attempt_idx, attempt in enumerate(attempts):
+                if (
+                    last_oom_failed_ngl is not None
+                    and attempt["n_gpu_layers"] >= last_oom_failed_ngl
+                    and attempt["offload_kqv"]
+                ):
+                    continue
+                if attempt_idx > 0:
+                    log.warning(
+                        f"Retrying '{filename}' (attempt {attempt_idx + 1}): "
+                        f"ngl={attempt['n_gpu_layers']}, kv={attempt['kv_cache_type']}, "
+                        f"fa={attempt['flash_attn']}, kqv_gpu={attempt['offload_kqv']}, n_ctx={attempt['n_ctx']}"
                     )
-                    effective_chat_format = None
+                    gc.collect()
+                    time.sleep(0.2)
 
-            llama_kwargs: Dict[str, Any] = {
-                "model_path": str(path),
-                "n_gpu_layers": gpu_layers,
-                "n_ctx": context_size,
-                "n_threads": N_THREADS,
-                "n_batch": N_BATCH,
-                "last_n_tokens_size": 1024,
-                "type_k": int(preflight["kv_type"]),
-                "type_v": int(preflight["kv_type"]),
-                "offload_kqv": gpu_layers > 0,
-                "flash_attn": FLASH_ATTN if gpu_layers > 0 else False,
-                "chat_format": effective_chat_format,
-                "verbose": False,
-            }
-            if chat_handler is not None:
-                llama_kwargs["chat_handler"] = chat_handler
+                chat_handler = None
+                effective_chat_format = None if chat_format == "auto" else chat_format
+                if paired_mmproj:
+                    if MTMDChatHandler is None:
+                        msg = f"Vision projector '{paired_mmproj}' found, but MTMDChatHandler is unavailable in llama-cpp-python."
+                        log.warning(msg)
+                        preflight.setdefault("warnings", []).append(msg)
+                        preflight["mmproj_model"] = None
+                        preflight["vision_capable"] = False
+                        paired_mmproj = None
+                    else:
+                        mm_gpu = bool(attempt["mmproj_gpu"])
+                        if mm_gpu not in cached_handlers:
+                            clip_path = MODEL_DIR / paired_mmproj
+                            try:
+                                cached_handlers[mm_gpu] = MTMDChatHandler(
+                                    clip_model_path=str(clip_path),
+                                    use_gpu=mm_gpu,
+                                    verbose=False,
+                                )
+                            except Exception as mm_exc:
+                                if mm_gpu:
+                                    log.warning(f"Vision mmproj GPU init failed ({mm_exc}); retrying on CPU.")
+                                    continue
+                                raise
+                        chat_handler = cached_handlers[mm_gpu]
+                        effective_chat_format = None
 
-            STATE.llm = Llama(**llama_kwargs)
+                llama_kwargs: Dict[str, Any] = {
+                    "model_path": str(path),
+                    "n_gpu_layers": int(attempt["n_gpu_layers"]),
+                    "n_ctx": int(attempt["n_ctx"]),
+                    "n_threads": N_THREADS,
+                    "n_batch": N_BATCH,
+                    "last_n_tokens_size": 1024,
+                    "type_k": int(attempt["kv_type"]),
+                    "type_v": int(attempt["kv_type"]),
+                    "offload_kqv": bool(attempt["offload_kqv"]),
+                    "flash_attn": bool(attempt["flash_attn"]),
+                    "chat_format": effective_chat_format,
+                    "verbose": False,
+                }
+                if chat_handler is not None:
+                    llama_kwargs["chat_handler"] = chat_handler
+
+                try:
+                    STATE.llm = Llama(**llama_kwargs)
+                    chosen = attempt
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    STATE.llm = None
+                    if _is_vram_oom_error(exc) and attempt["n_gpu_layers"] > 0:
+                        last_oom_failed_ngl = attempt["n_gpu_layers"]
+                    log.warning(f"Load attempt {attempt_idx + 1} failed: {exc}")
+
+            if chosen is None or STATE.llm is None:
+                raise last_exc or RuntimeError("All model load attempts failed.")
+
             orig_init_sampler = STATE.llm._init_sampler
 
             def _patched_init_sampler(*s_args, **s_kwargs):
@@ -2824,23 +3398,40 @@ def load_model(
             unload_current_model()
             raise HTTPException(status_code=500, detail=f"Model load failed: {exc}") from exc
 
+        if chosen.get("reason"):
+            preflight.setdefault("warnings", []).append(chosen["reason"])
+        preflight["n_gpu_layers"] = int(chosen["n_gpu_layers"])
+        preflight["kv_type"] = int(chosen["kv_type"])
+        preflight["kv_cache_type"] = str(chosen["kv_cache_type"])
+        preflight["offload_kqv"] = bool(chosen["offload_kqv"])
+        preflight["context_size"] = int(chosen["n_ctx"])
+
+        vram_after = _measure_free_vram_bytes()
+        measured_vram = max(0, vram_before - vram_after) if vram_before > 0 else 0
+
         dt = time.perf_counter() - t0
         STATE.loaded_model = filename
         STATE.loaded_at = time.time()
         STATE.load_seconds = dt
-        STATE.loaded_gpu_layers = gpu_layers
-        STATE.loaded_context_size = context_size
-        STATE.loaded_kv_cache_type = preflight["kv_cache_type"]
+        STATE.loaded_gpu_layers = int(chosen["n_gpu_layers"])
+        STATE.loaded_context_size = int(chosen["n_ctx"])
+        STATE.loaded_kv_cache_type = str(chosen["kv_cache_type"])
         STATE.loaded_chat_format = chat_format
         STATE.loaded_mmproj = paired_mmproj
         STATE.loaded_vision_capable = bool(paired_mmproj)
+        STATE.loaded_vram_bytes = (
+            max(int(preflight.get("predicted_gpu_bytes") or 0), measured_vram)
+            if int(chosen["n_gpu_layers"]) > 0
+            else 0
+        )
         log.info(
-            f"Model '{filename}' resident in VRAM (vision={STATE.loaded_vision_capable}). Load time: {dt:.2f}s"
+            f"Model '{filename}' resident ({STATE.loaded_gpu_layers} GPU layers, kv={STATE.loaded_kv_cache_type}, vision={STATE.loaded_vision_capable}). Load time: {dt:.2f}s"
         )
         return preflight
     finally:
         with STATE._lease:
             STATE.locked = False
+            STATE.loading_model = None
 
 
 # =====================================================================
@@ -2969,8 +3560,9 @@ def _list_hf_repo_ggufs(repo_id: str) -> Dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not inspect HuggingFace repo '{clean_repo}': {exc}") from exc
 
-    models: List[Dict[str, Any]] = []
+    raw_models: List[Dict[str, Any]] = []
     mmprojs: List[Dict[str, Any]] = []
+    split_sizes: Dict[Tuple[str, int], int] = {}
     for sib in getattr(info, "siblings", None) or []:
         rfilename = str(getattr(sib, "rfilename", "") or "")
         if not rfilename.lower().endswith(".gguf"):
@@ -2985,8 +3577,43 @@ def _list_hf_repo_ggufs(repo_id: str) -> Dict[str, Any]:
         if _is_mmproj_filename(rfilename):
             mmprojs.append(entry)
         else:
-            models.append(entry)
+            split_info = _parse_split_gguf_name(Path(rfilename).name)
+            if split_info:
+                prefix, _part, total = split_info
+                split_key = (f"{Path(rfilename).parent.as_posix()}/{prefix.lower()}", total)
+                split_sizes[split_key] = split_sizes.get(split_key, 0) + size_bytes
+            raw_models.append(entry)
+
+    models: List[Dict[str, Any]] = []
+    for entry in raw_models:
+        split_info = _parse_split_gguf_name(entry["local_name"])
+        if split_info:
+            prefix, part, total = split_info
+            if part != 1:
+                continue
+            split_key = (f"{Path(entry['filename']).parent.as_posix()}/{prefix.lower()}", total)
+            total_size = split_sizes.get(split_key, entry["size_bytes"])
+            entry = {
+                **entry,
+                "size_bytes": total_size,
+                "size_gb": round(total_size / (1024 ** 3), 2),
+                "part_count": total,
+            }
+        models.append(entry)
     return {"repo_id": clean_repo, "models": models, "mmprojs": mmprojs}
+
+
+def _check_download_disk_space(required_bytes: int, label: str = "model") -> None:
+    if required_bytes <= 0:
+        return
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    free_bytes = int(shutil.disk_usage(MODEL_DIR).free)
+    safety_margin = 128 * 1024 * 1024
+    if free_bytes < required_bytes + safety_margin:
+        raise RuntimeError(
+            f"Insufficient free disk space in {MODEL_DIR} for {label} "
+            f"(need ~{required_bytes / GIB:.2f} GB, only {free_bytes / GIB:.2f} GB free)."
+        )
 
 
 def _stream_hf_file(
@@ -3011,7 +3638,7 @@ def _stream_hf_file(
     url = f"https://huggingface.co/{repo_id}/resolve/main/{encoded_file}"
 
     existing = part_path.stat().st_size if part_path.is_file() else 0
-    headers: Dict[str, str] = {"User-Agent": "GHostPCP/1.3.0"}
+    headers: Dict[str, str] = {"User-Agent": "GHostPCP/1.4.0"}
     if existing > 0:
         headers["Range"] = f"bytes={existing}-"
 
@@ -3024,11 +3651,13 @@ def _stream_hf_file(
             headers.pop("Range", None)
             resp2 = req_lib.get(url, headers=headers, stream=True, timeout=(20, 90), allow_redirects=True)
             resp2.raise_for_status()
+            _check_download_disk_space(int(resp2.headers.get("Content-Length") or 0), local_filename)
             return _write_hf_stream(resp2, part_path, target, stage_label, existing, t_start, cancel_event)
         resp.raise_for_status()
         if resp.status_code == 200 and existing > 0:
             # Server ignored Range header; restart cleanly from 0
             existing = 0
+        _check_download_disk_space(int(resp.headers.get("Content-Length") or 0), local_filename)
         return _write_hf_stream(resp, part_path, target, stage_label, existing, t_start, cancel_event)
 
 
@@ -3079,13 +3708,31 @@ def _run_model_download_worker(
     mmproj_save_as: str,
 ) -> None:
     try:
-        _stream_hf_file(
-            repo_id=repo_id,
-            remote_filename=filename,
-            local_filename=save_as,
-            stage_label=f"Downloading {save_as}",
-            cancel_event=MODEL_DOWNLOAD_STATE.cancel_event,
-        )
+        split_info = _parse_split_gguf_name(Path(filename).name)
+        if split_info and split_info[1] == 1:
+            prefix, _, total = split_info
+            save_split = _parse_split_gguf_name(save_as)
+            save_prefix = save_split[0] if save_split else prefix
+            remote_dir = str(Path(filename).parent.as_posix())
+            for part_idx in range(1, total + 1):
+                part_name = f"{prefix}-{part_idx:05d}-of-{total:05d}.gguf"
+                remote_part = f"{remote_dir}/{part_name}" if remote_dir and remote_dir != "." else part_name
+                local_part = f"{save_prefix}-{part_idx:05d}-of-{total:05d}.gguf"
+                _stream_hf_file(
+                    repo_id=repo_id,
+                    remote_filename=remote_part,
+                    local_filename=local_part,
+                    stage_label=f"Downloading {local_part} (part {part_idx}/{total})",
+                    cancel_event=MODEL_DOWNLOAD_STATE.cancel_event,
+                )
+        else:
+            _stream_hf_file(
+                repo_id=repo_id,
+                remote_filename=filename,
+                local_filename=save_as,
+                stage_label=f"Downloading {save_as}",
+                cancel_event=MODEL_DOWNLOAD_STATE.cancel_event,
+            )
         if mmproj_filename and mmproj_save_as:
             _stream_hf_file(
                 repo_id=repo_id,
@@ -3211,6 +3858,7 @@ class LoaderSettings(BaseModel):
     model: StrictStr = Field(default=DEFAULT_SETTINGS["model"], min_length=1, max_length=255)
     mmproj_model: StrictStr = Field(default="auto", max_length=255)
     chat_format: ChatFormat = "auto"
+    auto_mount_model: bool = True
     system_prompt: StrictStr = Field(default=DEFAULT_SETTINGS["system_prompt"], max_length=12000)
     pcp_enabled: bool = True
     pcp_top_k: StrictInt = Field(default=4, ge=1, le=12)
@@ -3631,6 +4279,10 @@ def models_download_start(req: ModelDownloadRequest):
         save_as = preset["save_as"]
         mmproj_filename = preset.get("mmproj_filename") or ""
         mmproj_save_as = preset.get("mmproj_save_as") or ""
+        try:
+            _check_download_disk_space(int(float(preset.get("size_gb") or 0) * GIB), save_as)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     else:
         if not req.repo_id or not req.filename:
             raise HTTPException(status_code=400, detail="Provide either catalog_id or repo_id + filename.")
@@ -3681,12 +4333,23 @@ def models_download_cancel():
 def preflight_endpoint(req: PreflightRequest):
     if STATE.locked:
         raise HTTPException(status_code=409, detail="A model change is in progress.")
-    plan = preflight_model(req.model, req.n_ctx, mmproj_model=req.mmproj_model)
+    credit_vram = STATE.loaded_vram_bytes if STATE.llm is not None else 0
+    plan = preflight_model(
+        req.model,
+        req.n_ctx,
+        mmproj_model=req.mmproj_model,
+        credit_vram_bytes=credit_vram,
+    )
     if STATE.loaded_model:
-        plan["warnings"].append(
-            "A model is currently resident; this preview uses current free VRAM. "
-            "Loading will unload it and recalculate before allocation."
-        )
+        if credit_vram > 0:
+            plan["warnings"].append(
+                f"Credited ~{credit_vram / GIB:.2f} GiB currently held by '{STATE.loaded_model}' "
+                "(automatically unloaded when you click MOUNT)."
+            )
+        else:
+            plan["warnings"].append(
+                "A model is currently resident; loading will unload it before allocation."
+            )
     return plan
 
 
@@ -3718,6 +4381,7 @@ def unload_endpoint():
     finally:
         with STATE._lease:
             STATE.locked = False
+            STATE.loading_model = None
     return {"status": "unloaded"}
 
 
@@ -3733,10 +4397,12 @@ def reset_endpoint():
         model = STATE.loaded_model
     try:
         llm.reset()
+        STATE.auto_archived_signatures.clear()
         return {"status": "reset", "model": model}
     finally:
         with STATE._lease:
             STATE.locked = False
+            STATE.loading_model = None
 
 
 @app.get("/v1/status", dependencies=[Depends(verify_access)])
@@ -3754,9 +4420,11 @@ def status(request: Request):
         "engine": "GHostPCP",
         "backend": BACKEND_NAME,
         "resident_model": STATE.loaded_model,
+        "loading_model": STATE.loading_model,
         "mmproj_model": STATE.loaded_mmproj,
         "vision_capable": STATE.loaded_vision_capable,
         "n_gpu_layers": STATE.loaded_gpu_layers,
+        "vram_gb": round(STATE.loaded_vram_bytes / GIB, 2) if STATE.loaded_vram_bytes else 0.0,
         "n_ctx": STATE.loaded_context_size,
         "kv_cache_type": STATE.loaded_kv_cache_type,
         "chat_format": STATE.loaded_chat_format,
@@ -4269,7 +4937,7 @@ def _capture_session_continuity_note(raw_msgs: List[Dict[str, Any]]) -> str:
                 stream=False,
             )
             text = str(((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
-            text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.IGNORECASE)
+            text = _strip_reasoning_blocks(text)
             text = re.sub(r"\s+", " ", text).strip()
             if text:
                 return text[:420]
@@ -4314,6 +4982,10 @@ def pcp_save_session(req: SaveSessionRequest):
             PCP_INDEX = PCPIndex(active_dir, cache_dir=active_dir, model_dir=bge_dir)
 
         raw_msgs = [m.model_dump(exclude_none=True) for m in req.messages]
+        unsaved_msgs = [
+            m for m in raw_msgs
+            if _turn_signature(m) not in STATE.auto_archived_signatures
+        ]
         settings = load_settings()
         capture_cont = (
             req.capture_continuity
@@ -4322,15 +4994,27 @@ def pcp_save_session(req: SaveSessionRequest):
         )
         continuity_note = _capture_session_continuity_note(raw_msgs) if capture_cont else ""
 
-        try:
-            result = PCP_INDEX.append_session(raw_msgs, continuity_note=continuity_note or None)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            log.error(f"Save session failed: {exc}")
-            raise HTTPException(status_code=500, detail=f"Failed to save session: {exc}") from exc
+        if raw_msgs and not unsaved_msgs:
+            files = sorted(active_dir.glob("ghost_pcp_*.md"))
+            result = {
+                "saved_to": files[-1].name if files else "already_archived",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "turns_saved": 0,
+                "passages_added": 0,
+                "total_volumes": PCP_INDEX.file_count,
+                "total_passages": PCP_INDEX.passage_count,
+            }
+        else:
+            try:
+                result = PCP_INDEX.append_session(unsaved_msgs, continuity_note=continuity_note or None)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                log.error(f"Save session failed: {exc}")
+                raise HTTPException(status_code=500, detail=f"Failed to save session: {exc}") from exc
 
         result["continuity_note"] = continuity_note
+        STATE.auto_archived_signatures.clear()
         with STATE._history_lock:
             STATE.conversation.clear()
         if _personas_registry_path().is_file():
@@ -4359,6 +5043,7 @@ def pcp_save_session(req: SaveSessionRequest):
     finally:
         with STATE._lease:
             STATE.locked = False
+            STATE.loading_model = None
 
 
 @app.post("/v1/pcp/reindex", dependencies=[Depends(verify_access)])
@@ -4504,7 +5189,6 @@ def remote_status():
         "tunnel_starting": TUNNEL_STATE.starting,
         "tunnel_url": tunnel_url,
         "tunnel_error": TUNNEL_STATE.error,
-        "scanner_url": "https://wildemindpress.com/scanner.html",
     }
 
 
@@ -4807,6 +5491,8 @@ def set_chat_history(req: ChatHistoryRequest):
     ]
     with STATE._history_lock:
         STATE.conversation = cleaned
+    if not cleaned:
+        STATE.auto_archived_signatures.clear()
     if _personas_registry_path().is_file():
         active = _get_active_persona()
         if active:
@@ -5005,10 +5691,17 @@ def _strip_images_with_placeholder(content: Any, placeholder: str) -> Tuple[Any,
     return f"{joined}\n\n{note}".strip() if joined else note, removed
 
 
+def _turn_signature(msg: Dict[str, Any]) -> str:
+    role = str(msg.get("role") or "").strip().lower()
+    plain = _strip_reasoning_blocks(_extract_message_plain_text(msg.get("content"))).strip()
+    return hashlib.sha1(f"{role}:{plain[:500]}".encode("utf-8", errors="replace")).hexdigest()
+
+
 def _fit_messages_to_context(
     messages: List[Dict[str, Any]],
     n_ctx: int,
     max_tokens: int,
+    evicted_out: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Trim older turns and oversize attachments so total prompt tokens stay inside n_ctx."""
     if not messages:
@@ -5037,7 +5730,9 @@ def _fit_messages_to_context(
 
     while len(fitted) > 2 and total_est() > budget:
         drop_idx = 1 if fitted[0].get("role") == "system" else 0
-        fitted.pop(drop_idx)
+        dropped = fitted.pop(drop_idx)
+        if evicted_out is not None and dropped.get("role") in ("user", "assistant"):
+            evicted_out.append(dropped)
 
     if total_est() > budget:
         other_tokens = sum(_estimate_message_tokens(m) for m in fitted[:-1])
@@ -5098,7 +5793,7 @@ def _llm_web_query_rewriter(user_prompt: str) -> str:
             stream=False,
         )
         raw = str(((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
-        raw = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", raw, flags=re.IGNORECASE)
+        raw = _strip_reasoning_blocks(raw)
         raw = re.sub(r"[\r\n\"'`]+", " ", raw).strip()
         norm = re.sub(r"[\s.!?]+$", "", raw).upper()
         if not raw or norm in ("NONE", "NO", "N/A", "NONE NEEDED", "NO SEARCH", "NO SEARCH NEEDED"):
@@ -5179,7 +5874,7 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
         for msg in raw_messages[:latest_user_idx]:
             if msg.get("role") in ("user", "assistant"):
                 plain_prior = _extract_message_plain_text(msg.get("content"))
-                cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", plain_prior, flags=re.IGNORECASE).strip()
+                cleaned = _strip_reasoning_blocks(plain_prior).strip()
                 if cleaned:
                     prior_turns.append(cleaned[:200])
         if prior_turns:
@@ -5308,7 +6003,34 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
 
     effective_n_ctx = int(STATE.loaded_context_size or settings.get("n_ctx") or 8192)
     effective_max_tokens = int(req.max_tokens or settings.get("max_tokens") or 512)
-    raw_messages = _fit_messages_to_context(raw_messages, effective_n_ctx, effective_max_tokens)
+    evicted_turns: List[Dict[str, Any]] = []
+    raw_messages = _fit_messages_to_context(
+        raw_messages,
+        effective_n_ctx,
+        effective_max_tokens,
+        evicted_out=evicted_turns,
+    )
+
+    auto_archived_turns = 0
+    if evicted_turns and use_pcp and PCP_INDEX is not None:
+        fresh_evicted: List[Dict[str, Any]] = []
+        for turn in evicted_turns:
+            if not _extract_message_plain_text(turn.get("content")).strip():
+                continue
+            sig = _turn_signature(turn)
+            if sig not in STATE.auto_archived_signatures:
+                fresh_evicted.append(turn)
+        if fresh_evicted:
+            try:
+                PCP_INDEX.append_session(fresh_evicted, timestamp_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                for turn in fresh_evicted:
+                    STATE.auto_archived_signatures.add(_turn_signature(turn))
+                auto_archived_turns = len(fresh_evicted)
+                turn_warnings.append(
+                    f"Auto-archived {auto_archived_turns} older message(s) to PCP memory before sliding context."
+                )
+            except Exception as exc:
+                log.warning(f"Overflow auto-archive skipped cleanly: {exc}")
 
     # For Qwen3 models when reasoning blocks are hidden, append /no_think to system + all user turns
     if (
@@ -5324,11 +6046,18 @@ def _prepare_pcp_messages(req: ChatRequest) -> Tuple[List[Dict[str, Any]], bool]
                     msg["content"] = _append_text_to_message_content(msg.get("content"), "\n/no_think")
 
     prompt_tokens_est = sum(_estimate_message_tokens(m) for m in raw_messages)
+    ctx_pct = min(100, round((prompt_tokens_est / max(1, effective_n_ctx)) * 100))
+    if ctx_pct >= 85 and auto_archived_turns == 0:
+        turn_warnings.append(
+            f"Context window is {ctx_pct}% full; overflowing turns auto-archive into PCP memory (click SAVE & CLEAR anytime)."
+        )
     STATE.last_turn_meta = {
         "sources": turn_sources,
         "warnings": turn_warnings,
         "prompt_tokens_est": prompt_tokens_est,
         "n_ctx": effective_n_ctx,
+        "ctx_pct": ctx_pct,
+        "auto_archived_turns": auto_archived_turns,
         "web_used": bool(use_web and turn_sources),
     }
 
@@ -5395,6 +6124,70 @@ def _chat_completion_args(req: ChatRequest, prepared_messages: List[Dict[str, An
     return args
 
 
+class _ChannelNormalizer:
+    """Convert Harmony (<|channel|>), <thought>, and [THINK] tokens into <think>...</think> across stream chunks."""
+
+    _TOKEN_RE = re.compile(
+        r"(?:<\|start\|>[a-z0-9_:-]*)?<\|channel\|>(analysis|commentary|final)(?:<\|constrain\|>[^\s<]+)?(?:<\|message\|>)?|"
+        r"<\|start\|>[a-z0-9_:-]*|<\|end\|>|<\|return\|>|<\|message\|>|<thought>|</thought>|\[THINK\]|\[/THINK\]",
+        re.IGNORECASE,
+    )
+    _TAIL_RE = re.compile(
+        r"(?:"
+        r"(?:<\|start\|>[a-z0-9_:-]{0,24})?<\|channel\|>(?:[a-z]{0,16})(?:<\|constrain\|>[^\s<]{0,24})?(?:<\|m(?:e(?:s(?:s(?:a(?:g(?:e\|?)?)?)?)?)?)?)?|"
+        r"<\|start\|>[a-z0-9_:-]{0,24}|"
+        r"<\|[a-z_|]{0,16}|"
+        r"<|"
+        r"<t(?:h(?:o(?:u(?:g(?:h(?:t)?)?)?)?)?)?|"
+        r"</t(?:h(?:o(?:u(?:g(?:h(?:t)?)?)?)?)?)?|"
+        r"\[(?:t(?:h(?:i(?:n(?:k)?)?)?)?|/(?:t(?:h(?:i(?:n(?:k)?)?)?)?)?)"
+        r")$",
+        re.IGNORECASE,
+    )
+
+    def __init__(self):
+        self.pending = ""
+        self.in_reasoning = False
+
+    def _replace_match(self, match: re.Match) -> str:
+        channel = (match.group(1) or "").lower()
+        token = match.group(0).lower()
+        if channel in ("analysis", "commentary") or token in ("<thought>", "[think]"):
+            if not self.in_reasoning:
+                self.in_reasoning = True
+                return "<think>"
+            return ""
+        if channel == "final" or token in ("</thought>", "[/think]", "<|end|>", "<|return|>"):
+            if self.in_reasoning:
+                self.in_reasoning = False
+                return "</think>"
+            return ""
+        return ""
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        buf = self.pending + text
+        self.pending = ""
+        tail_match = self._TAIL_RE.search(buf)
+        hold_from = tail_match.start() if tail_match else len(buf)
+        ready = buf[:hold_from]
+        self.pending = buf[hold_from:]
+        if not ready:
+            return ""
+        if "<" not in ready and "[" not in ready:
+            return ready
+        return self._TOKEN_RE.sub(self._replace_match, ready)
+
+    def flush(self) -> str:
+        out = self._TOKEN_RE.sub(self._replace_match, self.pending) if self.pending else ""
+        self.pending = ""
+        if self.in_reasoning:
+            self.in_reasoning = False
+            out += "</think>"
+        return out
+
+
 class _ThinkGate:
     OPEN = "<think>"
     CLOSE = "</think>"
@@ -5459,6 +6252,7 @@ def _stream_generator(
     failed = False
     stream = None
     reasoning_open = False
+    channel_norm = _ChannelNormalizer()
     think_gate = _ThinkGate(show_reasoning)
     try:
         stream_args = _chat_completion_args(req, prepared_messages)
@@ -5492,7 +6286,8 @@ def _stream_generator(
                     if show_reasoning and reasoning_open and reasoning is None:
                         content = "</think>" + content
                         reasoning_open = False
-                    filtered = think_gate.feed(content)
+                    normalized = channel_norm.feed(content)
+                    filtered = think_gate.feed(normalized) if normalized else ""
                     if filtered:
                         delta["content"] = filtered
                         token_count += 1
@@ -5504,6 +6299,17 @@ def _stream_generator(
                     continue
             yield _sse(chunk)
 
+        norm_tail = channel_norm.flush()
+        if norm_tail:
+            filtered_tail = think_gate.feed(norm_tail)
+            if filtered_tail:
+                yield _sse({
+                    "id": f"chatcmpl-{generation_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{"index": 0, "delta": {"content": filtered_tail}}],
+                })
         if show_reasoning and reasoning_open:
             yield _sse({
                 "id": f"chatcmpl-{generation_id}",
@@ -5532,11 +6338,15 @@ def _stream_generator(
             })
 
         elapsed_now = max(0.01, time.perf_counter() - start)
-        decode_now = elapsed_now - ((first_token_at - start) if first_token_at else 0.0)
+        prefill_sec = max(0.0, (first_token_at - start) if first_token_at else 0.0)
+        decode_now = elapsed_now - prefill_sec
         rate_now = token_count / decode_now if decode_now > 0 else 0.0
         meta_payload = dict(turn_meta or {})
         meta_payload["tok_per_sec"] = round(rate_now, 1)
+        meta_payload["prefill_sec"] = round(prefill_sec, 2)
         meta_payload["elapsed_sec"] = round(elapsed_now, 2)
+        meta_payload["vram_gb"] = round(STATE.loaded_vram_bytes / GIB, 2) if STATE.loaded_vram_bytes else 0.0
+        meta_payload["gpu_layers"] = STATE.loaded_gpu_layers
         meta_payload["chunks"] = token_count
         yield _sse({
             "id": f"chatcmpl-{generation_id}",
@@ -5619,15 +6429,17 @@ def chat_completions(req: ChatRequest):
         if llm is None:
             raise RuntimeError("No model resident.")
         out = llm.create_chat_completion(**completion_args)
-        if not show_reasoning:
-            try:
-                content = out["choices"][0]["message"]["content"]
-                if isinstance(content, str):
-                    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        try:
+            content = out["choices"][0]["message"]["content"]
+            if isinstance(content, str):
+                if show_reasoning:
+                    out["choices"][0]["message"]["content"] = _normalize_reasoning_tags(content)
+                else:
+                    cleaned = _strip_reasoning_blocks(content).strip()
                     if cleaned:
                         out["choices"][0]["message"]["content"] = cleaned
-            except (KeyError, IndexError, TypeError):
-                pass
+        except (KeyError, IndexError, TypeError):
+            pass
     except Exception as e:
         log.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -5642,6 +6454,8 @@ def chat_completions(req: ChatRequest):
             **turn_meta,
             "tok_per_sec": round(tps, 1),
             "elapsed_sec": round(elapsed, 2),
+            "vram_gb": round(STATE.loaded_vram_bytes / GIB, 2) if STATE.loaded_vram_bytes else 0.0,
+            "gpu_layers": STATE.loaded_gpu_layers,
         }
     log.info(
         f"COMPLETION :: model={req.model} prompt_tok={usage.get('prompt_tokens', '?')} "
@@ -5672,7 +6486,7 @@ def startup_banner():
     log.info(f"Model directory : {MODEL_DIR.resolve()}")
     log.info(f"PCP Data dir    : {PCP_DATA_DIR.resolve()}")
     log.info(f"Settings file   : {SETTINGS_PATH.resolve()}")
-    log.info(f"Selected backend: {BACKEND_NAME} ({RUNTIME_LLAMA_LIB_DIR})")
+    log.info(f"Selected backend: {BACKEND_NAME} ({RUNTIME_LLAMA_LIB_DIR}) · {N_THREADS} physical threads")
     log.info(f"Bind address    : http://{BIND_HOST}:{PORT} (Desktop Loopback + Paired Remote)")
     lan_ip = get_lan_ip()
     ts_ip = get_tailscale_ip()
@@ -5685,6 +6499,54 @@ def startup_banner():
     for m in detected:
         log.info(f"  -> {m['id']} ({m['size_gb']} GB)")
     log.info("GHostPCP Engine online.")
+
+
+def _pick_auto_mount_target() -> Optional[Tuple[str, dict]]:
+    """Choose the preferred persona model or last-used valid local GGUF when auto-mount is enabled."""
+    settings = load_settings()
+    if not settings.get("auto_mount_model", True):
+        return None
+    valid_models = [m["id"] for m in scan_models() if m.get("valid_gguf", True)]
+    if not valid_models:
+        return None
+    available = set(valid_models)
+    active_persona = _get_active_persona() if _personas_registry_path().is_file() else None
+    preferred = str((active_persona or {}).get("preferred_model") or "").strip()
+    if preferred and preferred in available:
+        return preferred, settings
+    saved_model = str(settings.get("model") or "").strip()
+    if saved_model and saved_model in available:
+        return saved_model, settings
+    if len(valid_models) == 1:
+        return valid_models[0], settings
+    return None
+
+
+def _schedule_startup_auto_mount() -> None:
+    """Trigger background model auto-mount when running the real server executable/script."""
+    if os.environ.get("GHOST_NO_AUTOLOAD", "").strip() == "1":
+        return
+    picked = _pick_auto_mount_target()
+    if not picked:
+        return
+    model_id, settings = picked
+
+    def _worker():
+        try:
+            with STATE._lease:
+                if STATE.llm is not None or STATE.locked or STATE.busy:
+                    return
+            log.info(f"Auto-mounting startup model '{model_id}' ...")
+            load_model(
+                model_id,
+                int(settings.get("n_ctx") or DEFAULT_N_CTX),
+                str(settings.get("chat_format") or "auto"),
+                str(settings.get("mmproj_model") or "auto"),
+            )
+        except Exception as exc:
+            log.warning(f"Startup auto-mount skipped cleanly: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 @app.on_event("startup")
@@ -5708,6 +6570,7 @@ if __name__ == "__main__":
 
     try:
         if args.api_only:
+            _schedule_startup_auto_mount()
             uvicorn.run(
                 app,
                 host=BIND_HOST,
@@ -5738,6 +6601,7 @@ if __name__ == "__main__":
                 server.should_exit = True
                 server_thread.join(timeout=5)
                 raise RuntimeError(f"GHostPCP server did not start on {LOOPBACK_HOST}:{PORT}.")
+            _schedule_startup_auto_mount()
 
             try:
                 webview.create_window(
